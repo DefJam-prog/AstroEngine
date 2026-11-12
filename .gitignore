@@ -1,0 +1,47 @@
+# Build output
+/build/
+/Build/
+/dist/
+/out/
+/bin/
+/obj/
+/target/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake-build-*/
+
+# Generated files and caches
+*.log
+*.tmp
+*.temp
+*.cache
+.cache/
+.pytest_cache/
+__pycache__/
+
+# IDE and editor state
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/

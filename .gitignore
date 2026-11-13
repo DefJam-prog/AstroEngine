@@ -6,6 +6,7 @@
 /bin/
 /obj/
 /target/
+/Library/
 /CMakeFiles/
 /CMakeCache.txt
 /cmake-build-*/

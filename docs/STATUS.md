@@ -24,15 +24,15 @@
 | Подэтап 01.3 | EventBus, TimeService/fixed timestep и ModuleRegistry::tick реализованы; unit-тесты добавлены |
 | Подэтап 01.4 | Typed CommandRegistry, версия/type checks, validation, execute/result и audit реализованы; unit-тесты добавлены |
 | Подэтап 01.5 | In-memory transactions, transactional commands, Undo/Redo, rollback/barrier semantics реализованы; unit-тесты добавлены |
-| Исходники и API | Core API 01.1–01.5; Scene/Entity; обязательный Transform с уникальным в сцене Component ID, валидация конечных значений; Astro Scene v2 и миграция v1→v2. Asset Registry и прочие компоненты не реализованы |
-| Сборка и тесты | Windows x64/MSVC Debug сборка успешна; CTest 9/9, включая Transform unit, сериализацию/миграцию integration и editor smoke; логи build/03.1-build.log, build/03.1-ctest.log |
+| Исходники и API | Core API 01.1–01.5; Scene/Entity, Transform и Astro Scene v2; project-local Asset Registry с PNG/JPEG metadata import, Asset ID/Reference, SHA-256 cache и явным reimport. Renderer integration и другие asset types отсутствуют |
+| Сборка и тесты | Windows x64/MSVC Debug сборка успешна; CTest 11/11, включая `assets.hash.unit`, `assets.registry.integration` и регрессионные editor/runtime smoke; логи build/03.2-build.log, build/03.2-ctest.log |
 | Политика проверок и документации | Требования записаны в TESTING.md и D009; это не результаты выполненных тестов |
 | Недостающие документы целевого комплекта | docs/FILE_FORMATS.md, docs/TEMPLATE_GUIDE.md |
 | Совместимость и лицензии зависимостей | Не проверены |
 
 Сборка проверена из Visual Studio 2022 Developer Command Prompt x64; инструменты доступны через среду VS, хотя в обычном PowerShell не все присутствуют в PATH.
 
-00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4 и 03.1: см. отчёты этапов. Следующий рекомендуемый подэтап — 03.2.
+00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4 и 03.1–03.2: см. отчёты этапов. Следующий рекомендуемый подэтап — 03.3.
 
 ## Подэтап 02.1
 Добавлен optional astro_editor: окно, docking, меню и project.astro. Создание проекта отказывает для существующего каталога до каких-либо изменений; файл записывается во временный файл и публикуется без замены. Некорректное открытие не меняет активный проект. На завершении 02.1 CTest 6/6, включая smoke этих сценариев. См. [отчёт 02.1](reports/02.1.md).
@@ -45,6 +45,9 @@
 
 ## Подэтап 02.4
 Astro Scene v1 сохраняет ID, имя сцены, иерархию и имена сущностей. Редактор предоставляет Ctrl+S/O/Z/Y (также Ctrl+Shift+Z), диагностику и блокирует смену проекта/сцены при несохранённых изменениях. Undo/Redo покрывает транзакционное изменение Name; создание/удаление сущностей не включено в историю. CTest 9/9; подробности и ограничения — [отчёт 02.4](reports/02.4.md).
+
+## Подэтап 03.2
+`astro_assets` предоставляет project-local AssetRegistry. `.png`, `.jpg` и `.jpeg` импортируются только из `Assets/`, получают сохраняемый numeric AssetId и метаданные; encoded bytes зеркалируются в `Library/Assets` по SHA-256. Изменённый источник требует явного reimport, который сохраняет ID. Индекс хранится в `.astro/assets.index`. Image decoding, оптимизация и renderer integration отсутствуют. CTest 11/11; детали — [отчёт 03.2](reports/03.2.md).
 
 ## Подэтап 03.1
 Каждая сущность получает один обязательный `astro.Transform` версии 1 с устойчивым в пределах сцены Component ID, позицией, вращением Эйлера в градусах и масштабом. Astro Scene v2 записывает Transform и ID; файлы v1 мигрируют к значениям по умолчанию. CTest 9/9; ограничения — [отчёт 03.1](reports/03.1.md).

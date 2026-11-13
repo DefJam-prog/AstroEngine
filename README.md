@@ -18,7 +18,7 @@ ctest --preset windows-debug
 
 Каждую команду выполнять только после успешного завершения предыдущей. Подробности и чистая сборка: [BUILD_GUIDE](docs/BUILD_GUIDE.md).
 
-Ожидаемый вывод (ещё не подтверждён запуском в этом окружении):
+Ожидаемый вывод headless приложения:
 
 ```text
 [info] AstroEngine
@@ -50,3 +50,7 @@ ctest --preset windows-debug
 В редакторе доступны сохранение/открытие сцены (Ctrl+S, Ctrl+O), Undo/Redo (Ctrl+Z, Ctrl+Y или Ctrl+Shift+Z) и панель Diagnostics. Astro Scene v2 сохраняет ID/имена сцены и сущностей, иерархию, ID компонентов и Transform. При несохранённых правках переключение проекта/сцены блокируется. Формат и миграция v1 описаны в [FILE_FORMATS.md](docs/FILE_FORMATS.md).
 
 Каждая новая сущность получает обязательный Transform с позицией, углами Эйлера в градусах и масштабом. Доступен C++ API `scene.transform(entityId)` и `scene.setTransform(entityId, value)`; значения должны быть конечными числами. Пространственный рендеринг и вычисление мировых матриц пока отсутствуют.
+
+### Импорт изображений в проекте (03.2)
+
+`astro_assets` предоставляет `AssetRegistry::open(projectRoot)`, `importImage(relativePath)` и `reimport(AssetId)`. Источники PNG/JPEG должны находиться внутри `Assets/`; их исходные байты не меняются. Индекс стабильных ID находится в `.astro/assets.index`, проверенные исходники зеркалируются по SHA-256 в генерируемый `Library/Assets` (эта папка добавлена в `.gitignore`). Пример и ограничения: [ASSET_PIPELINE.md](docs/ASSET_PIPELINE.md).

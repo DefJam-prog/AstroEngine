@@ -25,3 +25,18 @@ END
 ## Границы
 
 На этапе 03.1 реализован только тип Transform. Другие компоненты, Asset references, неизвестные данные сторонних схем, пользовательские миграции, Transform в Inspector, Undo/Redo для Transform и runtime/spatial rendering не входят в текущий формат/API. Формат Scene не является форматом прогресса игры или Save System.
+
+## Asset index v1
+
+`<project>/.astro/assets.index` — UTF-8 line-based registry manifest:
+
+```text
+ASTRO_ASSETS 1
+NEXT <next-asset-id>
+ASSET <asset-id> "<Assets-relative UTF-8 path>" PNG|JPEG <width> <height> <source-size> <sha256-hex>
+END
+```
+
+Пути и quoted strings сериализуются через `std::quoted`. Значения ID положительные; `NEXT` больше всех занятых ID. Дубликаты ID и source path, неверный hash/размер/путь/format, неизвестная версия, лишние строки и повреждённый UTF-8 отклоняются. Индекс ограничен 16 MiB, 100000 asset entries и 4096 UTF-8 байт на source path. Сохранение использует временный файл и атомарную замену. Повреждённый индекс остаётся нетронутым и возвращает ошибку.
+
+Кэшированный файл находится в `Library/Assets/<sha256>.v1.<png|jpg>`. Сейчас он побайтно равен encoded source и восстанавливается через импорт; старые хэш-версии не удаляются. `Library/` добавлен в `.gitignore`; `.astro/assets.index` сохраняется в проекте.

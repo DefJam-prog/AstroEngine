@@ -67,3 +67,5 @@ ctest --test-dir build/stack-spike --output-on-failure
 Результаты прогона сохранены в `build/02.4-build.log` и `build/02.4-ctest.log`. Каталог сборки должен быть сконфигурирован заранее; для чистой конфигурации выберите новый каталог и следуйте инструкциям выше.
 
 Подэтап 03.1 проверялся теми же командами. Итоговые логи: `build/03.1-build.log`, `build/03.1-ctest.log`; Windows x64/MSVC Debug, CTest 9/9.
+
+Подэтап 03.2 использует те же команды; `cmake --build` автоматически повторно конфигурирует каталог после добавления `astro_assets`. Логи: `build/03.2-build.log`, `build/03.2-ctest.log`. Для asset-only проверки: `ctest --test-dir build/stack-spike -R '^assets\.' --output-on-failure`.

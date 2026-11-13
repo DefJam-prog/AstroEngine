@@ -55,6 +55,8 @@ ctest --preset windows-debug
 
 Подэтап 06.3: панели `View → Timeline` и `View → Camera Presets` редактируют/проигрывают один scalar animation track и вычисляют camera pose через существующие пресеты CameraRig. Это editor preview: animation не привязана к Scene properties, camera pose не рендерится, документы не сохраняются. См. [Timeline](docs/TIMELINE_EDITOR.md) и [Camera Rig](docs/CAMERA_RIG.md).
 
+Подэтап 06.4: окно `View → Save System` позволяет создавать пустые профили, явно выбирать сохраняемые свойства, составлять группы сущностей, подключать правила группы к профилю, настраивать checkpoint и проверять активацию/respawn на копии сцены с временным хранилищем. Данные authoring пока in-memory; ограничения: [Save System Editor](docs/SAVE_SYSTEM_EDITOR.md), результаты: [отчёт 06.4](docs/reports/06.4.md).
+
 ### Сцены редактора (02.4)
 
 В редакторе доступны сохранение/открытие сцены (Ctrl+S, Ctrl+O), Undo/Redo (Ctrl+Z, Ctrl+Y или Ctrl+Shift+Z) и панель Diagnostics. Astro Scene v4 сохраняет ID/имена сцены и сущностей, иерархию, Transform, SpriteRenderer AssetId и prefab instance metadata. Загрузчик также читает v1–v3. При несохранённых правках переключение проекта/сцены блокируется. Формат и миграции описаны в [FILE_FORMATS.md](docs/FILE_FORMATS.md).

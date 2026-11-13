@@ -31,6 +31,10 @@ add_subdirectory(engine/assets)
 add_subdirectory(engine/scene)
 add_subdirectory(engine/prefabs)
 
+if(ASTRO_BUILD_EDITOR OR BUILD_TESTING)
+    add_subdirectory(engine/save_editor)
+endif()
+
 if(ASTRO_BUILD_VISUAL_LOGIC OR ASTRO_BUILD_EDITOR OR BUILD_TESTING)
     add_subdirectory(engine/logic)
 endif()

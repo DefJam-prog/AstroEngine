@@ -1,8 +1,8 @@
 # Этапы, подэтапы и критерии приёмки
 
-Источник: раздел 10 требований пользователя. Подэтапы 00.1–00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4, 05.1–05.6 и 06.1–06.3 реализованы в ограниченном объёме по отчётам. Остальные этапы запланированы; наличие документов само по себе не означает прохождение приёмки.
+Источник: раздел 10 требований пользователя. Подэтапы 00.1–00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4, 05.1–05.6 и 06.1–06.4 реализованы в ограниченном объёме по отчётам. Остальные этапы запланированы; наличие документов само по себе не означает прохождение приёмки.
 
-00.1–00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4, 05.1–05.6 и 06.1–06.3: см. отчёты подэтапов.
+00.1–00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4, 05.1–05.6 и 06.1–06.4: см. отчёты подэтапов.
 
 Выполняется только явно назначенный пользователем подэтап. После него — отчёт и остановка до ручного подтверждения. Стек остаётся предварительным до успешной проверки 00.3; шаблоны создаются после реализации необходимых подсистем.
 
@@ -85,6 +85,8 @@
 Подэтап 06.2 реализован ограниченно: in-memory UI document authoring, две встроенные темы, Desktop/Tablet/Phone responsive preview и две валидируемые Scene bindings. Документ не сохраняется и не используется runtime Game UI; полная приёмка этапа 06 не достигнута.
 
 Подэтап 06.3 реализован ограниченно: scalar timeline/keyframe authoring and preview playback, plus CameraRig presets/custom pose panel. Neither timeline values bind to Scene properties nor camera output is rendered; full Stage 06 acceptance remains open.
+
+Подэтап 06.4 реализован ограниченно: in-memory explicit profile fields and entity groups, checkpoint authoring/XY preview, plus an isolated SaveStore/CheckpointSystem restore preview. Project persistence and unsupported gameplay properties remain open; see [SAVE_SYSTEM_EDITOR.md](SAVE_SYSTEM_EDITOR.md) and [report](reports/06.4.md).
 
 - **06.1** Visual Scripting, типизированные узлы и отладка.
 - **06.2** UI Editor, темы, привязки, responsive layout.

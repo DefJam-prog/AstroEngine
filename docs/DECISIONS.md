@@ -309,3 +309,11 @@ AssetId назначается монотонно и сохраняется в �
 - Timeline authoring is limited to one bounded scalar track with strict key ordering, linear interpolation, scrub and simple play/pause. This is not a general animation graph or Scene-property binding system.
 - Camera Presets reuses `CameraRig` modes and validation; the panel previews computed pose values only. It does not create a camera component or render a view.
 - Both panels use existing editor dependencies; no new external library is added. State remains in memory until a versioned animation document format is designed.
+
+## D039 — Keep Save System authoring explicit and runtime-compatible (06.4)
+
+- Editor groups are explicit entity-ID sets; profile group rules flatten to the existing `SaveProfile` entity/property pairs before runtime use. No scene-wide or tag-inferred saving is introduced.
+- The panel offers only Save v1 properties that the runtime can actually store. It validates component availability before compilation and reports unsupported/missing bindings instead of silently omitting them.
+- Checkpoint configuration is validated by `CheckpointSystem`; the XY view is a Transform-based authoring preview. Restore testing uses an isolated Scene copy and a unique OS temporary directory.
+- Profile/group/checkpoint authoring remains in memory in 06.4. Persisting it requires a versioned project document format and migration policy, so it is not added implicitly to Astro Scene v4 or player save slots.
+- No external dependency is added. This bounded editor work does not complete Save System product requirements such as tags, templates, health/inventory, conditions, or respawn policies.

@@ -6,6 +6,7 @@
 #include "astro/logic/VisualLogicGraph.hpp"
 #include "astro/runtime/AnimationTimeline.hpp"
 #include "astro/runtime/CameraRig.hpp"
+#include "astro/save_editor/SaveSystemDocument.hpp"
 #include "astro/scene/Scene.hpp"
 #include "astro/scene/SceneFile.hpp"
 #include "astro/ui/UiDocument.hpp"
@@ -21,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <functional>
@@ -633,6 +635,279 @@ void drawTimelineEditor(astro::runtime::AnimationTimeline& timeline, const float
     ImGui::End();
 }
 
+astro::core::Result<void> testCheckpointRestore(const astro::save_editor::SaveSystemDocument& document,
+    const Scene& source, const EntityId checkpointId)
+{
+    using namespace astro;
+    const auto profiles = document.compileProfiles(source);
+    if (!profiles) return core::Result<void>::failure(profiles.error());
+    const auto checkpoints = document.validateCheckpoints(source, profiles.value());
+    if (!checkpoints) return core::Result<void>::failure(checkpoints.error());
+    const auto definition = document.checkpoints().find(checkpointId);
+    if (definition == document.checkpoints().end())
+        return core::Result<void>::failure({core::ErrorCode::NotFound, "Select an authored checkpoint first"});
+    EntityId actor = 0;
+    for (const auto& entity : source.entities()) if (entity.id != checkpointId) { actor = entity.id; break; }
+    if (!actor) return core::Result<void>::failure({core::ErrorCode::InvalidState, "Create another scene entity to act as the checkpoint player"});
+    if (definition->second.mode == runtime::CheckpointMode::SaveSelectedProfile)
+    {
+        const auto profile = profiles.value().find(definition->second.saveProfileId);
+        if (profile == profiles.value().end() || !profile->second.fields().contains(actor)
+            || std::find(profile->second.fields().at(actor).begin(), profile->second.fields().at(actor).end(),
+                runtime::SaveProperty::entityName) == profile->second.fields().at(actor).end())
+            return core::Result<void>::failure({core::ErrorCode::ValidationError,
+                "Restore preview needs entity.name explicitly selected for the test actor in this profile"});
+    }
+
+    auto root = std::filesystem::temp_directory_path()
+        / ("AstroEngine-Checkpoint-Preview-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::error_code ec;
+    if (!std::filesystem::create_directory(root, ec) || ec)
+        return core::Result<void>::failure({core::ErrorCode::IoError, "Could not create isolated checkpoint preview directory"});
+    struct OwnedDirectory
+    {
+        std::filesystem::path path;
+        ~OwnedDirectory() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
+    } cleanup{root};
+
+    auto storeResult = runtime::SaveStore::open(root, 100);
+    if (!storeResult) return core::Result<void>::failure(storeResult.error());
+    auto store = std::move(storeResult).value();
+    runtime::CheckpointSystem system;
+    auto registered = system.registerCheckpoint(source, definition->second);
+    if (!registered) return registered;
+    auto preview = source;
+    auto actorTransform = preview.transform(actor)->value;
+    actorTransform.position.x = -100000.0;
+    if (!preview.setTransform(actor, actorTransform))
+        return core::Result<void>::failure({core::ErrorCode::ValidationError, "Could not position preview actor outside checkpoint"});
+    core::EventBus events;
+    runtime::CheckpointSaveContext context{&store, &profiles.value(), "editor-preview"};
+    auto update = system.update(preview, actor, events,
+        definition->second.mode == runtime::CheckpointMode::SaveSelectedProfile ? &context : nullptr);
+    if (!update) return core::Result<void>::failure(update.error());
+    actorTransform.position = preview.transform(checkpointId)->value.position;
+    if (!preview.setTransform(actor, actorTransform))
+        return core::Result<void>::failure({core::ErrorCode::ValidationError, "Could not move preview actor into checkpoint"});
+    update = system.update(preview, actor, events,
+        definition->second.mode == runtime::CheckpointMode::SaveSelectedProfile ? &context : nullptr);
+    if (!update || update.value().activated != 1)
+        return core::Result<void>::failure(update ? core::Error{core::ErrorCode::InvalidState, "Checkpoint did not activate"} : update.error());
+    if (definition->second.mode == runtime::CheckpointMode::SaveSelectedProfile)
+    {
+        preview.find(actor)->name = "Preview mutated";
+        auto restored = system.respawn(preview, actor,
+            {runtime::RespawnRestoreMode::SelectedProfile, {}}, events, &context);
+        if (!restored) return core::Result<void>::failure(restored.error());
+        if (preview.find(actor)->name != source.find(actor)->name)
+            return core::Result<void>::failure({core::ErrorCode::ValidationError, "Selected profile did not restore the actor name"});
+    }
+    else
+    {
+        auto restored = system.respawn(preview, actor,
+            {runtime::RespawnRestoreMode::PositionOnly, {}}, events);
+        if (!restored) return core::Result<void>::failure(restored.error());
+    }
+    return core::Result<void>::success();
+}
+
+void drawSaveSystemEditor(astro::save_editor::SaveSystemDocument& document, const Scene& scene,
+    const std::optional<EntityId> selectedEntity, const std::function<void(const std::string&)>& reportError,
+    bool& windowDrawn)
+{
+    using namespace astro::runtime;
+    if (!ImGui::Begin("Save System")) { ImGui::End(); return; }
+    windowDrawn = true;
+    ImGui::TextDisabled("Explicitly selected fields only. Authoring currently stays in editor memory.");
+    static std::array<char, 65> groupId{"progress"};
+    static std::array<char, 65> profileId{"player-progress"};
+    ImGui::SeparatorText("Groups");
+    ImGui::InputText("New group ID", groupId.data(), groupId.size());
+    ImGui::SameLine();
+    if (ImGui::Button("Create group"))
+    {
+        auto result = document.createGroup(groupId.data());
+        if (!result) reportError(result.error().message);
+    }
+    static int groupIndex = 0;
+    std::vector<const char*> groups;
+    for (const auto& [id, value] : document.groups()) { (void)value; groups.push_back(id.c_str()); }
+    if (!groups.empty())
+    {
+        groupIndex = std::clamp(groupIndex, 0, static_cast<int>(groups.size()) - 1);
+        ImGui::Combo("Group", &groupIndex, groups.data(), static_cast<int>(groups.size()));
+        const auto& group = std::next(document.groups().begin(), groupIndex)->second;
+        ImGui::Text("Members: %zu", group.entities.size());
+        if (selectedEntity && scene.find(*selectedEntity))
+        {
+            const bool member = group.entities.contains(*selectedEntity);
+            if (ImGui::Button(member ? "Remove selected entity from group" : "Add selected entity to group"))
+            {
+                auto result = document.setGroupMember(group.id, *selectedEntity, !member);
+                if (!result) reportError(result.error().message);
+            }
+        }
+        else ImGui::TextDisabled("Select a Hierarchy entity to edit group membership.");
+    }
+    else ImGui::TextDisabled("Groups are explicit entity lists; no tag inference is performed.");
+
+    ImGui::SeparatorText("Save profiles");
+    ImGui::InputText("New profile ID", profileId.data(), profileId.size());
+    ImGui::SameLine();
+    if (ImGui::Button("Create empty profile"))
+    {
+        auto result = document.createProfile(profileId.data());
+        if (!result) reportError(result.error().message);
+    }
+    static int profileIndex = 0;
+    std::vector<const char*> profiles;
+    for (const auto& [id, value] : document.profiles()) { (void)value; profiles.push_back(id.c_str()); }
+    static constexpr const char* properties[]{"entity.name", "transform.position.x", "transform.position.y",
+        "transform.position.z", "transform.rotation.x", "transform.rotation.y", "transform.rotation.z",
+        "transform.scale.x", "transform.scale.y", "transform.scale.z", "sprite_renderer.visible"};
+    static int propertyIndex = 0;
+    if (!profiles.empty())
+    {
+        profileIndex = std::clamp(profileIndex, 0, static_cast<int>(profiles.size()) - 1);
+        ImGui::Combo("Profile", &profileIndex, profiles.data(), static_cast<int>(profiles.size()));
+        const auto& profile = std::next(document.profiles().begin(), profileIndex)->second;
+        ImGui::Combo("Property", &propertyIndex, properties, static_cast<int>(std::size(properties)));
+        if (selectedEntity && scene.find(*selectedEntity))
+        {
+            const bool fieldSelected = profile.fields.contains(*selectedEntity)
+                && profile.fields.at(*selectedEntity).contains(properties[propertyIndex]);
+            if (ImGui::Button(fieldSelected ? "Remove field from selected entity" : "Save field on selected entity"))
+            {
+                auto result = document.setField(profile.id, *selectedEntity, properties[propertyIndex], !fieldSelected);
+                if (!result) reportError(result.error().message);
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("Group rule:");
+            if (!groups.empty())
+            {
+                const auto& group = std::next(document.groups().begin(), groupIndex)->second;
+                const auto rules = profile.groupFields.find(group.id);
+                const bool enabled = rules != profile.groupFields.end() && rules->second.contains(properties[propertyIndex]);
+                if (ImGui::SmallButton(enabled ? "Remove group rule" : "Add group rule"))
+                {
+                    auto result = document.setGroupField(profile.id, group.id, properties[propertyIndex], !enabled);
+                    if (!result) reportError(result.error().message);
+                }
+            }
+            else ImGui::TextDisabled("create a group first");
+        }
+        else ImGui::TextDisabled("Select a scene entity to assign explicit fields.");
+        const auto compiled = document.compileProfiles(scene);
+        if (!compiled) ImGui::TextColored(ImVec4(1, 0.35f, 0.25f, 1), "Profile validation: %s", compiled.error().message.c_str());
+        else
+        {
+            const auto& effective = compiled.value().at(profile.id).fields();
+            std::size_t count = 0;
+            for (const auto& [entity, fields] : effective) { (void)entity; count += fields.size(); }
+            ImGui::Text("Effective selected fields: %zu", count);
+            for (const auto& [entity, fields] : effective)
+                for (const auto& field : fields)
+                    ImGui::BulletText("Entity %llu — %s", static_cast<unsigned long long>(entity), field.c_str());
+        }
+    }
+    else ImGui::TextDisabled("Profiles start empty; add fields explicitly.");
+
+    ImGui::SeparatorText("Checkpoints");
+    if (selectedEntity && scene.find(*selectedEntity) && scene.transform(*selectedEntity))
+    {
+        auto found = document.checkpoints().find(*selectedEntity);
+        const bool checkpointExists = found != document.checkpoints().end();
+        CheckpointDefinition definition;
+        if (checkpointExists) definition = found->second;
+        else { definition.entity = *selectedEntity; definition.respawnPosition = scene.transform(*selectedEntity)->value.position; }
+        ImGui::Text("Checkpoint entity: %llu", static_cast<unsigned long long>(*selectedEntity));
+        bool changed = false;
+        changed |= ImGui::InputDouble("Area half-width", &definition.area.halfWidth, 0.1, 1.0, "%.2f");
+        changed |= ImGui::InputDouble("Area half-height", &definition.area.halfHeight, 0.1, 1.0, "%.2f");
+        changed |= ImGui::InputDouble("Respawn X", &definition.respawnPosition.x, 0.1, 1.0, "%.2f");
+        changed |= ImGui::InputDouble("Respawn Y", &definition.respawnPosition.y, 0.1, 1.0, "%.2f");
+        changed |= ImGui::InputDouble("Respawn Z", &definition.respawnPosition.z, 0.1, 1.0, "%.2f");
+        int mode = static_cast<int>(definition.mode);
+        if (ImGui::Combo("Activation", &mode, "Respawn only\0Save selected profile\0"))
+        { definition.mode = static_cast<CheckpointMode>(mode); if (definition.mode == CheckpointMode::RespawnOnly) definition.saveProfileId.clear(); changed = true; }
+        int repeat = static_cast<int>(definition.repeatMode);
+        if (ImGui::Combo("Repeat", &repeat, "Repeatable\0One shot\0")) { definition.repeatMode = static_cast<CheckpointRepeatMode>(repeat); changed = true; }
+        if (definition.mode == CheckpointMode::SaveSelectedProfile)
+        {
+            if (!profiles.empty())
+            {
+                const auto& selectedProfile = std::next(document.profiles().begin(), profileIndex)->first;
+                if (ImGui::Button(("Use profile: " + selectedProfile).c_str())) { definition.saveProfileId = selectedProfile; changed = true; }
+            }
+            ImGui::Text("Profile: %s", definition.saveProfileId.empty() ? "(select a profile)" : definition.saveProfileId.c_str());
+            int slot = static_cast<int>(definition.slot);
+            if (ImGui::InputInt("Save slot", &slot)) { definition.slot = static_cast<std::size_t>(std::max(slot, 0)); changed = true; }
+        }
+        ImGui::Checkbox("Enabled", &definition.enabled);
+        changed |= ImGui::IsItemEdited();
+        if (ImGui::Button(checkpointExists ? "Apply checkpoint" : "Add / validate checkpoint")) changed = true;
+        if (changed)
+        {
+            auto result = document.setCheckpoint(definition);
+            if (!result) reportError(result.error().message);
+            else
+            {
+                auto compiled = document.compileProfiles(scene);
+                if (compiled)
+                {
+                    auto valid = document.validateCheckpoints(scene, compiled.value());
+                    if (!valid) reportError(valid.error().message);
+                }
+                else reportError(compiled.error().message);
+            }
+        }
+        bool removedCheckpoint = false;
+        if (checkpointExists && ImGui::Button("Remove checkpoint"))
+        {
+            auto result = document.removeCheckpoint(*selectedEntity);
+            if (!result) reportError(result.error().message);
+            removedCheckpoint = static_cast<bool>(result);
+        }
+        if (checkpointExists && !removedCheckpoint && ImGui::Button("Test checkpoint activation and restore"))
+        {
+            const auto tested = testCheckpointRestore(document, scene, *selectedEntity);
+            if (!tested) reportError(tested.error().message);
+        }
+    }
+    else ImGui::TextDisabled("Select a scene entity with Transform to author its checkpoint.");
+
+    ImGui::SeparatorText("Checkpoint XY map");
+    const auto mapSize = ImVec2(-1.0f, 150.0f);
+    if (ImGui::BeginChild("CheckpointMap", mapSize, true))
+    {
+        const auto origin = ImGui::GetCursorScreenPos();
+        const auto size = ImGui::GetContentRegionAvail();
+        auto* draw = ImGui::GetWindowDrawList();
+        draw->AddRectFilled(origin, ImVec2(origin.x + size.x, origin.y + size.y), IM_COL32(24, 29, 38, 255));
+        constexpr float scale = 8.0f;
+        const ImVec2 center(origin.x + size.x * 0.5f, origin.y + size.y * 0.5f);
+        for (const auto& entity : scene.entities())
+        {
+            const auto* transform = scene.transform(entity.id);
+            if (!transform) continue;
+            const ImVec2 point(center.x + static_cast<float>(transform->value.position.x) * scale,
+                center.y - static_cast<float>(transform->value.position.y) * scale);
+            draw->AddCircleFilled(point, entity.id == selectedEntity.value_or(0) ? 5.0f : 3.0f,
+                entity.id == selectedEntity.value_or(0) ? IM_COL32(255, 210, 90, 255) : IM_COL32(120, 180, 230, 255));
+            draw->AddText(ImVec2(point.x + 5, point.y), IM_COL32(225, 230, 240, 255), entity.name.c_str());
+            const auto checkpoint = document.checkpoints().find(entity.id);
+            if (checkpoint != document.checkpoints().end())
+                draw->AddRect(ImVec2(point.x - static_cast<float>(checkpoint->second.area.halfWidth) * scale,
+                    point.y - static_cast<float>(checkpoint->second.area.halfHeight) * scale),
+                    ImVec2(point.x + static_cast<float>(checkpoint->second.area.halfWidth) * scale,
+                        point.y + static_cast<float>(checkpoint->second.area.halfHeight) * scale), IM_COL32(100, 230, 130, 230));
+        }
+    }
+    ImGui::EndChild();
+    ImGui::TextDisabled("XY preview only; does not move Scene entities or render gameplay triggers.");
+    ImGui::End();
+}
+
 void drawCameraPresets(astro::runtime::CameraRig& camera, const Scene& scene,
     const std::optional<EntityId> selectedEntity, const float deltaSeconds,
     const std::function<void(const std::string&)>& reportError, bool& windowDrawn)
@@ -1065,6 +1340,8 @@ public:
         astro::runtime::CameraRig cameraRig;
         bool showTimeline = false, showCameraPresets = false;
         bool timelineWindowDrawn = false, cameraWindowDrawn = false;
+        bool showSaveSystem = false, saveSystemWindowDrawn = false;
+        astro::save_editor::SaveSystemDocument saveSystemDocument;
         bool showUiEditor = false, uiEditorWindowDrawn = false;
         astro::ui::UiDocument uiDocument;
         std::optional<astro::ui::ElementId> selectedUiElement;
@@ -1283,6 +1560,7 @@ public:
                 throw std::runtime_error("Scene model smoke failed");
             selectedEntity = root.value();
             showTimeline = true;
+            showSaveSystem = true;
             showCameraPresets = true;
             if (!timeline.seek(0.5) || timeline.sample() != 5.0
                 || !cameraRig.setMode(astro::runtime::CameraMode::ThirdPerson))
@@ -1322,6 +1600,23 @@ public:
             if (!commands.execute<astro::scene::SetSpriteRendererPayload, void>("entity.set_sprite_renderer", 1, setSprite)
                 || !scene.spriteRenderer(root.value()))
                 throw std::runtime_error("SpriteRenderer command smoke failed");
+            if (!saveSystemDocument.createGroup("smoke-actors")
+                || !saveSystemDocument.setGroupMember("smoke-actors", root.value(), true)
+                || !saveSystemDocument.createProfile("smoke-progress")
+                || !saveSystemDocument.setGroupField("smoke-progress", "smoke-actors",
+                    std::string(astro::runtime::SaveProperty::entityName), true))
+                throw std::runtime_error("Save System profile/group smoke setup failed");
+            astro::runtime::CheckpointDefinition smokeCheckpoint;
+            smokeCheckpoint.entity = child.value();
+            smokeCheckpoint.area = {2.0, 2.0};
+            smokeCheckpoint.respawnPosition = {3.0, 4.0, 0.0};
+            smokeCheckpoint.mode = astro::runtime::CheckpointMode::SaveSelectedProfile;
+            smokeCheckpoint.saveProfileId = "smoke-progress";
+            if (!saveSystemDocument.setCheckpoint(smokeCheckpoint))
+                throw std::runtime_error("Save System checkpoint smoke setup failed");
+            const auto restorePreview = testCheckpointRestore(saveSystemDocument, scene, child.value());
+            if (!restorePreview)
+                throw std::runtime_error("Save System restore preview failed: " + restorePreview.error().message);
             sceneDirty = true;
             if (!saveCurrentScene() || !queueShortcut(SDLK_Z) || !queueShortcut(SDLK_Y)
                 || !queueShortcut(SDLK_S) || !queueShortcut(SDLK_O))
@@ -1423,12 +1718,14 @@ public:
                     ImGui::MenuItem("UI Editor", nullptr, &showUiEditor);
                     ImGui::MenuItem("Timeline", nullptr, &showTimeline);
                     ImGui::MenuItem("Camera Presets", nullptr, &showCameraPresets);
+                    ImGui::MenuItem("Save System", nullptr, &showSaveSystem);
                     if (ImGui::MenuItem("Reset layout"))
                     {
                         resetLayout = true;
                         showProject = showDiagnostics = showVisualLogic = true;
                         showUiEditor = true;
                         showTimeline = showCameraPresets = true;
+                        showSaveSystem = true;
                     }
                     ImGui::EndMenu();
                 }
@@ -1453,6 +1750,7 @@ public:
                 ImGui::DockBuilderDockWindow("UI Editor", right);
                 ImGui::DockBuilderDockWindow("Timeline", right);
                 ImGui::DockBuilderDockWindow("Camera Presets", right);
+                ImGui::DockBuilderDockWindow("Save System", right);
                 ImGui::DockBuilderFinish(dock);
                 resetLayout = false;
             }
@@ -1575,6 +1873,8 @@ public:
             }
             if (showTimeline)
                 drawTimelineEditor(timeline, ImGui::GetIO().DeltaTime, reportError, timelineWindowDrawn);
+            if (showSaveSystem)
+                drawSaveSystemEditor(saveSystemDocument, scene, selectedEntity, reportError, saveSystemWindowDrawn);
             if (showCameraPresets)
                 drawCameraPresets(cameraRig, scene, selectedEntity, ImGui::GetIO().DeltaTime,
                     reportError, cameraWindowDrawn);
@@ -1685,7 +1985,10 @@ public:
             && uiEditorWindowDrawn && uiDocument.elements().size() == 1
             && uiDocument.find(1)->text == "Edited Root Ω"
             && timelineWindowDrawn && timeline.keyframes().size() == 3 && timeline.sample() == 5.0
-            && cameraWindowDrawn && cameraRig.settings().mode == astro::runtime::CameraMode::ThirdPerson) ? 1 : 0;
+            && cameraWindowDrawn && cameraRig.settings().mode == astro::runtime::CameraMode::ThirdPerson
+            && saveSystemWindowDrawn && saveSystemDocument.profiles().contains("smoke-progress")
+            && saveSystemDocument.groups().contains("smoke-actors")
+            && saveSystemDocument.checkpoints().contains(2)) ? 1 : 0;
     }
 };
 }

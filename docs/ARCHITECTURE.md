@@ -105,7 +105,7 @@ Export создаёт самостоятельный runtime с минималь
 
 ## Границы текущего решения
 
-Save System & Checkpoint Editor — обязательный модуль продукта с явным выбором сохраняемых объектов, компонентов и свойств. Требования к SaveProfile, checkpoint, respawn, хранению и проверкам описаны в [SAVE_SYSTEM.md](SAVE_SYSTEM.md). Автоматическое сохранение всего мира без выбора профиля/правил запрещено. В 05.4 реализовано selective runtime save для Name, Transform scalar fields и SpriteRenderer visibility; SaveStore пишет в переданный user-data root, а не в проект. Checkpoint, respawn и GUI authoring ещё отсутствуют.
+Save System & Checkpoint Editor — обязательный модуль продукта с явным выбором сохраняемых объектов, компонентов и свойств. Требования к SaveProfile, checkpoint, respawn, хранению и проверкам описаны в [SAVE_SYSTEM.md](SAVE_SYSTEM.md). Автоматическое сохранение всего мира без выбора профиля/правил запрещено. Runtime save/checkpoint реализованы в 05.4–05.5; ограниченный editor authoring и restore preview добавлены в 06.4. Группы и профили пока не сериализуются, а набор доступных полей ограничен Save v1.
 
 Адаптеры рендеринга, физики, звука и импорта должны позволять заменять библиотеки без переписывания ядра. Бинарный ABI, схемы payload, правила владения конкретными объектами и детали миграций пока не определены. Их нельзя считать готовыми контрактами реализации.
 
@@ -156,8 +156,8 @@ Astro Scene v4 сериализует ID, Transform, SpriteRenderer и prefab in
 
 ## Runtime save slots (05.4)
 
-`astro_runtime_save` is an optional Scene-state persistence target. A versioned `SaveProfile` starts empty and explicitly selects individual properties by stable Entity ID; `SaveStore` writes numbered slots with CRC32 integrity checks, a bounded file size, atomic replacement, and `.bak` fallback. Loading validates before applying to a Scene copy. It does not serialize whole scenes or automatically persist anything; supported fields and limits are in [SAVE_SYSTEM.md](SAVE_SYSTEM.md) and [FILE_FORMATS.md](FILE_FORMATS.md).
+`astro_runtime_save` is an optional Scene-state persistence target. A versioned `SaveProfile` starts empty and explicitly selects individual properties by stable Entity ID; `SaveStore` writes numbered slots with CRC32 integrity checks, a bounded file size, atomic replacement, and `.bak` fallback. Loading validates before applying to a Scene copy. `astro_save_editor` is editor/test-only authoring: explicit groups flatten into SaveProfile fields; it does not serialize whole scenes or automatically persist anything. Supported fields and limits are in [SAVE_SYSTEM.md](SAVE_SYSTEM.md), [Save System Editor](SAVE_SYSTEM_EDITOR.md), and [FILE_FORMATS.md](FILE_FORMATS.md).
 
 ## Runtime checkpoints and respawn (05.5)
 
-`astro_runtime_checkpoint` detects actor XY entry into code-registered 2D AABBs, applies optional runtime conditions, tracks one-shot/repeatable use, and emits typed events. A definition explicitly chooses position-only or a named SaveProfile/slot. Respawn is called by the host game; selected-profile restore is opt-in and the checkpoint spawn position is applied after save-state load. Definitions/state are runtime-only; no death detector, Scene component, physics trigger, visual area or editor authoring is implied. See [SAVE_SYSTEM.md](SAVE_SYSTEM.md).
+`astro_runtime_checkpoint` detects actor XY entry into code-registered 2D AABBs, applies optional runtime conditions, tracks one-shot/repeatable use, and emits typed events. A definition explicitly chooses position-only or a named SaveProfile/slot. Respawn is called by the host game; selected-profile restore is opt-in and the checkpoint spawn position is applied after save-state load. Definitions/runtime state are runtime-only; 06.4 provides an in-memory editor configuration, Transform-based XY preview, and isolated restore test, but no Scene component, physics trigger, rendered trigger, or project persistence. See [SAVE_SYSTEM.md](SAVE_SYSTEM.md).

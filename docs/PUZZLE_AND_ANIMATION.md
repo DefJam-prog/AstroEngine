@@ -17,7 +17,7 @@ The seed supports reproducible tests and replay setup; runtime state is not seri
 
 ## Scalar animation tracks
 
-`AnimationTrack::create` validates finite, strictly increasing keyframe times. `sample(seconds)` performs linear interpolation and clamps before/after the track; a non-finite sample time returns the first keyframe. It is a deterministic sampling primitive; there is no scene-property binding, easing library, event tracks, playback controller, serialization, or renderer integration yet.
+`astro_runtime_animation` provides `AnimationTrack` and the editable `AnimationTimeline` model. The former validates finite, strictly increasing keyframe times and samples linear interpolation with endpoint clamping. The latter supports validated key edits, a clamped playhead, and simple play/pause/advance. The model is built when Editor/tests are enabled, or with `-DASTRO_BUILD_ANIMATION_RUNTIME=ON`. `ASTRO_BUILD_PUZZLE_RUNTIME=ON` also enables and links it for compatibility with earlier target use. There is no Scene-property binding, easing library, event track, serialization, or game renderer integration. The editor workflow is documented in [TIMELINE_EDITOR.md](TIMELINE_EDITOR.md).
 
 ## SDL audio cues
 
@@ -26,7 +26,7 @@ The optional `astro_runtime_sdl_audio` target uses the SDL3 audio stream API to 
 Optional build and tests:
 
 ```powershell
-cmake -S . -B build/stack-spike -DASTRO_BUILD_GAME_UI_DEMO=ON -DBUILD_TESTING=ON
+cmake -S . -B build/stack-spike -DASTRO_BUILD_GAME_UI_DEMO=ON -DASTRO_BUILD_ANIMATION_RUNTIME=ON -DBUILD_TESTING=ON
 cmake --build build/stack-spike --parallel 4
 ctest --test-dir build/stack-spike --output-on-failure
 ```

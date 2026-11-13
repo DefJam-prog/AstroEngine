@@ -53,6 +53,8 @@ CI workflow в 00.2 не добавлен: реализован локальны
 
 `-DBUILD_TESTING=OFF` исключает регистрацию тестов. Сборка не требует сети после подготовки toolchain. UTF-8 включён для MSVC; пути в командах теста заключены в кавычки. Фактическая сборка в путях с пробелами и Unicode ещё не проверена.
 
+Optional `astro_runtime_animation` (scalar track and timeline playback model) is enabled by `-DASTRO_BUILD_ANIMATION_RUNTIME=ON`; it has no SDL/bgfx/ImGui dependency. `ASTRO_BUILD_PUZZLE_RUNTIME=ON` also builds/links this target to preserve the earlier puzzle target's animation dependency. The editor and test configurations enable it automatically.
+
 В этой среде CMake/CTest/Ninja и MSVC доступны через Visual Studio 2022 Developer Command Prompt x64. Фактические результаты текущей сборки и CTest приведены в [отчёте 01.5](reports/01.5.md); поддержку macOS/Android/iOS не проверяли.
 
 ## Упаковка Windows runtime (этап 05.6)

@@ -302,3 +302,10 @@ AssetId назначается монотонно и сохраняется в �
 - Binding refresh reads Scene values into the UI document and never writes to Scene. It validates all bindings before applying refreshed values, so a stale source does not partially update the document.
 - The first authoring panel is an in-memory editor prototype. Versioned UI-file persistence, gameplay/runtime rendering, more binding sources, navigation/input, localization, nested interactive layout editing, and custom theme authoring are deferred. This does not satisfy full Stage 06 acceptance.
 - No additional third-party dependency is introduced; the Editor panel uses the existing ImGui integration.
+
+## D038 — Separate animation sampling from puzzle runtime and expose an editor preview (06.3)
+
+- `AnimationTrack` and `AnimationTimeline` live in the optional `astro_runtime_animation` target. `ASTRO_BUILD_PUZZLE_RUNTIME` retains a public dependency on that target for compatibility; `ASTRO_BUILD_ANIMATION_RUNTIME` enables animation without the Puzzle module.
+- Timeline authoring is limited to one bounded scalar track with strict key ordering, linear interpolation, scrub and simple play/pause. This is not a general animation graph or Scene-property binding system.
+- Camera Presets reuses `CameraRig` modes and validation; the panel previews computed pose values only. It does not create a camera component or render a view.
+- Both panels use existing editor dependencies; no new external library is added. State remains in memory until a versioned animation document format is designed.

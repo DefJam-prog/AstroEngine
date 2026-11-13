@@ -53,6 +53,8 @@ ctest --preset windows-debug
 
 Подэтап 06.2: панель `View → UI Editor` создаёт Text/Button/Panel элементы, редактирует тёмную/светлую тему и responsive anchors/offsets, показывает Desktop/Tablet/Phone preview и поддерживает привязки `Entity.Name` и `SpriteRenderer.Visible`. UI-документы пока живут только в памяти редактора и не отображаются в игровой сборке. См. [руководство UI Editor](docs/UI_EDITOR.md).
 
+Подэтап 06.3: панели `View → Timeline` и `View → Camera Presets` редактируют/проигрывают один scalar animation track и вычисляют camera pose через существующие пресеты CameraRig. Это editor preview: animation не привязана к Scene properties, camera pose не рендерится, документы не сохраняются. См. [Timeline](docs/TIMELINE_EDITOR.md) и [Camera Rig](docs/CAMERA_RIG.md).
+
 ### Сцены редактора (02.4)
 
 В редакторе доступны сохранение/открытие сцены (Ctrl+S, Ctrl+O), Undo/Redo (Ctrl+Z, Ctrl+Y или Ctrl+Shift+Z) и панель Diagnostics. Astro Scene v4 сохраняет ID/имена сцены и сущностей, иерархию, Transform, SpriteRenderer AssetId и prefab instance metadata. Загрузчик также читает v1–v3. При несохранённых правках переключение проекта/сцены блокируется. Формат и миграции описаны в [FILE_FORMATS.md](docs/FILE_FORMATS.md).

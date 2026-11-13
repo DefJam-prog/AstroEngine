@@ -7,8 +7,8 @@
 | Продуктовые требования P01–P14 | Записаны в PRODUCT_REQUIREMENTS.md; реализация отсутствует |
 | Предварительный стек | Записан в TECH_STACK.md; не утверждён окончательно |
 | Решение о стеке | Предложение D001 в DECISIONS.md |
-| Слои архитектуры и контракты | Core/Scene/Assets/Prefabs и прототип Visual Logic реализованы в ограниченном объёме; см. ARCHITECTURE.md и отчёты |
-| Графический редактор и UX | Минимальный редактор есть; 06.1 добавил Visual Logic, 06.2 — UI authoring/preview prototype; полный UX из EDITOR_UX.md не реализован |
+| Слои архитектуры и контракты | Core/Scene/Assets/Prefabs, Visual Logic, UI Editor и Timeline prototypes реализованы в ограниченном объёме; см. ARCHITECTURE.md и отчёты |
+| Графический редактор и UX | Минимальный редактор есть; 06.1 Visual Logic, 06.2 UI authoring, 06.3 Timeline/Camera panels; полный UX из EDITOR_UX.md не реализован |
 | Save System & Checkpoint Editor | 05.4–05.5: selective slots + runtime checkpoint/respawn; editor authoring и расширенные игровые поля отсутствуют |
 | Игровые системы и расширения | Требования раздела 07 записаны в GAME_SYSTEMS.md и D005; реализация отсутствует, требуется проверенная основа |
 | Шаблоны игр T01–T10 | Требования раздела 08 записаны в GAME_TEMPLATES.md и D006; шаблоны, конструктор и smoke-тесты отсутствуют |
@@ -27,20 +27,21 @@
 | Исходники и API | Core API 01.1–01.5; Scene v4 читает v1–v3; Transform, SpriteRenderer и prefab instance metadata; `astro_prefabs` с nested prefab, source mapping, overrides, update API и транзакционными командами |
 | Подэтап 05.1 | Runtime PhysicsWorld2D: static/dynamic bodies, XY AABB overlap, gravity, simple resolution, Enter/Stay/Exit events; кодовые привязки, не сериализуются |
 | Подэтап 05.2 | GameUiModel для меню/HUD/паузы/настроек; optional SDL3/ImGui demo, не зависит от Editor target |
-| Подэтап 05.3 | Optional match-three rules (`ASTRO_BUILD_PUZZLE_RUNTIME`), scalar animation tracks, SDL synthesized audio cues; нет visual puzzle board или audio asset playback |
+| Подэтап 05.3 | Optional match-three rules (`ASTRO_BUILD_PUZZLE_RUNTIME`), scalar animation runtime (separated into `astro_runtime_animation` in 06.3), SDL synthesized audio cues; нет visual puzzle board или audio asset playback |
 | Подэтап 05.4 | Explicit Entity/property profiles, indexed slots, schema/game version checks, CRC32, atomic write and backup fallback |
 | Подэтап 05.5 | Runtime XY checkpoint triggers, callback conditions, one-shot/repeatable use, typed events, opt-in selected-profile respawn |
 | Подэтап 05.6 | Optional Windows x64/MSVC Game UI runtime ZIP, SDL3/ImGui license texts, clean-start smoke; full Stage 05 acceptance remains incomplete |
 | Подэтап 06.1 | Typed dataflow graph, deterministic synchronous debugger and editor panel; no graph persistence, command/Scene integration, branches or drag-wire authoring |
 | Подэтап 06.2 | UI Editor model/panel, Dark/Light theme preview, responsive anchors, Desktop/Tablet/Phone preview, validated Entity.Name/Text and SpriteRenderer.Visible/Visible bindings; no UI-file persistence or game-runtime rendering |
-| Сборка и тесты | Windows x64/MSVC Debug: 06.2 editor profile 30/30; headless regression 25/25; 06.1 package smoke passed in 05.6 |
+| Подэтап 06.3 | Timeline scalar key editing/playback/curve preview; CameraRig preset/custom pose editor; no Scene animation bindings or rendered camera view |
+| Сборка и тесты | Windows x64/MSVC Debug: 06.3 editor profile 31/31; headless regression 26/26; timeline, camera, UI and Visual Logic smokes passed |
 | Политика проверок и документации | Требования записаны в TESTING.md и D009; это не результаты выполненных тестов |
 | Недостающие документы целевого комплекта | docs/FILE_FORMATS.md, docs/TEMPLATE_GUIDE.md |
 | Совместимость и лицензии зависимостей | Не проверены |
 
 Сборка проверена из Visual Studio 2022 Developer Command Prompt x64; инструменты доступны через среду VS, хотя в обычном PowerShell не все присутствуют в PATH.
 
-00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4, 05.1–05.6 и 06.1–06.2: см. отчёты этапов. Приёмка законченной игры этапа 05 и всего этапа 06 ещё не выполнена.
+00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4, 05.1–05.6 и 06.1–06.3: см. отчёты этапов. Приёмка законченной игры этапа 05 и всего этапа 06 ещё не выполнена.
 
 ## Подэтап 05.1
 
@@ -52,7 +53,7 @@
 
 ## Подэтап 05.3
 
-`astro_runtime_puzzle` реализует deterministic seeded match-three rules, cascades, refill, score и level thresholds; `AnimationTrack` валидирует и интерполирует scalar keyframes. Optional SDL3 audio stream queues short synthesized cues and is used by the Game UI demo when available. Build/test profile: Windows x64/MSVC Debug, CTest 24/24. Нету serialized level/progress, visible puzzle board, scene animation binding, audio assets/mixer, spatialization или physical-speaker verification. См. [PUZZLE_AND_ANIMATION.md](PUZZLE_AND_ANIMATION.md) и [отчёт](reports/05.3.md).
+`astro_runtime_puzzle` реализует deterministic seeded match-three rules, cascades, refill, score и level thresholds; `astro_runtime_animation` provides `AnimationTrack` and `AnimationTimeline` separately. Existing `ASTRO_BUILD_PUZZLE_RUNTIME` continues to link the animation target; enable `ASTRO_BUILD_ANIMATION_RUNTIME` to build animation alone. Optional SDL3 audio stream queues short synthesized cues and is used by the Game UI demo when available. Build/test profile: Windows x64/MSVC Debug, CTest 24/24 at the original 05.3 implementation. Нету serialized level/progress, Scene animation binding, audio assets/mixer, spatialization или physical-speaker verification. См. [PUZZLE_AND_ANIMATION.md](PUZZLE_AND_ANIMATION.md), [TIMELINE_EDITOR.md](TIMELINE_EDITOR.md) и [отчёт](reports/05.3.md).
 
 ## Подэтап 05.4
 

@@ -4,6 +4,8 @@
 #include "ProjectFile.hpp"
 #include "astro/assets/AssetRegistry.hpp"
 #include "astro/logic/VisualLogicGraph.hpp"
+#include "astro/runtime/AnimationTimeline.hpp"
+#include "astro/runtime/CameraRig.hpp"
 #include "astro/scene/Scene.hpp"
 #include "astro/scene/SceneFile.hpp"
 #include "astro/ui/UiDocument.hpp"
@@ -527,6 +529,189 @@ void drawUiEditor(astro::ui::UiDocument& document, const Scene& scene,
     ImGui::End();
 }
 
+void drawTimelineEditor(astro::runtime::AnimationTimeline& timeline, const float deltaSeconds,
+    const std::function<void(const std::string&)>& reportError, bool& windowDrawn)
+{
+    if (!ImGui::Begin("Timeline")) { ImGui::End(); return; }
+    windowDrawn = true;
+    if (timeline.isPlaying())
+    {
+        const auto advanced = timeline.advance(deltaSeconds);
+        if (!advanced) reportError(advanced.error().message);
+    }
+    if (ImGui::Button(timeline.isPlaying() ? "Pause" : "Play"))
+    {
+        if (timeline.isPlaying()) timeline.pause();
+        else timeline.play();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset")) timeline.reset();
+    ImGui::SameLine();
+    if (ImGui::Button("Add key at end"))
+    {
+        const auto added = timeline.addKeyframe({timeline.endTime() + 1.0, timeline.sample()});
+        if (!added) reportError(added.error().message);
+    }
+    ImGui::Text("Scalar track — %.3f", timeline.sample());
+    double playhead = timeline.playhead();
+    const double start = timeline.startTime(), end = timeline.endTime();
+    if (start < end && ImGui::SliderScalar("Playhead", ImGuiDataType_Double, &playhead, &start, &end, "%.2f s"))
+    {
+        const auto sought = timeline.seek(playhead);
+        if (!sought) reportError(sought.error().message);
+    }
+
+    const auto graphSize = ImVec2(-1.0f, 120.0f);
+    if (ImGui::BeginChild("TimelineCurve", graphSize, true))
+    {
+        const auto origin = ImGui::GetCursorScreenPos();
+        const auto available = ImGui::GetContentRegionAvail();
+        const ImVec2 max(origin.x + available.x, origin.y + available.y);
+        auto* draw = ImGui::GetWindowDrawList();
+        draw->AddRectFilled(origin, max, IM_COL32(24, 29, 38, 255));
+        double minimum = timeline.keyframes().front().value;
+        double maximum = minimum;
+        for (const auto& key : timeline.keyframes())
+        {
+            minimum = std::min(minimum, key.value);
+            maximum = std::max(maximum, key.value);
+        }
+        if (minimum == maximum) { minimum -= 1.0; maximum += 1.0; }
+        const double timeRange = end - start;
+        const auto point = [&](const double time) {
+            const double x = (time - start) / timeRange;
+            const double y = (timeline.sampleAt(time) - minimum) / (maximum - minimum);
+            return ImVec2(origin.x + static_cast<float>(x * available.x),
+                max.y - static_cast<float>(y * available.y));
+        };
+        ImVec2 previous = point(start);
+        for (int sample = 1; sample <= 64; ++sample)
+        {
+            const double time = start + timeRange * static_cast<double>(sample) / 64.0;
+            const ImVec2 current = point(time);
+            draw->AddLine(previous, current, IM_COL32(100, 175, 255, 255), 2.0f);
+            previous = current;
+        }
+        for (const auto& key : timeline.keyframes())
+        {
+            const double x = (key.timeSeconds - start) / timeRange;
+            const double y = (key.value - minimum) / (maximum - minimum);
+            draw->AddCircleFilled(ImVec2(origin.x + static_cast<float>(x * available.x),
+                max.y - static_cast<float>(y * available.y)), 4.0f, IM_COL32(255, 205, 90, 255));
+        }
+        const double headX = (timeline.playhead() - start) / timeRange;
+        const float x = origin.x + static_cast<float>(headX * available.x);
+        draw->AddLine(ImVec2(x, origin.y), ImVec2(x, max.y), IM_COL32(255, 90, 90, 220), 1.0f);
+    }
+    ImGui::EndChild();
+
+    ImGui::SeparatorText("Keyframes");
+    bool removed = false;
+    for (std::size_t index = 0; index < timeline.keyframes().size(); ++index)
+    {
+        ImGui::PushID(static_cast<int>(index));
+        double keyTime = timeline.keyframes()[index].timeSeconds;
+        double value = timeline.keyframes()[index].value;
+        bool changed = ImGui::InputDouble("Time", &keyTime, 0.01, 0.1, "%.3f");
+        ImGui::SameLine();
+        changed |= ImGui::InputDouble("Value", &value, 0.1, 1.0, "%.3f");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Remove"))
+        {
+            const auto result = timeline.removeKeyframe(index);
+            if (!result) reportError(result.error().message);
+            removed = true;
+        }
+        else if (changed)
+        {
+            const auto result = timeline.updateKeyframe(index, {keyTime, value});
+            if (!result) reportError(result.error().message);
+        }
+        ImGui::PopID();
+        if (removed) break;
+    }
+    ImGui::End();
+}
+
+void drawCameraPresets(astro::runtime::CameraRig& camera, const Scene& scene,
+    const std::optional<EntityId> selectedEntity, const float deltaSeconds,
+    const std::function<void(const std::string&)>& reportError, bool& windowDrawn)
+{
+    using astro::runtime::CameraMode;
+    if (!ImGui::Begin("Camera Presets")) { ImGui::End(); return; }
+    windowDrawn = true;
+    static constexpr const char* modes[]{"Custom", "First Person", "Third Person", "Isometric", "Top Down", "Platformer", "Strategy"};
+    int mode = static_cast<int>(camera.settings().mode);
+    if (ImGui::Combo("Preset", &mode, modes, 7))
+    {
+        const auto changed = camera.setMode(static_cast<CameraMode>(mode));
+        if (!changed) reportError(changed.error().message);
+    }
+    std::vector<const char*> entityNames;
+    entityNames.reserve(scene.entities().size());
+    int entityIndex = 0;
+    for (std::size_t index = 0; index < scene.entities().size(); ++index)
+    {
+        entityNames.push_back(scene.entities()[index].name.c_str());
+        if (camera.settings().target == scene.entities()[index].id) entityIndex = static_cast<int>(index);
+    }
+    if (!entityNames.empty())
+    {
+        if (ImGui::Combo("Follow entity", &entityIndex, entityNames.data(), static_cast<int>(entityNames.size())))
+        {
+            auto settings = camera.settings();
+            settings.target = scene.entities()[static_cast<std::size_t>(entityIndex)].id;
+            const auto configured = camera.configure(settings);
+            if (!configured) reportError(configured.error().message);
+            else if (camera.settings().mode != CameraMode::Custom)
+                reportLogicResult(camera.snapToTarget(scene), reportError);
+        }
+    }
+    else ImGui::TextDisabled("Create a scene entity to use a follow preset.");
+    if (selectedEntity && scene.find(*selectedEntity) && ImGui::Button("Use selected Hierarchy entity"))
+    {
+        auto settings = camera.settings();
+        settings.target = selectedEntity;
+        const auto configured = camera.configure(settings);
+        if (!configured) reportError(configured.error().message);
+        else if (camera.settings().mode != CameraMode::Custom)
+            reportLogicResult(camera.snapToTarget(scene), reportError);
+    }
+    if (camera.settings().mode != CameraMode::Custom && camera.settings().target
+        && scene.find(*camera.settings().target))
+    {
+        const auto updated = camera.update(scene, deltaSeconds);
+        if (!updated) reportError(updated.error().message);
+    }
+    else if (camera.settings().mode != CameraMode::Custom)
+        ImGui::TextDisabled("Select a valid target entity for this follow preset.");
+    if (camera.settings().mode == CameraMode::Custom)
+    {
+        auto pose = camera.pose();
+        bool changed = false;
+        ImGui::SeparatorText("Custom pose");
+        changed |= ImGui::InputDouble("Position X", &pose.position.x, 0.1, 1.0, "%.3f");
+        changed |= ImGui::InputDouble("Position Y", &pose.position.y, 0.1, 1.0, "%.3f");
+        changed |= ImGui::InputDouble("Position Z", &pose.position.z, 0.1, 1.0, "%.3f");
+        changed |= ImGui::InputDouble("Rotation X", &pose.rotationDegrees.x, 1.0, 10.0, "%.2f");
+        changed |= ImGui::InputDouble("Rotation Y", &pose.rotationDegrees.y, 1.0, 10.0, "%.2f");
+        changed |= ImGui::InputDouble("Rotation Z", &pose.rotationDegrees.z, 1.0, 10.0, "%.2f");
+        changed |= ImGui::InputDouble("Zoom", &pose.zoom, 0.1, 1.0, "%.2f");
+        if (changed)
+        {
+            const auto updated = camera.setPose(pose);
+            if (!updated) reportError(updated.error().message);
+        }
+    }
+    const auto& pose = camera.pose();
+    ImGui::SeparatorText("Computed pose");
+    ImGui::Text("Position: %.2f, %.2f, %.2f", pose.position.x, pose.position.y, pose.position.z);
+    ImGui::Text("Rotation: %.2f, %.2f, %.2f", pose.rotationDegrees.x, pose.rotationDegrees.y, pose.rotationDegrees.z);
+    ImGui::Text("Zoom: %.2f", pose.zoom);
+    ImGui::TextDisabled("Pose preview only; camera image rendering is not connected.");
+    ImGui::End();
+}
+
 struct SceneNodeLayout
 {
     const Entity* entity;
@@ -874,6 +1059,12 @@ public:
         auto logicGraph = makeScoreGateGraph();
         astro::logic::VisualLogicDebugger logicDebugger;
         bool visualLogicWindowDrawn = false;
+        auto timelineCreated = astro::runtime::AnimationTimeline::create({{0.0, 0.0}, {1.0, 10.0}, {2.0, 0.0}});
+        if (!timelineCreated) throw std::runtime_error(timelineCreated.error().message);
+        auto timeline = std::move(timelineCreated).value();
+        astro::runtime::CameraRig cameraRig;
+        bool showTimeline = false, showCameraPresets = false;
+        bool timelineWindowDrawn = false, cameraWindowDrawn = false;
         bool showUiEditor = false, uiEditorWindowDrawn = false;
         astro::ui::UiDocument uiDocument;
         std::optional<astro::ui::ElementId> selectedUiElement;
@@ -1091,6 +1282,16 @@ public:
             if (!root || !child || scene.entities().size() != 2 || scene.find(child.value())->parent != root.value())
                 throw std::runtime_error("Scene model smoke failed");
             selectedEntity = root.value();
+            showTimeline = true;
+            showCameraPresets = true;
+            if (!timeline.seek(0.5) || timeline.sample() != 5.0
+                || !cameraRig.setMode(astro::runtime::CameraMode::ThirdPerson))
+                throw std::runtime_error("Timeline/camera preset smoke setup failed");
+            auto cameraSettings = cameraRig.settings();
+            cameraSettings.target = root.value();
+            if (!cameraRig.configure(cameraSettings) || !cameraRig.snapToTarget(scene)
+                || cameraRig.pose().position.y != 2.0 || cameraRig.pose().position.z != -5.0)
+                throw std::runtime_error("Camera preset target/pose smoke failed");
             showUiEditor = true;
             const auto uiTitle = uiDocument.addElement(astro::ui::ElementKind::Text, "Player label");
             if (!uiTitle) throw std::runtime_error("UI editor smoke element creation failed");
@@ -1220,11 +1421,14 @@ public:
                     ImGui::MenuItem("Diagnostics", nullptr, &showDiagnostics);
                     ImGui::MenuItem("Visual Logic", nullptr, &showVisualLogic);
                     ImGui::MenuItem("UI Editor", nullptr, &showUiEditor);
+                    ImGui::MenuItem("Timeline", nullptr, &showTimeline);
+                    ImGui::MenuItem("Camera Presets", nullptr, &showCameraPresets);
                     if (ImGui::MenuItem("Reset layout"))
                     {
                         resetLayout = true;
                         showProject = showDiagnostics = showVisualLogic = true;
                         showUiEditor = true;
+                        showTimeline = showCameraPresets = true;
                     }
                     ImGui::EndMenu();
                 }
@@ -1247,6 +1451,8 @@ public:
                 ImGui::DockBuilderDockWindow("Diagnostics", right);
                 ImGui::DockBuilderDockWindow("Inspector", right);
                 ImGui::DockBuilderDockWindow("UI Editor", right);
+                ImGui::DockBuilderDockWindow("Timeline", right);
+                ImGui::DockBuilderDockWindow("Camera Presets", right);
                 ImGui::DockBuilderFinish(dock);
                 resetLayout = false;
             }
@@ -1367,6 +1573,11 @@ public:
                 drawUiEditor(uiDocument, scene, selectedUiElement, uiPreviewPreset, uiTextDraft,
                     uiTextDraftElement, reportError, uiEditorWindowDrawn);
             }
+            if (showTimeline)
+                drawTimelineEditor(timeline, ImGui::GetIO().DeltaTime, reportError, timelineWindowDrawn);
+            if (showCameraPresets)
+                drawCameraPresets(cameraRig, scene, selectedEntity, ImGui::GetIO().DeltaTime,
+                    reportError, cameraWindowDrawn);
             if (showDiagnostics)
             {
                 ImGui::Begin("Diagnostics", &showDiagnostics);
@@ -1472,7 +1683,9 @@ public:
             && undoShortcuts == 1 && redoShortcuts == 1 && saveShortcuts == 1 && openShortcuts == 1
             && visualLogicWindowDrawn && logicDebugger.state() == astro::logic::DebugState::Completed
             && uiEditorWindowDrawn && uiDocument.elements().size() == 1
-            && uiDocument.find(1)->text == "Edited Root Ω") ? 1 : 0;
+            && uiDocument.find(1)->text == "Edited Root Ω"
+            && timelineWindowDrawn && timeline.keyframes().size() == 3 && timeline.sample() == 5.0
+            && cameraWindowDrawn && cameraRig.settings().mode == astro::runtime::CameraMode::ThirdPerson) ? 1 : 0;
     }
 };
 }

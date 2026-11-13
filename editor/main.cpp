@@ -3,6 +3,7 @@
 #include <string>
 #include "ProjectFile.hpp"
 #include "astro/assets/AssetRegistry.hpp"
+#include "astro/logic/VisualLogicGraph.hpp"
 #include "astro/scene/Scene.hpp"
 #include "astro/scene/SceneFile.hpp"
 #include <SDL3/SDL.h>
@@ -108,6 +109,219 @@ void drawHierarchyBranch(const Scene& scene, const std::optional<EntityId> paren
         }
         else if (ImGui::IsItemClicked()) selected = entity.id;
     }
+}
+
+astro::logic::VisualLogicGraph makeScoreGateGraph()
+{
+    using astro::logic::NodeKind;
+    astro::logic::VisualLogicGraph graph("Score gate example");
+    const auto score = graph.addNode(NodeKind::NumberConstant);
+    const auto bonus = graph.addNode(NodeKind::NumberConstant);
+    const auto total = graph.addNode(NodeKind::Add);
+    const auto threshold = graph.addNode(NodeKind::NumberConstant);
+    const auto passed = graph.addNode(NodeKind::GreaterThan);
+    const auto enabled = graph.addNode(NodeKind::BooleanConstant);
+    const auto result = graph.addNode(NodeKind::And);
+    if (!score || !bonus || !total || !threshold || !passed || !enabled || !result)
+        throw std::runtime_error("Could not create Visual Logic example nodes");
+    if (!graph.setLiteral(score.value(), 4.0) || !graph.setLiteral(bonus.value(), 3.0)
+        || !graph.setLiteral(threshold.value(), 6.0) || !graph.setLiteral(enabled.value(), true)
+        || !graph.connect(score.value(), total.value(), 0) || !graph.connect(bonus.value(), total.value(), 1)
+        || !graph.connect(total.value(), passed.value(), 0) || !graph.connect(threshold.value(), passed.value(), 1)
+        || !graph.connect(passed.value(), result.value(), 0) || !graph.connect(enabled.value(), result.value(), 1))
+        throw std::runtime_error("Could not connect Visual Logic example graph");
+    return graph;
+}
+
+void reportLogicResult(const astro::core::Result<void>& result,
+    const std::function<void(const std::string&)>& reportError)
+{
+    if (!result) reportError(result.error().message);
+}
+
+void drawVisualLogic(astro::logic::VisualLogicGraph& graph, astro::logic::VisualLogicDebugger& debugger,
+    const std::function<void(const std::string&)>& reportError, bool& windowDrawn)
+{
+    using namespace astro::logic;
+    if (!ImGui::Begin("Visual Logic")) { ImGui::End(); return; }
+    windowDrawn = true;
+    ImGui::Text("%s", graph.name().c_str());
+    ImGui::TextDisabled("Typed dataflow prototype. Inputs connect through typed menus; graph is not saved yet.");
+
+    const auto add = [&](const NodeKind kind) {
+        const auto result = graph.addNode(kind);
+        if (!result) reportError(result.error().message);
+        else debugger.reset();
+    };
+    const auto addButton = [&](const char* label, const NodeKind kind) {
+        ImGui::PushID(static_cast<int>(kind));
+        if (ImGui::Button(label)) add(kind);
+        ImGui::PopID();
+    };
+    addButton("+ Number", NodeKind::NumberConstant);
+    ImGui::SameLine(); addButton("+ Boolean", NodeKind::BooleanConstant);
+    ImGui::SameLine(); addButton("+ String", NodeKind::StringConstant);
+    ImGui::SameLine();
+    if (ImGui::BeginMenu("+ Math"))
+    {
+        if (ImGui::MenuItem("Add")) add(NodeKind::Add);
+        if (ImGui::MenuItem("Subtract")) add(NodeKind::Subtract);
+        if (ImGui::MenuItem("Multiply")) add(NodeKind::Multiply);
+        if (ImGui::MenuItem("Divide")) add(NodeKind::Divide);
+        ImGui::EndMenu();
+    }
+    ImGui::SameLine();
+    if (ImGui::BeginMenu("+ Compare"))
+    {
+        if (ImGui::MenuItem("Greater than")) add(NodeKind::GreaterThan);
+        if (ImGui::MenuItem("Less than")) add(NodeKind::LessThan);
+        if (ImGui::MenuItem("Equal number")) add(NodeKind::EqualNumber);
+        ImGui::EndMenu();
+    }
+    ImGui::SameLine();
+    if (ImGui::BeginMenu("+ Logic"))
+    {
+        if (ImGui::MenuItem("And")) add(NodeKind::And);
+        if (ImGui::MenuItem("Or")) add(NodeKind::Or);
+        if (ImGui::MenuItem("Not")) add(NodeKind::Not);
+        ImGui::EndMenu();
+    }
+    ImGui::SameLine();
+    if (ImGui::BeginMenu("+ Text"))
+    {
+        if (ImGui::MenuItem("Concatenate")) add(NodeKind::Concatenate);
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::Button("Run"))
+    {
+        auto started = debugger.start(graph);
+        if (!started) reportError(started.error().message);
+        else reportLogicResult(debugger.runToEnd(), reportError);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Step"))
+    {
+        if (debugger.state() != DebugState::Running)
+        {
+            const auto started = debugger.start(graph);
+            if (!started) reportError(started.error().message);
+        }
+        if (debugger.state() == DebugState::Running)
+        {
+            const auto stepped = debugger.step();
+            if (!stepped) reportError(stepped.error().message);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset debug")) debugger.reset();
+    ImGui::SameLine();
+    ImGui::TextDisabled("Debugger: %s", debugger.state() == DebugState::Idle ? "idle"
+        : debugger.state() == DebugState::Running ? "running"
+        : debugger.state() == DebugState::Completed ? "complete" : "faulted");
+
+    const auto available = ImGui::GetContentRegionAvail();
+    ImGui::BeginChild("LogicNodes", ImVec2(0, available.y), true);
+    for (const auto& node : graph.nodes())
+    {
+        ImGui::PushID(static_cast<int>(node.id));
+        ImGui::Separator();
+        ImGui::Text("Node %u — %s", node.id, nodeKindName(node.kind));
+        ImGui::SameLine();
+        ImGui::TextDisabled("Output: %s", valueTypeName(outputType(node.kind)));
+
+        if (node.kind == NodeKind::NumberConstant)
+        {
+            auto value = std::get<double>(node.literal);
+            if (ImGui::InputDouble("Value", &value))
+            {
+                const auto changed = graph.setLiteral(node.id, value);
+                if (!changed) reportError(changed.error().message);
+                else debugger.reset();
+            }
+        }
+        else if (node.kind == NodeKind::BooleanConstant)
+        {
+            auto value = std::get<bool>(node.literal);
+            if (ImGui::Checkbox("Value", &value))
+            {
+                const auto changed = graph.setLiteral(node.id, value);
+                if (!changed) reportError(changed.error().message);
+                else debugger.reset();
+            }
+        }
+        else if (node.kind == NodeKind::StringConstant)
+        {
+            std::array<char, 256> text{};
+            const auto& value = std::get<std::string>(node.literal);
+            std::copy_n(value.data(), std::min(value.size(), text.size() - 1), text.data());
+            if (ImGui::InputText("Value", text.data(), text.size()))
+            {
+                const auto changed = graph.setLiteral(node.id, std::string(text.data()));
+                if (!changed) reportError(changed.error().message);
+                else debugger.reset();
+            }
+        }
+
+        for (std::size_t input = 0; input < node.inputs.size(); ++input)
+        {
+            const auto expected = inputType(node.kind, input);
+            if (!expected) continue;
+            std::string selected = "<unconnected>";
+            if (node.inputs[input])
+            {
+                if (const auto* source = graph.find(*node.inputs[input]))
+                    selected = "Node " + std::to_string(source->id) + " — " + nodeKindName(source->kind);
+            }
+            const auto label = "Input " + std::to_string(input + 1) + " (" + valueTypeName(*expected) + ")";
+            if (ImGui::BeginCombo(label.c_str(), selected.c_str()))
+            {
+                if (ImGui::Selectable("<unconnected>"))
+                {
+                    const auto changed = graph.disconnect(node.id, input);
+                    if (!changed) reportError(changed.error().message);
+                    else debugger.reset();
+                }
+                for (const auto& candidate : graph.nodes())
+                {
+                    if (candidate.id == node.id || outputType(candidate.kind) != *expected) continue;
+                    const auto candidateLabel = "Node " + std::to_string(candidate.id) + " — " + nodeKindName(candidate.kind);
+                    if (ImGui::Selectable(candidateLabel.c_str(), node.inputs[input] == candidate.id))
+                    {
+                        const auto disconnected = graph.disconnect(node.id, input);
+                        if (!disconnected) reportError(disconnected.error().message);
+                        else
+                        {
+                            debugger.reset();
+                            const auto changed = graph.connect(candidate.id, node.id, input);
+                            if (!changed) reportError(changed.error().message);
+                        }
+                    }
+                }
+                ImGui::EndCombo();
+            }
+        }
+
+        if (const auto* state = debugger.trace(node.id))
+        {
+            if (state->state == NodeState::Succeeded && state->output)
+                ImGui::TextColored(ImVec4(0.35f, 0.9f, 0.45f, 1.0f), "Output: %s", formatValue(*state->output).c_str());
+            else if (state->state == NodeState::Failed)
+                ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f), "Error: %s", state->diagnostic.c_str());
+            else ImGui::TextDisabled("Debug state: pending");
+        }
+        if (ImGui::SmallButton("Remove node"))
+        {
+            const auto removed = graph.removeNode(node.id);
+            if (!removed) reportError(removed.error().message);
+            else debugger.reset();
+            ImGui::PopID();
+            break;
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    ImGui::End();
 }
 
 struct SceneNodeLayout
@@ -453,7 +667,10 @@ public:
     {
         int width = 1100, height = 720, frames = 0;
         bool running = true, resetLayout = true, docked = false;
-        bool showProject = true, showDiagnostics = true;
+        bool showProject = true, showDiagnostics = true, showVisualLogic = true;
+        auto logicGraph = makeScoreGateGraph();
+        astro::logic::VisualLogicDebugger logicDebugger;
+        bool visualLogicWindowDrawn = false;
         char path[1024] = "";
         char scenePathInput[1024] = "";
         char assetPathInput[512] = "";
@@ -618,6 +835,14 @@ public:
         std::filesystem::path smokeDirectory;
         if (smoke)
         {
+            const auto started = logicDebugger.start(logicGraph);
+            const auto evaluated = started ? logicDebugger.runToEnd()
+                : astro::core::Result<void>::failure(started.error());
+            const auto* finalTrace = logicGraph.nodes().empty() ? nullptr
+                : logicDebugger.trace(logicGraph.nodes().back().id);
+            if (!evaluated || !finalTrace || !finalTrace->output
+                || !std::holds_alternative<bool>(*finalTrace->output) || !std::get<bool>(*finalTrace->output))
+                throw std::runtime_error("Visual Logic editor smoke evaluation failed");
             smokeDirectory = std::filesystem::temp_directory_path() /
                 ("AstroEditor-" + std::to_string(SDL_GetTicksNS()));
             createProject(smokeDirectory, "Smoke project Ω");
@@ -762,7 +987,12 @@ public:
                 {
                     ImGui::MenuItem("Project", nullptr, &showProject);
                     ImGui::MenuItem("Diagnostics", nullptr, &showDiagnostics);
-                    if (ImGui::MenuItem("Reset layout")) { resetLayout = true; showProject = showDiagnostics = true; }
+                    ImGui::MenuItem("Visual Logic", nullptr, &showVisualLogic);
+                    if (ImGui::MenuItem("Reset layout"))
+                    {
+                        resetLayout = true;
+                        showProject = showDiagnostics = showVisualLogic = true;
+                    }
                     ImGui::EndMenu();
                 }
                 ImGui::EndMainMenuBar();
@@ -773,11 +1003,13 @@ public:
                 ImGui::DockBuilderRemoveNode(dock);
                 ImGui::DockBuilderAddNode(dock, ImGuiDockNodeFlags_DockSpace);
                 ImGui::DockBuilderSetNodeSize(dock, ImGui::GetMainViewport()->WorkSize);
-                ImGuiID left, remainder, center, right;
+                ImGuiID left, remainder, center, right, logicPane, scenePane;
                 ImGui::DockBuilderSplitNode(dock, ImGuiDir_Left, 0.23f, &left, &remainder);
                 ImGui::DockBuilderSplitNode(remainder, ImGuiDir_Right, 0.25f, &right, &center);
+                ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.32f, &logicPane, &scenePane);
                 ImGui::DockBuilderDockWindow("Hierarchy", left);
-                ImGui::DockBuilderDockWindow("Scene View", center);
+                ImGui::DockBuilderDockWindow("Scene View", scenePane);
+                ImGui::DockBuilderDockWindow("Visual Logic", logicPane);
                 ImGui::DockBuilderDockWindow("Project", right);
                 ImGui::DockBuilderDockWindow("Diagnostics", right);
                 ImGui::DockBuilderDockWindow("Inspector", right);
@@ -887,6 +1119,8 @@ public:
                 drawSceneView(scene, selectedEntity);
             }
             ImGui::End();
+            if (showVisualLogic)
+                drawVisualLogic(logicGraph, logicDebugger, reportError, visualLogicWindowDrawn);
             if (showDiagnostics)
             {
                 ImGui::Begin("Diagnostics", &showDiagnostics);
@@ -989,7 +1223,8 @@ public:
         }
         return smoke && !(frames == 90 && docked && rendered && activeProject == "Smoke project Ω"
             && scene.entities().size() == 2 && scene.find(1)->name == "Edited Root Ω"
-            && undoShortcuts == 1 && redoShortcuts == 1 && saveShortcuts == 1 && openShortcuts == 1) ? 1 : 0;
+            && undoShortcuts == 1 && redoShortcuts == 1 && saveShortcuts == 1 && openShortcuts == 1
+            && visualLogicWindowDrawn && logicDebugger.state() == astro::logic::DebugState::Completed) ? 1 : 0;
     }
 };
 }

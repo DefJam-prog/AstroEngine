@@ -40,6 +40,10 @@ GUI, визуальная логика и AI используют единый �
 
 ## Typed Command API
 
+### Visual Logic prototype (06.1)
+
+`engine/logic` provides an optional C++20 typed dataflow graph and deterministic single-threaded evaluator. The editor exposes a vertical-node-list UI with typed input menus and per-node debugging. It is deliberately isolated from `CommandRegistry` and `Scene`: this prototype cannot mutate a project or gameplay state. Graph persistence, undo, flow-control nodes, runtime bindings, and drag-wire authoring are not implemented. The graph target has no SDL/bgfx/ImGui dependency; the optional editor UI uses the existing editor stack. See [VISUAL_LOGIC.md](VISUAL_LOGIC.md).
+
 Подэтап 01.4 реализует `CommandRegistry` в `engine/core`. `CommandSchema` задаёт ID и положительную версию; template-типы задают точный C++ payload и output; обязательный validator проверяет payload/предусловия, executor получает `EngineContext` и возвращает `Result<Output>`. `validate` выполняет validation-only/dry-run без вызова executor, `execute` повторяет validation непосредственно перед выполнением. Результат, типизированные ошибки и локальные audit entries доступны вызывающему коду. Подробный контракт и пример: [COMMAND_API.md](COMMAND_API.md).
 
 Подэтап 01.5 добавляет `registerTransactionalCommand`: callback собирает apply/undo шаги, а registry применяет их атомарной транзакцией и включает в Undo/Redo history. Обычный `registerCommand` остаётся совместимым для необратимых операций, но после успешной валидации очищает прежнюю историю как undo-barrier до вызова executor. При ошибке применения транзакция откатывает выполненный префикс; ошибка rollback сообщается, а история очищается, чтобы не продолжать с потенциально неверным состоянием. Каждый отдельный apply/undo callback обязан быть атомарным или самокомпенсирующимся. API пока не является сериализуемой/удалённой схемой, не формирует preview diff и не реализует разрешения AI.

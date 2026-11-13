@@ -1,6 +1,6 @@
 # Command API — ранний C++ контракт
 
-Подэтап 01.4 добавил локальный `CommandRegistry` для вызова движковых операций через typed payload. В 02.3 первая операция Scene Model (`entity.set_property` v1) подключена к этому registry и используется редакторским Inspector. Визуальная логика и AI-адаптеры пока не реализованы.
+Подэтап 01.4 добавил локальный `CommandRegistry` для вызова движковых операций через typed payload. В 02.3 первая операция Scene Model (`entity.set_property` v1) подключена к этому registry и используется редакторским Inspector. В 06.1 появилась отдельная pure dataflow Visual Logic prototype; её узлы пока не вызывают команды и не меняют Scene. AI-адаптеры пока не реализованы.
 
 ## Схема команды
 

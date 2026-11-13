@@ -289,3 +289,9 @@ AssetId назначается монотонно и сохраняется в �
 - The archive contains the statically linked `astro_game_ui_demo.exe`, a runtime README, and the SDL3/Dear ImGui upstream license texts from the existing local dependency cache. Missing license texts fail configuration instead of silently distributing an incomplete package. No DLL is currently required in the Release archive; OS system libraries remain platform requirements.
 - A CTest smoke builds the archive, extracts it into a fresh unique directory and starts the packaged executable with `--smoke` from that directory. It does not use a project/source-tree resource. The Release ZIP is a package of the current Game UI prototype only.
 - AstroEngine's own license remains undecided. This package does not establish project licensing or satisfy third-party license review for all dependencies. The visible multi-level puzzle and connected SaveProfile/checkpoint progression remain absent, so Stage 05 acceptance is still open.
+
+## D036 — Keep Visual Logic 06.1 as a pure typed dataflow prototype
+
+- The first Visual Logic iteration is an optional C++20 graph/evaluator with typed Number/Boolean/String pins, deterministic evaluation, bounded node/text sizes, and a synchronous step debugger. It has no new third-party dependencies.
+- The editor uses typed menus for connections to keep this substage small. Graph files, undo, execution-flow/branch nodes, runtime bindings, gameplay commands, Scene mutation, and drag-wire authoring are deferred; no UI action should imply these are available.
+- Keep the evaluator independent of `CommandRegistry` and Scene until the graph model, persistence, and transactional semantics can be designed and tested together. This prototype does not meet Stage 06 acceptance by itself.

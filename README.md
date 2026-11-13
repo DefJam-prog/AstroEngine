@@ -49,6 +49,8 @@ ctest --preset windows-debug
 Подэтап 03.4: [Prefab API](docs/reports/03.4.md). Есть versioned файлы, вложенные ссылки, overrides и update; панели editor для authoring пока отсутствуют.
 Редактор 02.3: [Inspector и schema properties](docs/reports/02.3.md). Сейчас схема включает обязательное имя сущности и read-only ID; команда изменения проверяет UTF-8 и ограничение 240 байт.
 
+Подэтап 06.1: optional Editor содержит Visual Logic dataflow prototype с типизированными числами/логическими/текстовыми узлами и пошаговой трассой. Соединения выбираются из типизированного меню; графы пока не сохраняются и не меняют Scene. См. [документацию Visual Logic](docs/VISUAL_LOGIC.md).
+
 ### Сцены редактора (02.4)
 
 В редакторе доступны сохранение/открытие сцены (Ctrl+S, Ctrl+O), Undo/Redo (Ctrl+Z, Ctrl+Y или Ctrl+Shift+Z) и панель Diagnostics. Astro Scene v4 сохраняет ID/имена сцены и сущностей, иерархию, Transform, SpriteRenderer AssetId и prefab instance metadata. Загрузчик также читает v1–v3. При несохранённых правках переключение проекта/сцены блокируется. Формат и миграции описаны в [FILE_FORMATS.md](docs/FILE_FORMATS.md).

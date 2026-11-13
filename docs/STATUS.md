@@ -7,8 +7,8 @@
 | Продуктовые требования P01–P14 | Записаны в PRODUCT_REQUIREMENTS.md; реализация отсутствует |
 | Предварительный стек | Записан в TECH_STACK.md; не утверждён окончательно |
 | Решение о стеке | Предложение D001 в DECISIONS.md |
-| Слои архитектуры и контракты | Требования раздела 04 записаны в ARCHITECTURE.md и D002; реализация отсутствует |
-| Графический редактор и UX | Требования раздела 05 записаны в EDITOR_UX.md и D003; реализация отсутствует |
+| Слои архитектуры и контракты | Core/Scene/Assets/Prefabs и прототип Visual Logic реализованы в ограниченном объёме; см. ARCHITECTURE.md и отчёты |
+| Графический редактор и UX | Минимальный редактор есть; 06.1 добавляет Visual Logic panel, полный UX из EDITOR_UX.md не реализован |
 | Save System & Checkpoint Editor | 05.4–05.5: selective slots + runtime checkpoint/respawn; editor authoring и расширенные игровые поля отсутствуют |
 | Игровые системы и расширения | Требования раздела 07 записаны в GAME_SYSTEMS.md и D005; реализация отсутствует, требуется проверенная основа |
 | Шаблоны игр T01–T10 | Требования раздела 08 записаны в GAME_TEMPLATES.md и D006; шаблоны, конструктор и smoke-тесты отсутствуют |
@@ -31,14 +31,15 @@
 | Подэтап 05.4 | Explicit Entity/property profiles, indexed slots, schema/game version checks, CRC32, atomic write and backup fallback |
 | Подэтап 05.5 | Runtime XY checkpoint triggers, callback conditions, one-shot/repeatable use, typed events, opt-in selected-profile respawn |
 | Подэтап 05.6 | Optional Windows x64/MSVC Game UI runtime ZIP, SDL3/ImGui license texts, clean-start smoke; full Stage 05 acceptance remains incomplete |
-| Сборка и тесты | Windows x64/MSVC Debug: 05.6 package profile 24/24; headless regression 21/21; Release package smoke passed |
+| Подэтап 06.1 | Typed dataflow graph, deterministic synchronous debugger and editor panel; no graph persistence, command/Scene integration, branches or drag-wire authoring |
+| Сборка и тесты | Windows x64/MSVC Debug: 06.1 editor profile 28/28; headless regression 23/23; Release package smoke passed in 05.6 |
 | Политика проверок и документации | Требования записаны в TESTING.md и D009; это не результаты выполненных тестов |
 | Недостающие документы целевого комплекта | docs/FILE_FORMATS.md, docs/TEMPLATE_GUIDE.md |
 | Совместимость и лицензии зависимостей | Не проверены |
 
 Сборка проверена из Visual Studio 2022 Developer Command Prompt x64; инструменты доступны через среду VS, хотя в обычном PowerShell не все присутствуют в PATH.
 
-00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4 и 05.1–05.6: см. отчёты этапов. 05.6 — последний явно заданный подэтап этапа 05, но приёмка законченной игры ещё не выполнена. Дорожная карта пока не определяет следующий подэтап для недостающей визуальной puzzle/game integration; перед этапом 06 этот объём нужно отдельно определить и согласовать.
+00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4, 05.1–05.6 и 06.1: см. отчёты этапов. Приёмка законченной игры этапа 05 и всего этапа 06 ещё не выполнена.
 
 ## Подэтап 05.1
 

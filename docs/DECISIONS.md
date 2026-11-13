@@ -249,3 +249,9 @@ AssetId назначается монотонно и сохраняется в �
 - `InteractionSystem` stores code-defined runtime behavior bindings keyed by EntityId; it reuses the typed core EventBus for sequenced Requested/Activated/Rejected events rather than adding a second event transport.
 - Eligibility checks actor/target existence, enabled state, Transform and Euclidean range before invoking the behavior callback on the supplied runtime Scene.
 - Bindings are not Scene-serialized and are not editor-authored; physics triggers, UI prompts, input routing and undo are not implied. Callbacks and post-activation observers can cause non-transactional side effects; the caller owns the runtime copy and recovery policy.
+
+## D030 — Minimal dependency-free runtime 2D physics (05.1)
+
+- `PhysicsWorld2D` is a separate optional C++20 target and introduces no third-party physics dependency. 2D body/collider data remains runtime-owned and binds to one SceneId; callers step it inside RuntimeSession using the play Scene copy.
+- The first verified slice uses static/dynamic bodies, gravity, axis-aligned boxes in XY, discrete pairwise overlap checks, basic positional correction and EventBus Enter/Stay/Exit notifications. Triggers report overlaps without resolving them.
+- This is deliberately not a full physics engine. Rotation, mass/material response, CCD, joints, persistence, editor authoring and rendering are deferred; high-speed tunneling and O(n²) scaling are known limitations.

@@ -129,7 +129,7 @@
 Приёмка: подтверждённые сборки на реальных целевых toolchains;
 Windows не должен ломаться. Не обещать iOS-сборку на Windows без Mac.
 
-02.1–03.5 и 04.1–04.3 реализованы в пределах ограничений [отчётов](reports/). Следующий рекомендуемый подэтап — 05.1 (физика/коллизии), только после отдельного подтверждения пользователя.
+02.1–03.5 и 04.1–05.1 реализованы в пределах ограничений [отчётов](reports/). Следующий рекомендуемый подэтап — 05.2 (Game UI), только после отдельного подтверждения пользователя.
 
 ## Подэтап 03.5 — граф ресурсов и детерминированный package
 
@@ -137,8 +137,12 @@ Windows не должен ломаться. Не обещать iOS-сборку
 
 ## Подэтап 04.3 — камеры и следование
 
-Добавлен runtime CameraRig API для camera pose, пресетов и следования с параметрами. Рендеринг, Scene camera component и визуальное представление отсутствуют. Следующий рекомендуемый подэтап — 05.1, только после отдельного подтверждения пользователя.
+Добавлен runtime CameraRig API для camera pose, пресетов и следования с параметрами. Рендеринг, Scene camera component и визуальное представление отсутствуют.
 
 ## Runtime Interaction and Events (04.4)
 
-Реализованы programmatic runtime behavior bindings и typed interaction events. Данные поведения остаются вне Scene file; следующий рекомендуемый подэтап — 05.1 (минимальная физика/коллизии), только после отдельного подтверждения.
+Реализованы programmatic runtime behavior bindings и typed interaction events. Данные поведения остаются вне Scene file.
+
+## Подэтап 05.1 — минимальная 2D-физика и collision events
+
+Добавлены runtime body/collider bindings, gravity, fixed-step XY AABB collision detection, базовая positional correction и sequenced Enter/Stay/Exit events. Данные остаются вне Scene serialization; ограничения — [PHYSICS_2D.md](PHYSICS_2D.md) и [отчёт](reports/05.1.md). Следующий рекомендуемый подэтап — 05.2 Game UI.

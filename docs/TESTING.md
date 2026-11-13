@@ -164,3 +164,7 @@ Windows x64, MSVC 14.44, Debug, BGFX D3D11: `cmake --build build/stack-spike --p
 ## 04.4 результаты
 
 `runtime.interaction.integration` проверяет Requested/Activated/Rejected event order/sequence, registered/duplicate/missing behaviors, enabled-state, in/out-of-range activation, callback mutation isolation on Runtime Scene, Result error and thrown exception diagnostics. Полный Windows x64/MSVC CTest — 18/18; editor/graphics smoke прошли regression, но визуальный interaction test не выполнялся.
+
+## 05.1 результаты
+
+`runtime.physics2d.integration` проверяет gravity/fixed-step movement, solid floor correction, velocity stop, Enter/Stay/Exit sequence, trigger overlap without correction, invalid values, static velocity rejection, one-SceneId binding, wrong-scene rejection and authoring/runtime Scene isolation. Полный Windows x64/MSVC CTest — 19/19; editor/graphics smoke regressions passed. Нагрузочное масштабирование, CCD/tunneling scenarios and visual collision rendering are not tested or implemented. Logs: `build/05.1-build.log`, `build/05.1-ctest.log`.

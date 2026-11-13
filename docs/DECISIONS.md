@@ -282,3 +282,10 @@ AssetId назначается монотонно и сохраняется в �
 - Respawn is explicitly invoked by host gameplay. Default policy restores only the configured checkpoint/fallback position. SelectedProfile restoration is a separate opt-in policy and is allowed only for a SaveSelectedProfile checkpoint; it applies into a Scene copy before the checkpoint spawn position is assigned.
 - Conditions and EventBus observers may have external side effects that are not rolled back. Respawned event observers run after the runtime Scene has been replaced. Definitions and active state are runtime-only and must be registered against the Play Scene. No editor authoring, death detector, visual/audio behavior, health/inventory rules, or no-code condition graph was added.
 - `ASTRO_BUILD_CHECKPOINT_RUNTIME` gates the target for non-test builds and also enables its SaveStore dependency; no new third-party dependency was added.
+
+## D035 — Windows package for the current Game UI prototype (05.6)
+
+- `ASTRO_BUILD_WINDOWS_RUNTIME_PACKAGE` is opt-in and currently requires Windows x64/MSVC plus `ASTRO_BUILD_GAME_UI_DEMO=ON`. It uses CPack ZIP; default/headless builds remain unaffected.
+- The archive contains the statically linked `astro_game_ui_demo.exe`, a runtime README, and the SDL3/Dear ImGui upstream license texts from the existing local dependency cache. Missing license texts fail configuration instead of silently distributing an incomplete package. No DLL is currently required in the Release archive; OS system libraries remain platform requirements.
+- A CTest smoke builds the archive, extracts it into a fresh unique directory and starts the packaged executable with `--smoke` from that directory. It does not use a project/source-tree resource. The Release ZIP is a package of the current Game UI prototype only.
+- AstroEngine's own license remains undecided. This package does not establish project licensing or satisfy third-party license review for all dependencies. The visible multi-level puzzle and connected SaveProfile/checkpoint progression remain absent, so Stage 05 acceptance is still open.

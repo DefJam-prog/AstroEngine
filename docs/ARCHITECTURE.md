@@ -89,6 +89,8 @@ Runtime предусматривает фиксированный шаг сим�
 
 Export создаёт самостоятельный runtime с минимальным набором используемых ресурсов. Готовая игра не включает редактор.
 
+В 05.6 добавлен optional Windows x64/MSVC ZIP-пакет только для существующего `astro_game_ui_demo`: exe собирается со статическими SDL3/ImGui, а README и upstream license files попадают в архив рядом. Пакет smoke проверяет распаковку и запуск без cwd/source-tree зависимостей. Это техническая поставка Game UI prototype, не экспорт полной игры и не подтверждение полной приёмки этапа 05; текущие границы перечислены в [отчёте 05.6](reports/05.6.md).
+
 ## Границы текущего решения
 
 Save System & Checkpoint Editor — обязательный модуль продукта с явным выбором сохраняемых объектов, компонентов и свойств. Требования к SaveProfile, checkpoint, respawn, хранению и проверкам описаны в [SAVE_SYSTEM.md](SAVE_SYSTEM.md). Автоматическое сохранение всего мира без выбора профиля/правил запрещено. В 05.4 реализовано selective runtime save для Name, Transform scalar fields и SpriteRenderer visibility; SaveStore пишет в переданный user-data root, а не в проект. Checkpoint, respawn и GUI authoring ещё отсутствуют.

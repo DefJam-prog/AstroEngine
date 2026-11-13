@@ -1,8 +1,8 @@
 # Этапы, подэтапы и критерии приёмки
 
-Источник: раздел 10 требований пользователя. Подэтапы 00.1–00.3, 01.1–01.5, 02.1–02.4 и 03.1–03.5, 04.1–04.2 реализованы в ограниченном объёме по отчётам. Остальные этапы запланированы; наличие документов само по себе не означает прохождение приёмки.
+Источник: раздел 10 требований пользователя. Подэтапы 00.1–00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4 и 05.1–05.6 реализованы в ограниченном объёме по отчётам. Остальные этапы запланированы; наличие документов само по себе не означает прохождение приёмки.
 
-00.1–00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5 и 04.1: см. отчёты подэтапов.
+00.1–00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4 и 05.1–05.6: см. отчёты подэтапов.
 
 Выполняется только явно назначенный пользователем подэтап. После него — отчёт и остановка до ручного подтверждения. Стек остаётся предварительным до успешной проверки 00.3; шаблоны создаются после реализации необходимых подсистем.
 
@@ -74,7 +74,9 @@
 - **05.6** Windows runtime packaging; smoke-тест чистого запуска.
 
 Приёмка: 2D-головоломка с несколькими уровнями, меню, звуком,
-сохранением прогресса и самостоятельным Windows-приложением.
+сохранением прогресса и самостоятельным Windows-приложением. Эта приёмка
+пока не выполнена: 05.6 упаковывает проверенный Game UI prototype, тогда как
+видимая доска/уровни и интеграция puzzle/save/checkpoint в приложение отсутствуют.
 
 ## ЭТАП 06 — NO-CODE И РЕДАКТОРЫ
 
@@ -129,7 +131,7 @@
 Приёмка: подтверждённые сборки на реальных целевых toolchains;
 Windows не должен ломаться. Не обещать iOS-сборку на Windows без Mac.
 
-02.1–03.5, 04.1–04.4 и 05.1–05.5 реализованы в пределах ограничений [отчётов](reports/). Следующий рекомендуемый подэтап — 05.6 (Windows runtime packaging), только после отдельного подтверждения пользователя.
+02.1–03.5, 04.1–04.4 и 05.1–05.6 реализованы в пределах ограничений [отчётов](reports/). Следующий шаг не нумерован в текущем плане: требуется отдельно определить работу для недостающей визуальной puzzle/game integration и полной приёмки этапа 05.
 
 ## Подэтап 03.5 — граф ресурсов и детерминированный package
 
@@ -162,3 +164,7 @@ Windows не должен ломаться. Не обещать iOS-сборку
 ## Подэтап 05.5 — Checkpoint v1
 
 Добавлен runtime-only `CheckpointSystem` с XY area entry, условиями C++ callback, typed Activated/Rejected/Respawned events, one-shot/repeatable поведением и явным respawn. `RespawnOnly` не пишет сохранения; `SaveSelectedProfile` требует зарегистрированный profile и слот из `SaveStore`. Restore выбранного профиля отключён по умолчанию и после load выставляет respawn position. Нет scene/editor authoring, world-space/physics triggers, death detection, sound/visuals, no-code conditions или health/inventory rules. Подробности: [SAVE_SYSTEM.md](SAVE_SYSTEM.md), [отчёт](reports/05.5.md).
+
+## Подэтап 05.6 — Windows runtime package
+
+Optional CPack target creates a ZIP of the current SDL3/ImGui Game UI demo with third-party license texts. The smoke extracts the archive to a fresh unique directory and starts the executable there. This verifies packaging of the prototype only: the visible multi-level puzzle and connected progress persistence from Stage 05 acceptance are still missing. Results and commands: [report 05.6](reports/05.6.md), [BUILD_GUIDE](BUILD_GUIDE.md#упаковка-windows-runtime-этап-056).

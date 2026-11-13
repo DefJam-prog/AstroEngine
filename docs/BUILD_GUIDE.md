@@ -55,6 +55,27 @@ CI workflow в 00.2 не добавлен: реализован локальны
 
 В этой среде CMake/CTest/Ninja и MSVC доступны через Visual Studio 2022 Developer Command Prompt x64. Фактические результаты текущей сборки и CTest приведены в [отчёте 01.5](reports/01.5.md); поддержку macOS/Android/iOS не проверяли.
 
+## Упаковка Windows runtime (этап 05.6)
+
+Из Visual Studio 2022 Developer PowerShell x64, при уже подготовленном локальном `build/spike-deps` с SDL3 и Dear ImGui:
+
+```powershell
+cmake -S . -B build/runtime-package -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DASTRO_BUILD_GAME_UI_DEMO=ON -DASTRO_BUILD_WINDOWS_RUNTIME_PACKAGE=ON
+cmake --build build/runtime-package --target package --parallel 4
+```
+
+Готовый ZIP: `build/runtime-package/AstroEngine-Stage05.6-Windows-x64.zip`. Распакуйте архив и запустите `astro_game_ui_demo.exe`. Внутри лежат краткое описание и лицензии SDL3/Dear ImGui. Пакет содержит только статически слинкованный demo executable и эти тексты; editor, build tools и исходниковые тестовые ресурсы не включаются. CMake не загружает зависимости.
+
+Чтобы проверить собранный пакет из чистого каталога, сконфигурируйте отдельную Debug-конфигурацию с `-DBUILD_TESTING=ON` и теми же двумя `ASTRO_BUILD_*` флагами, соберите её, затем выполните:
+
+```powershell
+ctest --test-dir build/runtime-package-tests -R runtime.windows.package.clean_start --output-on-failure --no-tests=error
+```
+
+CTest создаёт ZIP, распаковывает его в новый уникальный подкаталог, проверяет executable/README/license files и запускает `astro_game_ui_demo.exe --smoke` из каталога распаковки. Проектная лицензия не выбрана; наличие upstream license files не задаёт лицензию AstroEngine.
+
+Архив пока содержит Game UI demo, а не законченную игру: в нём нет видимой доски puzzle, уровней и подключённого к UI SaveProfile/checkpoint прогресса. Перед выпуском продукта нужно выполнить оставшуюся игровую интеграцию и отдельно оценить лицензионную политику всего приложения.
+
 ## Проверка редактора и файловых сцен (02.4)
 
 Из Visual Studio 2022 Developer PowerShell x64:

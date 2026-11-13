@@ -30,14 +30,15 @@
 | Подэтап 05.3 | Optional match-three rules (`ASTRO_BUILD_PUZZLE_RUNTIME`), scalar animation tracks, SDL synthesized audio cues; нет visual puzzle board или audio asset playback |
 | Подэтап 05.4 | Explicit Entity/property profiles, indexed slots, schema/game version checks, CRC32, atomic write and backup fallback |
 | Подэтап 05.5 | Runtime XY checkpoint triggers, callback conditions, one-shot/repeatable use, typed events, opt-in selected-profile respawn |
-| Сборка и тесты | Windows x64/MSVC Debug: baseline optional 25/25, headless 20/20; полный 05.5 regression — optional 26/26, headless 21/21 |
+| Подэтап 05.6 | Optional Windows x64/MSVC Game UI runtime ZIP, SDL3/ImGui license texts, clean-start smoke; full Stage 05 acceptance remains incomplete |
+| Сборка и тесты | Windows x64/MSVC Debug: 05.6 package profile 24/24; headless regression 21/21; Release package smoke passed |
 | Политика проверок и документации | Требования записаны в TESTING.md и D009; это не результаты выполненных тестов |
 | Недостающие документы целевого комплекта | docs/FILE_FORMATS.md, docs/TEMPLATE_GUIDE.md |
 | Совместимость и лицензии зависимостей | Не проверены |
 
 Сборка проверена из Visual Studio 2022 Developer Command Prompt x64; инструменты доступны через среду VS, хотя в обычном PowerShell не все присутствуют в PATH.
 
-00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4 и 05.1–05.5: см. отчёты этапов. Следующий рекомендуемый подэтап — 05.6.
+00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4 и 05.1–05.6: см. отчёты этапов. 05.6 — последний явно заданный подэтап этапа 05, но приёмка законченной игры ещё не выполнена. Дорожная карта пока не определяет следующий подэтап для недостающей визуальной puzzle/game integration; перед этапом 06 этот объём нужно отдельно определить и согласовать.
 
 ## Подэтап 05.1
 

@@ -35,7 +35,8 @@
 | Подэтап 06.2 | UI Editor model/panel, Dark/Light theme preview, responsive anchors, Desktop/Tablet/Phone preview, validated Entity.Name/Text and SpriteRenderer.Visible/Visible bindings; no UI-file persistence or game-runtime rendering |
 | Подэтап 06.3 | Timeline scalar key editing/playback/curve preview; CameraRig preset/custom pose editor; no Scene animation bindings or rendered camera view |
 | Подэтап 06.4 | Save System Editor: in-memory profiles, explicit entity groups/rules, checkpoint configuration/XY preview, isolated restore preview; no project persistence/templates or health/inventory fields |
-| Сборка и тесты | Windows x64/MSVC Debug: 06.4 editor profile 33/33; headless regression 28/28; editor smoke confirms Save System panel opens |
+| Предпосылка 06.5 | Optional Canvas2D, SDL3 Play preview; visible root SpriteRenderer entities use AssetRegistry dimensions and Windows WIC texture cache; hierarchy/editor Play/levels/templates absent |
+| Сборка и тесты | Windows x64/MSVC Debug: scene-sprite follow-up editor profile 36/36; headless regression 30/30; standalone backend-neutral target remains independent of SDL |
 | Политика проверок и документации | Требования записаны в TESTING.md и D009; это не результаты выполненных тестов |
 | Недостающие документы целевого комплекта | docs/FILE_FORMATS.md, docs/TEMPLATE_GUIDE.md |
 | Совместимость и лицензии зависимостей | Не проверены |

@@ -317,3 +317,15 @@ AssetId назначается монотонно и сохраняется в �
 - Checkpoint configuration is validated by `CheckpointSystem`; the XY view is a Transform-based authoring preview. Restore testing uses an isolated Scene copy and a unique OS temporary directory.
 - Profile/group/checkpoint authoring remains in memory in 06.4. Persisting it requires a versioned project document format and migration policy, so it is not added implicitly to Astro Scene v4 or player save slots.
 - No external dependency is added. This bounded editor work does not complete Save System product requirements such as tags, templates, health/inventory, conditions, or respawn policies.
+
+## D040 — Add a bounded 2D canvas before authoring game templates
+
+- `Canvas2D` stores backend-neutral filled-rectangle commands, explicit RGBA colors, and layer order; camera projection is independent of SDL. The optional SDL3 adapter owns no window/renderer resources.
+- A standalone Play preview composes existing `InputMapping` and `RuntimeSession`, updates only a runtime Scene copy at the fixed timestep, and demonstrates SDL rendering/input without adding a heavyweight dependency.
+- This is a geometry-only foundation and does not establish SDL3 as the final engine renderer. It does not render Scene/SpriteRenderer assets or provide editor Play UI, physics controller, or game templates. Do not mark 06.5 complete based on this experiment.
+
+## D041 — Connect root Scene sprites through an asset-resolving render boundary
+
+- `astro_scene_render2d` converts visible root `SpriteRenderer` components into backend-neutral Canvas2D sprite commands. It reads dimensions from `AssetRegistry`, applies XY position/scale and Z rotation, and rejects missing assets, invalid transforms and child sprites instead of silently misrendering unsupported hierarchy transforms.
+- `SDLCanvas2DRenderer` accepts a caller-supplied AssetId-to-texture resolver; the renderer does not own decoded assets. The Windows sample uses a bounded WIC BGRA decoder and caches SDL textures for the renderer lifetime. Source images remain in Assets; decoding reads the validated Library cache.
+- The WIC decoder is platform-specific and Windows-only. Future platform adapters must supply their own decoder. Parent transforms, camera components, editor preview integration, streaming, batching and template gameplay remain deferred; this follow-up does not complete stage 06.5.

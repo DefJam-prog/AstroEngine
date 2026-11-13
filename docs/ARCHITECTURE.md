@@ -154,6 +154,10 @@ Astro Scene v4 сериализует ID, Transform, SpriteRenderer и prefab in
 
 `astro_runtime_puzzle` provides deterministic match-three rules and scalar keyframe sampling without platform dependencies; it is included when tests are enabled or explicitly requested with `ASTRO_BUILD_PUZZLE_RUNTIME`. The optional SDL3 audio adapter is built only with the Game UI demo profile and queues short synthesized cue tones. There is no scene-bound animation/audio component, asset playback/mixing, or visual puzzle renderer; see [PUZZLE_AND_ANIMATION.md](PUZZLE_AND_ANIMATION.md).
 
+## Minimal 2D rendering and Play foundation (06.5 prerequisite)
+
+`astro_runtime_render2d` defines bounded backend-neutral rectangle and sprite commands, layer ordering, and world-to-viewport camera projection. `astro_scene_render2d` maps visible root Scene `SpriteRenderer` components to sprite commands using AssetRegistry dimensions and Transform XY position/scale/Z rotation. The optional SDL3 renderer resolves AssetIds to textures through a caller callback. The current Windows sample uses a WIC-backed `SDLImageTextureCache`; other platforms need their own decoder adapter. `astro_2d_playground` demonstrates input and fixed-step `RuntimeSession` updates on an isolated Scene copy. Parent transform composition, Editor Play UI, collision-bound controller, level persistence and templates remain absent. Details and checks: [RENDERER_2D.md](RENDERER_2D.md).
+
 ## Runtime save slots (05.4)
 
 `astro_runtime_save` is an optional Scene-state persistence target. A versioned `SaveProfile` starts empty and explicitly selects individual properties by stable Entity ID; `SaveStore` writes numbered slots with CRC32 integrity checks, a bounded file size, atomic replacement, and `.bak` fallback. Loading validates before applying to a Scene copy. `astro_save_editor` is editor/test-only authoring: explicit groups flatten into SaveProfile fields; it does not serialize whole scenes or automatically persist anything. Supported fields and limits are in [SAVE_SYSTEM.md](SAVE_SYSTEM.md), [Save System Editor](SAVE_SYSTEM_EDITOR.md), and [FILE_FORMATS.md](FILE_FORMATS.md).

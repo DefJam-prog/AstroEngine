@@ -1,12 +1,5 @@
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(imgui "${ASTRO_SPIKE_DEPS}/imgui")
-add_library(astro_runtime_sdl_input ../engine/runtime/adapters/sdl3/SDLInputAdapter.cpp)
-target_include_directories(astro_runtime_sdl_input PUBLIC ../engine/runtime/include)
-target_link_libraries(astro_runtime_sdl_input PUBLIC astro_runtime_input SDL3::SDL3-static)
-target_compile_features(astro_runtime_sdl_input PUBLIC cxx_std_20)
-set_target_properties(astro_runtime_sdl_input PROPERTIES CXX_EXTENSIONS OFF)
-target_compile_options(astro_runtime_sdl_input PRIVATE /W4 /permissive- /Zc:__cplusplus /utf-8)
-
 add_executable(astro_editor main.cpp ProjectFile.cpp)
 target_compile_features(astro_editor PRIVATE cxx_std_20)
 set_target_properties(astro_editor PROPERTIES CXX_EXTENSIONS OFF)

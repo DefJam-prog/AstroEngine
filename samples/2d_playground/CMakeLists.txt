@@ -1,0 +1,20 @@
+if(WIN32)
+    add_executable(astro_2d_playground main.cpp)
+    target_compile_features(astro_2d_playground PRIVATE cxx_std_20)
+    set_target_properties(astro_2d_playground PROPERTIES CXX_EXTENSIONS OFF)
+    target_link_libraries(astro_2d_playground PRIVATE astro_scene astro_runtime_session astro_runtime_input
+        astro_runtime_sdl_input astro_runtime_render2d astro_scene_render2d astro_runtime_sdl_render2d
+        astro_runtime_sdl_wic_image SDL3::SDL3-static)
+    if(MSVC)
+        target_compile_options(astro_2d_playground PRIVATE /W4 /permissive- /Zc:__cplusplus /utf-8)
+    else()
+        target_compile_options(astro_2d_playground PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    if(BUILD_TESTING)
+        add_test(NAME runtime.2d.playground.smoke COMMAND astro_2d_playground --smoke)
+        set_tests_properties(runtime.2d.playground.smoke PROPERTIES TIMEOUT 15 LABELS "smoke;graphics;runtime")
+    endif()
+else()
+    message(STATUS "astro_2d_playground is currently limited to Windows WIC image decoding")
+endif()

@@ -88,6 +88,8 @@
 
 Подэтап 06.4 реализован ограниченно: in-memory explicit profile fields and entity groups, checkpoint authoring/XY preview, plus an isolated SaveStore/CheckpointSystem restore preview. Project persistence and unsupported gameplay properties remain open; see [SAVE_SYSTEM_EDITOR.md](SAVE_SYSTEM_EDITOR.md) and [report](reports/06.4.md).
 
+Перед шаблонами 06.5 добавлена ограниченная prerequisite-основа: Canvas2D, SDL3 rendering adapter и standalone fixed-step Play preview; видимые root `SpriteRenderer` читают размеры AssetRegistry и рисуются через Windows WIC texture cache. Иерархические transforms, Editor Play workflow, level/progress persistence и сами шаблоны не реализованы. См. [RENDERER_2D.md](RENDERER_2D.md) и [отчёт follow-up](reports/06.5-scene-sprites.md).
+
 - **06.1** Visual Scripting, типизированные узлы и отладка.
 - **06.2** UI Editor, темы, привязки, responsive layout.
 - **06.3** Timeline/анимации, пресеты камер.

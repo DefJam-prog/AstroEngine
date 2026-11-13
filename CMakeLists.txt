@@ -16,6 +16,8 @@ option(ASTRO_BUILD_PUZZLE_RUNTIME "Build the optional backend-neutral puzzle run
 option(ASTRO_BUILD_ANIMATION_RUNTIME "Build the optional backend-neutral animation and timeline runtime module" OFF)
 option(ASTRO_BUILD_SAVE_RUNTIME "Build the optional selective game save runtime module" OFF)
 option(ASTRO_BUILD_CHECKPOINT_RUNTIME "Build the optional runtime checkpoint and respawn module" OFF)
+option(ASTRO_BUILD_RENDER2D "Build the optional backend-neutral 2D render-command module" OFF)
+option(ASTRO_BUILD_2D_PLAYGROUND "Build the optional SDL3 2D Play/render playground" OFF)
 option(ASTRO_BUILD_VISUAL_LOGIC "Build the optional typed Visual Logic graph runtime" OFF)
 option(ASTRO_BUILD_STACK_SPIKE "Build the isolated Windows SDL3/bgfx/ImGui experiment" OFF)
 option(ASTRO_BUILD_EDITOR "Build Windows editor" OFF)
@@ -48,8 +50,12 @@ if(BUILD_TESTING)
 endif()
 
 option(ASTRO_BUILD_WINDOWS_RUNTIME_PACKAGE "Package the optional Game UI runtime demo as a standalone Windows ZIP" OFF)
-if(ASTRO_BUILD_STACK_SPIKE OR ASTRO_BUILD_EDITOR OR ASTRO_BUILD_GAME_UI_DEMO)
+if(ASTRO_BUILD_STACK_SPIKE OR ASTRO_BUILD_EDITOR OR ASTRO_BUILD_GAME_UI_DEMO OR ASTRO_BUILD_2D_PLAYGROUND)
     add_subdirectory(samples/stack_spike)
+endif()
+
+if(ASTRO_BUILD_2D_PLAYGROUND OR (ASTRO_BUILD_EDITOR AND BUILD_TESTING))
+    add_subdirectory(samples/2d_playground)
 endif()
 
 if(ASTRO_BUILD_GAME_UI_DEMO)

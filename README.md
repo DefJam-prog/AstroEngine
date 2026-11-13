@@ -1,6 +1,6 @@
 # AstroEngine
 
-Начало разработки модульного 2D/3D-движка на C++20. Headless-приложение выводит информацию о запуске. В `astro_core` есть базовые сервисы, ModuleRegistry, typed EventBus, TimeService/fixed timestep, typed CommandRegistry и in-memory транзакции/Undo/Redo. Optional Windows editor показывает Hierarchy, Inspector с Name и SpriteRenderer, сохраняет Astro Scene v4 и показывает WIC image preview. Core API поддерживает nested prefabs, overrides и обновление экземпляров; UI управления префабами ещё нет. Общего игрового renderer пока нет; есть необязательный UI-демо backend.
+Начало разработки модульного 2D/3D-движка на C++20. Headless-приложение выводит информацию о запуске. В `astro_core` есть базовые сервисы, ModuleRegistry, typed EventBus, TimeService/fixed timestep, typed CommandRegistry и in-memory транзакции/Undo/Redo. Optional Windows editor показывает Hierarchy, Inspector с Name и SpriteRenderer, сохраняет Astro Scene v4 и показывает WIC image preview. Core API поддерживает nested prefabs, overrides и обновление экземпляров; UI управления префабами ещё нет. Optional Canvas2D/SDL3 Play preview показывает root Scene entities с видимым SpriteRenderer и текстурами из AssetRegistry; WIC loader пока ограничен Windows. Это не Editor Play workflow и не готовый игровой шаблон.
 
 В 00.2 добавлены локальные проверки с JSON-отчётом, настройка форматирования и опциональный статический анализ. Фактические результаты и ограничения: [отчёт 00.2](docs/reports/00.2.md). Подэтапы ядра 01.1–01.5 покрыты в [отчётах](docs/reports/).
 
@@ -56,6 +56,8 @@ ctest --preset windows-debug
 Подэтап 06.3: панели `View → Timeline` и `View → Camera Presets` редактируют/проигрывают один scalar animation track и вычисляют camera pose через существующие пресеты CameraRig. Это editor preview: animation не привязана к Scene properties, camera pose не рендерится, документы не сохраняются. См. [Timeline](docs/TIMELINE_EDITOR.md) и [Camera Rig](docs/CAMERA_RIG.md).
 
 Подэтап 06.4: окно `View → Save System` позволяет создавать пустые профили, явно выбирать сохраняемые свойства, составлять группы сущностей, подключать правила группы к профилю, настраивать checkpoint и проверять активацию/respawn на копии сцены с временным хранилищем. Данные authoring пока in-memory; ограничения: [Save System Editor](docs/SAVE_SYSTEM_EDITOR.md), результаты: [отчёт 06.4](docs/reports/06.4.md).
+
+Подготовительная основа для 06.5: optional `astro_runtime_render2d`, SDL3 адаптер и отдельный Play preview с fixed-step RuntimeSession, цветной геометрией и root `SpriteRenderer` из AssetRegistry. Детали и ограничения: [RENDERER_2D.md](docs/RENDERER_2D.md).
 
 ### Сцены редактора (02.4)
 

@@ -8,7 +8,7 @@
 | Предварительный стек | Записан в TECH_STACK.md; не утверждён окончательно |
 | Решение о стеке | Предложение D001 в DECISIONS.md |
 | Слои архитектуры и контракты | Core/Scene/Assets/Prefabs и прототип Visual Logic реализованы в ограниченном объёме; см. ARCHITECTURE.md и отчёты |
-| Графический редактор и UX | Минимальный редактор есть; 06.1 добавляет Visual Logic panel, полный UX из EDITOR_UX.md не реализован |
+| Графический редактор и UX | Минимальный редактор есть; 06.1 добавил Visual Logic, 06.2 — UI authoring/preview prototype; полный UX из EDITOR_UX.md не реализован |
 | Save System & Checkpoint Editor | 05.4–05.5: selective slots + runtime checkpoint/respawn; editor authoring и расширенные игровые поля отсутствуют |
 | Игровые системы и расширения | Требования раздела 07 записаны в GAME_SYSTEMS.md и D005; реализация отсутствует, требуется проверенная основа |
 | Шаблоны игр T01–T10 | Требования раздела 08 записаны в GAME_TEMPLATES.md и D006; шаблоны, конструктор и smoke-тесты отсутствуют |
@@ -32,14 +32,15 @@
 | Подэтап 05.5 | Runtime XY checkpoint triggers, callback conditions, one-shot/repeatable use, typed events, opt-in selected-profile respawn |
 | Подэтап 05.6 | Optional Windows x64/MSVC Game UI runtime ZIP, SDL3/ImGui license texts, clean-start smoke; full Stage 05 acceptance remains incomplete |
 | Подэтап 06.1 | Typed dataflow graph, deterministic synchronous debugger and editor panel; no graph persistence, command/Scene integration, branches or drag-wire authoring |
-| Сборка и тесты | Windows x64/MSVC Debug: 06.1 editor profile 28/28; headless regression 23/23; Release package smoke passed in 05.6 |
+| Подэтап 06.2 | UI Editor model/panel, Dark/Light theme preview, responsive anchors, Desktop/Tablet/Phone preview, validated Entity.Name/Text and SpriteRenderer.Visible/Visible bindings; no UI-file persistence or game-runtime rendering |
+| Сборка и тесты | Windows x64/MSVC Debug: 06.2 editor profile 30/30; headless regression 25/25; 06.1 package smoke passed in 05.6 |
 | Политика проверок и документации | Требования записаны в TESTING.md и D009; это не результаты выполненных тестов |
 | Недостающие документы целевого комплекта | docs/FILE_FORMATS.md, docs/TEMPLATE_GUIDE.md |
 | Совместимость и лицензии зависимостей | Не проверены |
 
 Сборка проверена из Visual Studio 2022 Developer Command Prompt x64; инструменты доступны через среду VS, хотя в обычном PowerShell не все присутствуют в PATH.
 
-00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4, 05.1–05.6 и 06.1: см. отчёты этапов. Приёмка законченной игры этапа 05 и всего этапа 06 ещё не выполнена.
+00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4, 05.1–05.6 и 06.1–06.2: см. отчёты этапов. Приёмка законченной игры этапа 05 и всего этапа 06 ещё не выполнена.
 
 ## Подэтап 05.1
 

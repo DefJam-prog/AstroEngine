@@ -82,6 +82,8 @@
 
 Подэтап 06.1 реализован ограниченно: typed pure-dataflow prototype и базовая панель Visual Logic. Граф пока не сохраняется, не исполняет команды и не меняет Scene; отсутствуют flow-control и drag-wire authoring. Это не приёмка этапа 06.
 
+Подэтап 06.2 реализован ограниченно: in-memory UI document authoring, две встроенные темы, Desktop/Tablet/Phone responsive preview и две валидируемые Scene bindings. Документ не сохраняется и не используется runtime Game UI; полная приёмка этапа 06 не достигнута.
+
 - **06.1** Visual Scripting, типизированные узлы и отладка.
 - **06.2** UI Editor, темы, привязки, responsive layout.
 - **06.3** Timeline/анимации, пресеты камер.

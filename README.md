@@ -51,6 +51,8 @@ ctest --preset windows-debug
 
 Подэтап 06.1: optional Editor содержит Visual Logic dataflow prototype с типизированными числами/логическими/текстовыми узлами и пошаговой трассой. Соединения выбираются из типизированного меню; графы пока не сохраняются и не меняют Scene. См. [документацию Visual Logic](docs/VISUAL_LOGIC.md).
 
+Подэтап 06.2: панель `View → UI Editor` создаёт Text/Button/Panel элементы, редактирует тёмную/светлую тему и responsive anchors/offsets, показывает Desktop/Tablet/Phone preview и поддерживает привязки `Entity.Name` и `SpriteRenderer.Visible`. UI-документы пока живут только в памяти редактора и не отображаются в игровой сборке. См. [руководство UI Editor](docs/UI_EDITOR.md).
+
 ### Сцены редактора (02.4)
 
 В редакторе доступны сохранение/открытие сцены (Ctrl+S, Ctrl+O), Undo/Redo (Ctrl+Z, Ctrl+Y или Ctrl+Shift+Z) и панель Diagnostics. Astro Scene v4 сохраняет ID/имена сцены и сущностей, иерархию, Transform, SpriteRenderer AssetId и prefab instance metadata. Загрузчик также читает v1–v3. При несохранённых правках переключение проекта/сцены блокируется. Формат и миграции описаны в [FILE_FORMATS.md](docs/FILE_FORMATS.md).

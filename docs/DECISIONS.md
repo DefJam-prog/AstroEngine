@@ -295,3 +295,10 @@ AssetId назначается монотонно и сохраняется в �
 - The first Visual Logic iteration is an optional C++20 graph/evaluator with typed Number/Boolean/String pins, deterministic evaluation, bounded node/text sizes, and a synchronous step debugger. It has no new third-party dependencies.
 - The editor uses typed menus for connections to keep this substage small. Graph files, undo, execution-flow/branch nodes, runtime bindings, gameplay commands, Scene mutation, and drag-wire authoring are deferred; no UI action should imply these are available.
 - Keep the evaluator independent of `CommandRegistry` and Scene until the graph model, persistence, and transactional semantics can be designed and tested together. This prototype does not meet Stage 06 acceptance by itself.
+
+## D037 — Bound the first UI Editor to a previewable in-memory document (06.2)
+
+- The UI document model supports stable local element IDs, Panel/Text/Button elements, Dark/Light theme tokens, responsive anchors and pixel offsets, and typed bindings from `Entity.Name` to Text or `SpriteRenderer.Visible` to Visible.
+- Binding refresh reads Scene values into the UI document and never writes to Scene. It validates all bindings before applying refreshed values, so a stale source does not partially update the document.
+- The first authoring panel is an in-memory editor prototype. Versioned UI-file persistence, gameplay/runtime rendering, more binding sources, navigation/input, localization, nested interactive layout editing, and custom theme authoring are deferred. This does not satisfy full Stage 06 acceptance.
+- No additional third-party dependency is introduced; the Editor panel uses the existing ImGui integration.

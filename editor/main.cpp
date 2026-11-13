@@ -6,6 +6,7 @@
 #include "astro/logic/VisualLogicGraph.hpp"
 #include "astro/scene/Scene.hpp"
 #include "astro/scene/SceneFile.hpp"
+#include "astro/ui/UiDocument.hpp"
 #include <SDL3/SDL.h>
 #include <bgfx/bgfx.h>
 #include <bx/math.h>
@@ -319,6 +320,208 @@ void drawVisualLogic(astro::logic::VisualLogicGraph& graph, astro::logic::Visual
             break;
         }
         ImGui::PopID();
+    }
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+ImU32 uiColor(const std::uint32_t rgba)
+{
+    return IM_COL32((rgba >> 24) & 0xFF, (rgba >> 16) & 0xFF, (rgba >> 8) & 0xFF, rgba & 0xFF);
+}
+
+void drawUiEditor(astro::ui::UiDocument& document, const Scene& scene,
+    std::optional<astro::ui::ElementId>& selected, int& viewportPreset,
+    std::array<char, 4097>& textDraft, std::optional<astro::ui::ElementId>& draftElement,
+    const std::function<void(const std::string&)>& reportError, bool& windowDrawn)
+{
+    using namespace astro::ui;
+    if (!ImGui::Begin("UI Editor")) { ImGui::End(); return; }
+    windowDrawn = true;
+
+    static constexpr const char* themeNames[]{"Dark", "Light"};
+    int themeIndex = document.theme() == ThemeKind::Light ? 1 : 0;
+    if (ImGui::Combo("Theme", &themeIndex, themeNames, 2))
+    {
+        const auto changed = document.setTheme(themeIndex == 0 ? ThemeKind::Dark : ThemeKind::Light);
+        if (!changed) reportError(changed.error().message);
+    }
+    static constexpr const char* viewportNames[]{"Desktop 1280 x 720", "Tablet 800 x 1000", "Phone 390 x 844"};
+    ImGui::Combo("Preview size", &viewportPreset, viewportNames, 3);
+
+    const auto create = [&](const ElementKind kind, const char* name) {
+        const auto added = document.addElement(kind, name);
+        if (!added) reportError(added.error().message);
+        else { selected = added.value(); draftElement.reset(); }
+    };
+    if (ImGui::Button("+ Panel")) create(ElementKind::Panel, "Panel");
+    ImGui::SameLine();
+    if (ImGui::Button("+ Text")) create(ElementKind::Text, "Text");
+    ImGui::SameLine();
+    if (ImGui::Button("+ Button")) create(ElementKind::Button, "Button");
+    ImGui::SameLine();
+    ImGui::TextDisabled("UI layout is an in-memory editor document in 06.2.");
+
+    const auto body = ImGui::GetContentRegionAvail();
+    const float listWidth = std::clamp(body.x * 0.22f, 150.0f, 230.0f);
+    if (ImGui::BeginChild("UiElementList", ImVec2(listWidth, body.y), true))
+    {
+        for (const auto& element : document.elements())
+        {
+            if (ImGui::Selectable((element.name + "  [" + std::string(elementKindName(element.kind)) + "]##ui"
+                + std::to_string(element.id)).c_str(), selected == element.id))
+            {
+                selected = element.id;
+                draftElement.reset();
+            }
+        }
+    }
+    ImGui::EndChild();
+    ImGui::SameLine();
+
+    const float inspectorWidth = std::clamp(body.x * 0.30f, 230.0f, 330.0f);
+    if (ImGui::BeginChild("UiInspector", ImVec2(inspectorWidth, body.y), true))
+    {
+        const auto* element = selected ? document.find(*selected) : nullptr;
+        if (!element) ImGui::TextDisabled("Create or select an element.");
+        else
+        {
+            ImGui::Text("%s — %s", element->name.c_str(), elementKindName(element->kind).data());
+            if (ImGui::Button("Remove selected element"))
+            {
+                const auto removed = document.removeElement(element->id);
+                if (!removed) reportError(removed.error().message);
+                else { selected.reset(); draftElement.reset(); element = nullptr; }
+            }
+            if (!element)
+            {
+                ImGui::TextDisabled("Element removed.");
+            }
+            else
+            {
+                ImGui::SeparatorText("Content");
+                if (element->kind != ElementKind::Panel)
+                {
+                    if (draftElement != selected)
+                    {
+                        textDraft.fill('\0');
+                        std::copy_n(element->text.data(), std::min(element->text.size(), textDraft.size() - 1), textDraft.data());
+                        draftElement = selected;
+                    }
+                    const bool boundText = element->binding && element->binding->target == BindingTarget::Text;
+                    ImGui::BeginDisabled(boundText);
+                    if (ImGui::InputTextMultiline("Text", textDraft.data(), textDraft.size(), ImVec2(-1.0f, 68.0f)))
+                    {
+                        const auto changed = document.setText(element->id, textDraft.data());
+                        if (!changed) reportError(changed.error().message);
+                    }
+                    ImGui::EndDisabled();
+                    if (boundText) ImGui::TextDisabled("Text is driven by its scene binding.");
+                }
+
+                ImGui::SeparatorText("Responsive layout");
+                ResponsiveRect layout = element->layout;
+                bool layoutChanged = false;
+                ImGui::TextDisabled("Anchors are normalized to the parent area; offsets are pixels.");
+                layoutChanged |= ImGui::InputDouble("Anchor min X", &layout.anchorMinX, 0.01, 0.1, "%.2f");
+                layoutChanged |= ImGui::InputDouble("Anchor min Y", &layout.anchorMinY, 0.01, 0.1, "%.2f");
+                layoutChanged |= ImGui::InputDouble("Anchor max X", &layout.anchorMaxX, 0.01, 0.1, "%.2f");
+                layoutChanged |= ImGui::InputDouble("Anchor max Y", &layout.anchorMaxY, 0.01, 0.1, "%.2f");
+                layoutChanged |= ImGui::InputDouble("Offset min X", &layout.offsetMinX, 1.0, 10.0, "%.0f");
+                layoutChanged |= ImGui::InputDouble("Offset min Y", &layout.offsetMinY, 1.0, 10.0, "%.0f");
+                layoutChanged |= ImGui::InputDouble("Offset max X", &layout.offsetMaxX, 1.0, 10.0, "%.0f");
+                layoutChanged |= ImGui::InputDouble("Offset max Y", &layout.offsetMaxY, 1.0, 10.0, "%.0f");
+                if (layoutChanged)
+                {
+                    const auto changed = document.setLayout(element->id, layout);
+                    if (!changed) reportError(changed.error().message);
+                }
+
+                ImGui::SeparatorText("Scene binding");
+                std::vector<const char*> entityLabels;
+                entityLabels.reserve(scene.entities().size());
+                int entityIndex = 0;
+                for (std::size_t i = 0; i < scene.entities().size(); ++i)
+                {
+                    entityLabels.push_back(scene.entities()[i].name.c_str());
+                    if (element->binding && scene.entities()[i].id == element->binding->entity)
+                        entityIndex = static_cast<int>(i);
+                }
+                if (entityLabels.empty()) ImGui::TextDisabled("Create a scene entity to bind values.");
+                else
+                {
+                    ImGui::Combo("Entity", &entityIndex, entityLabels.data(), static_cast<int>(entityLabels.size()));
+                    static constexpr const char* textBindingNames[]{"No binding", "Entity.Name → Text"};
+                    static constexpr const char* visibleBindingNames[]{"No binding", "SpriteRenderer.Visible → Visible"};
+                    const bool textAllowed = element->kind == ElementKind::Text || element->kind == ElementKind::Button;
+                    const auto* boundEntity = scene.find(scene.entities()[static_cast<std::size_t>(entityIndex)].id);
+                    const bool visibleAllowed = boundEntity && scene.spriteRenderer(boundEntity->id);
+                    int bindingIndex = 0;
+                    if (element->binding && element->binding->entity == scene.entities()[static_cast<std::size_t>(entityIndex)].id)
+                    {
+                        if (element->binding->source == BindingSource::EntityName) bindingIndex = 1;
+                        else if (element->binding->source == BindingSource::SpriteVisible) bindingIndex = 1;
+                    }
+                    const char* const* labels = textAllowed ? textBindingNames : visibleBindingNames;
+                    if (textAllowed || visibleAllowed)
+                    {
+                        if (ImGui::Combo("Bind property", &bindingIndex, labels, 2))
+                        {
+                            std::optional<UiBinding> binding;
+                            if (bindingIndex == 1)
+                                binding = textAllowed
+                                    ? UiBinding{boundEntity->id, BindingSource::EntityName, BindingTarget::Text}
+                                    : UiBinding{boundEntity->id, BindingSource::SpriteVisible, BindingTarget::Visible};
+                            const auto changed = document.setBinding(element->id, binding, scene);
+                            if (!changed) reportError(changed.error().message);
+                        }
+                    }
+                    else ImGui::TextDisabled("This element has no supported binding target for this entity.");
+                }
+                if (element->binding && ImGui::Button("Clear binding"))
+                {
+                    const auto cleared = document.setBinding(element->id, std::nullopt, scene);
+                    if (!cleared) reportError(cleared.error().message);
+                }
+            }
+        }
+    }
+    ImGui::EndChild();
+    ImGui::SameLine();
+
+    if (ImGui::BeginChild("UiPreview", ImVec2(0, body.y), true))
+    {
+        const double viewportWidth = viewportPreset == 0 ? 1280.0 : viewportPreset == 1 ? 800.0 : 390.0;
+        const double viewportHeight = viewportPreset == 0 ? 720.0 : viewportPreset == 1 ? 1000.0 : 844.0;
+        ImGui::Text("Preview — %.0f x %.0f", viewportWidth, viewportHeight);
+        ImGui::TextDisabled("Change preview size to check anchors and offsets.");
+        const auto available = ImGui::GetContentRegionAvail();
+        const double scale = std::min(static_cast<double>(available.x) / viewportWidth,
+            static_cast<double>(available.y) / viewportHeight);
+        const double canvasWidth = viewportWidth * std::max(0.01, scale);
+        const double canvasHeight = viewportHeight * std::max(0.01, scale);
+        const auto origin = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("UiPreviewCanvas", ImVec2(static_cast<float>(canvasWidth), static_cast<float>(canvasHeight)));
+        auto* draw = ImGui::GetWindowDrawList();
+        const auto theme = document.resolvedTheme();
+        const ImVec2 canvasMax(origin.x + static_cast<float>(canvasWidth), origin.y + static_cast<float>(canvasHeight));
+        draw->AddRectFilled(origin, canvasMax, uiColor(theme.background));
+        draw->PushClipRect(origin, canvasMax, true);
+        for (const auto& item : document.elements())
+        {
+            if (!item.visible) continue;
+            const auto resolved = document.resolveLayout(item.id, viewportWidth, viewportHeight);
+            if (!resolved) { reportError(resolved.error().message); continue; }
+            const auto& rect = resolved.value();
+            const ImVec2 min(origin.x + static_cast<float>(rect.x * scale), origin.y + static_cast<float>(rect.y * scale));
+            const ImVec2 max(min.x + static_cast<float>(rect.width * scale), min.y + static_cast<float>(rect.height * scale));
+            if (item.kind == ElementKind::Panel) draw->AddRectFilled(min, max, uiColor(theme.surface), 3.0f);
+            else if (item.kind == ElementKind::Button) draw->AddRectFilled(min, max, uiColor(theme.accent), 4.0f);
+            const auto& caption = item.text.empty() ? item.name : item.text;
+            draw->AddText(ImVec2(min.x + 5.0f, min.y + 5.0f), uiColor(theme.text), caption.c_str());
+            if (selected == item.id) draw->AddRect(min, max, IM_COL32(255, 205, 90, 255), 2.0f, 0, 2.0f);
+        }
+        draw->PopClipRect();
     }
     ImGui::EndChild();
     ImGui::End();
@@ -671,6 +874,13 @@ public:
         auto logicGraph = makeScoreGateGraph();
         astro::logic::VisualLogicDebugger logicDebugger;
         bool visualLogicWindowDrawn = false;
+        bool showUiEditor = false, uiEditorWindowDrawn = false;
+        astro::ui::UiDocument uiDocument;
+        std::optional<astro::ui::ElementId> selectedUiElement;
+        std::optional<astro::ui::ElementId> uiTextDraftElement;
+        std::array<char, 4097> uiTextDraft{};
+        int uiPreviewPreset = 0;
+        bool uiBindingErrorReported = false;
         char path[1024] = "";
         char scenePathInput[1024] = "";
         char assetPathInput[512] = "";
@@ -881,6 +1091,27 @@ public:
             if (!root || !child || scene.entities().size() != 2 || scene.find(child.value())->parent != root.value())
                 throw std::runtime_error("Scene model smoke failed");
             selectedEntity = root.value();
+            showUiEditor = true;
+            const auto uiTitle = uiDocument.addElement(astro::ui::ElementKind::Text, "Player label");
+            if (!uiTitle) throw std::runtime_error("UI editor smoke element creation failed");
+            selectedUiElement = uiTitle.value();
+            astro::ui::ResponsiveRect uiResponsive;
+            uiResponsive.anchorMinX = 0.05;
+            uiResponsive.anchorMinY = 0.85;
+            uiResponsive.anchorMaxX = 0.95;
+            uiResponsive.anchorMaxY = 0.95;
+            uiResponsive.offsetMaxX = -8.0;
+            uiResponsive.offsetMaxY = -8.0;
+            if (!uiDocument.setLayout(uiTitle.value(), uiResponsive))
+                throw std::runtime_error("UI responsive layout setup failed");
+            const auto uiLayout = uiDocument.resolveLayout(uiTitle.value(), 1280.0, 720.0);
+            const auto uiPhoneLayout = uiDocument.resolveLayout(uiTitle.value(), 390.0, 844.0);
+            if (!uiLayout || !uiPhoneLayout || uiLayout.value().width == uiPhoneLayout.value().width)
+                throw std::runtime_error("UI responsive layout smoke failed");
+            if (!uiDocument.setBinding(uiTitle.value(), astro::ui::UiBinding{root.value(),
+                astro::ui::BindingSource::EntityName, astro::ui::BindingTarget::Text}, scene)
+                || !uiDocument.refreshBindings(scene) || uiDocument.find(uiTitle.value())->text != "Smoke Root Ω")
+                throw std::runtime_error("UI scene binding smoke failed");
             const astro::scene::SetScenePropertyPayload editName{root.value(), "name", std::string{"Edited Root Ω"}};
             if (!commands.validate("entity.set_property", 1, editName)
                 || !commands.execute<astro::scene::SetScenePropertyPayload, void>("entity.set_property", 1, editName)
@@ -988,10 +1219,12 @@ public:
                     ImGui::MenuItem("Project", nullptr, &showProject);
                     ImGui::MenuItem("Diagnostics", nullptr, &showDiagnostics);
                     ImGui::MenuItem("Visual Logic", nullptr, &showVisualLogic);
+                    ImGui::MenuItem("UI Editor", nullptr, &showUiEditor);
                     if (ImGui::MenuItem("Reset layout"))
                     {
                         resetLayout = true;
                         showProject = showDiagnostics = showVisualLogic = true;
+                        showUiEditor = true;
                     }
                     ImGui::EndMenu();
                 }
@@ -1013,6 +1246,7 @@ public:
                 ImGui::DockBuilderDockWindow("Project", right);
                 ImGui::DockBuilderDockWindow("Diagnostics", right);
                 ImGui::DockBuilderDockWindow("Inspector", right);
+                ImGui::DockBuilderDockWindow("UI Editor", right);
                 ImGui::DockBuilderFinish(dock);
                 resetLayout = false;
             }
@@ -1121,6 +1355,18 @@ public:
             ImGui::End();
             if (showVisualLogic)
                 drawVisualLogic(logicGraph, logicDebugger, reportError, visualLogicWindowDrawn);
+            if (showUiEditor)
+            {
+                const auto bindings = uiDocument.refreshBindings(scene);
+                if (!bindings && !uiBindingErrorReported)
+                {
+                    reportError(bindings.error().message);
+                    uiBindingErrorReported = true;
+                }
+                if (bindings) uiBindingErrorReported = false;
+                drawUiEditor(uiDocument, scene, selectedUiElement, uiPreviewPreset, uiTextDraft,
+                    uiTextDraftElement, reportError, uiEditorWindowDrawn);
+            }
             if (showDiagnostics)
             {
                 ImGui::Begin("Diagnostics", &showDiagnostics);
@@ -1224,7 +1470,9 @@ public:
         return smoke && !(frames == 90 && docked && rendered && activeProject == "Smoke project Ω"
             && scene.entities().size() == 2 && scene.find(1)->name == "Edited Root Ω"
             && undoShortcuts == 1 && redoShortcuts == 1 && saveShortcuts == 1 && openShortcuts == 1
-            && visualLogicWindowDrawn && logicDebugger.state() == astro::logic::DebugState::Completed) ? 1 : 0;
+            && visualLogicWindowDrawn && logicDebugger.state() == astro::logic::DebugState::Completed
+            && uiEditorWindowDrawn && uiDocument.elements().size() == 1
+            && uiDocument.find(1)->text == "Edited Root Ω") ? 1 : 0;
     }
 };
 }

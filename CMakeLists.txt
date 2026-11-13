@@ -34,6 +34,10 @@ if(ASTRO_BUILD_VISUAL_LOGIC OR ASTRO_BUILD_EDITOR OR BUILD_TESTING)
     add_subdirectory(engine/logic)
 endif()
 
+if(ASTRO_BUILD_EDITOR OR BUILD_TESTING)
+    add_subdirectory(engine/ui)
+endif()
+
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()

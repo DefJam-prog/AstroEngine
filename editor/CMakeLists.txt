@@ -16,7 +16,7 @@ target_include_directories(astro_editor PRIVATE
     "${imgui}" "${imgui}/backends"
     "${ASTRO_SPIKE_DEPS}/bgfx/include" "${ASTRO_SPIKE_DEPS}/bx/include"
     "${ASTRO_SPIKE_DEPS}/bgfx/examples/common/imgui")
-target_link_libraries(astro_editor PRIVATE astro_core astro_scene astro_visual_logic astro_runtime_sdl_input spike_imgui spike_bgfx spike_bimg spike_bx
+target_link_libraries(astro_editor PRIVATE astro_core astro_scene astro_visual_logic astro_ui_editor astro_runtime_sdl_input spike_imgui spike_bgfx spike_bimg spike_bx
     d3d11 dxgi dxguid psapi windowscodecs ole32)
 if(BUILD_TESTING)
     add_test(NAME editor.smoke COMMAND astro_editor --smoke)

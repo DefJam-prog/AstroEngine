@@ -22,7 +22,7 @@ flowchart LR
     Model --- Assets[Asset Registry / Prefabs]
 ```
 
-GUI, визуальная логика и AI используют единый механизм команд для одинаковых действий, согласно P01. AI не изменяет внутреннее состояние сцен в обход команд. Optional Runtime Modules — Rendering, Physics, Audio, UI — подключаются при необходимости через границы подсистем. Core не зависит от GUI и необязательных реализаций. Конкретные интерфейсы связи модели, ресурсов и runtime подлежат дальнейшему проектированию.
+Целевое направление: GUI, визуальная логика и AI должны использовать единый механизм команд для одинаковых действий, согласно P01. Реализованный Inspector вызывает Scene Command API; Visual Logic 06.1 и UI Editor 06.2 пока изолированы и не отправляют команды. AI не изменяет внутреннее состояние сцен в обход команд. Optional Runtime Modules — Rendering, Physics, Audio, UI — подключаются при необходимости через границы подсистем. Core не зависит от GUI и необязательных реализаций.
 
 ## Core
 
@@ -43,6 +43,10 @@ GUI, визуальная логика и AI используют единый �
 ### Visual Logic prototype (06.1)
 
 `engine/logic` provides an optional C++20 typed dataflow graph and deterministic single-threaded evaluator. The editor exposes a vertical-node-list UI with typed input menus and per-node debugging. It is deliberately isolated from `CommandRegistry` and `Scene`: this prototype cannot mutate a project or gameplay state. Graph persistence, undo, flow-control nodes, runtime bindings, and drag-wire authoring are not implemented. The graph target has no SDL/bgfx/ImGui dependency; the optional editor UI uses the existing editor stack. See [VISUAL_LOGIC.md](VISUAL_LOGIC.md).
+
+### UI Editor prototype (06.2)
+
+`engine/ui` contains an in-memory UI document model with stable element IDs, Panel/Text/Button kinds, Dark/Light preview themes, bounded responsive anchors/offsets, and two validated Scene bindings: `Entity.Name → Text` and `SpriteRenderer.Visible → Visible`. The Editor panel authors these elements and previews Desktop/Tablet/Phone viewports. Binding refresh is read-only with respect to Scene and applies values to the UI document only after all bindings validate. UI documents are not serialized, and the runtime Game UI renderer is not connected to this editor model. See [UI_EDITOR.md](UI_EDITOR.md).
 
 Подэтап 01.4 реализует `CommandRegistry` в `engine/core`. `CommandSchema` задаёт ID и положительную версию; template-типы задают точный C++ payload и output; обязательный validator проверяет payload/предусловия, executor получает `EngineContext` и возвращает `Result<Output>`. `validate` выполняет validation-only/dry-run без вызова executor, `execute` повторяет validation непосредственно перед выполнением. Результат, типизированные ошибки и локальные audit entries доступны вызывающему коду. Подробный контракт и пример: [COMMAND_API.md](COMMAND_API.md).
 

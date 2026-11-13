@@ -46,6 +46,7 @@ int main()
     const auto trailingPath = directory / "trailing.scene";
     const auto invalidUtf8Path = directory / "invalid utf8.scene";
     const auto legacyPath = directory / "legacy v1.scene";
+    const auto legacyV2Path = directory / "legacy v2.scene";
     const auto unknownComponentPath = directory / "unknown component.scene";
 
     Scene source(42, "Уровень Ω");
@@ -62,6 +63,7 @@ int main()
         moved.rotationDegrees = {0.0, 90.0, -45.5};
         moved.scale = {2.0, 0.5, 1.0};
         check(source.setTransform(root.value(), moved).hasValue(), "set a non-default Transform");
+        check(source.setSpriteRenderer(root.value(), {77}).hasValue(), "attach SpriteRenderer using stable AssetId");
         check(saveSceneFile(scenePath, source).hasValue(), "save a scene atomically");
         auto loaded = loadSceneFile(scenePath);
         check(loaded.hasValue(), "load a saved scene");
@@ -75,6 +77,9 @@ int main()
             const auto* loadedTransform = loaded.value().transform(root.value());
             check(loadedTransform && loadedTransform->id == source.transform(root.value())->id
                 && loadedTransform->value == moved, "preserve Transform values and component ID");
+            const auto* sprite = loaded.value().spriteRenderer(root.value());
+            check(sprite && sprite->texture.value == 77 && sprite->visible
+                && sprite->id == source.spriteRenderer(root.value())->id, "round-trip SpriteRenderer reference and component ID");
             auto next = loaded.value().createEntity("Next ID");
             check(next && next.value() == 4, "continue the persisted entity ID sequence");
         }
@@ -98,10 +103,22 @@ int main()
     if (migrated)
     {
         const auto oldComponentId = migrated.value().transform(12)->id;
-        check(saveSceneFile(legacyPath, migrated.value()).hasValue(), "rewrite migrated v1 file as v2");
+        check(saveSceneFile(legacyPath, migrated.value()).hasValue(), "rewrite migrated v1 file as v3");
         auto migratedAgain = loadSceneFile(legacyPath);
         check(migratedAgain && migratedAgain.value().transform(12)->id == oldComponentId,
-            "preserve migrated component ID after writing v2");
+            "preserve migrated component ID after writing v3");
+    }
+    writeText(legacyV2Path, "ASTRO_SCENE 2\nSCENE 8 \"Legacy v2\"\nENTITY 4 0 \"Old root\"\nCOMPONENT 9 4 \"astro.Transform\" 1 1 2 3 4 5 6 7 8 9\nEND\n");
+    auto migratedV2 = loadSceneFile(legacyV2Path);
+    check(migratedV2 && migratedV2.value().transform(4)->id == 9
+        && migratedV2.value().transform(4)->value.position == Vec3{1, 2, 3}
+        && !migratedV2.value().spriteRenderer(4), "migrate v2 Transform to the v3 model without changing IDs");
+    if (migratedV2)
+    {
+        check(saveSceneFile(legacyV2Path, migratedV2.value()).hasValue(), "write migrated v2 scene as v3");
+        auto roundTripV2 = loadSceneFile(legacyV2Path);
+        check(roundTripV2 && roundTripV2.value().transform(4)->id == 9,
+            "preserve v2 component ID through v3 save/load");
     }
     writeText(unknownComponentPath, "ASTRO_SCENE 2\nSCENE 1 \"X\"\nENTITY 1 0 \"Node\"\nCOMPONENT 1 1 \"astro.Unknown\" 1 0 0 0 0 0 0 1 1 1\nEND\n");
     auto unknownComponent = loadSceneFile(unknownComponentPath);
@@ -119,7 +136,7 @@ int main()
     check(!loadSceneFile(directory / "absent.scene"), "report missing file");
 
     for (const auto& file : {scenePath, versionPath, missingParentPath, cyclePath, trailingPath, invalidUtf8Path,
-        legacyPath, unknownComponentPath})
+        legacyPath, legacyV2Path, unknownComponentPath})
         std::filesystem::remove(file, fsError);
     check(std::filesystem::remove(directory, fsError), "remove only the test-owned empty directory");
 

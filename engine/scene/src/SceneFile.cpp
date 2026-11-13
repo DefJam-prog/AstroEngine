@@ -47,7 +47,7 @@ std::string serialize(const Scene& scene)
     std::ostringstream output;
     output.imbue(std::locale::classic());
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
-    output << "ASTRO_SCENE 2\nSCENE " << scene.id() << ' ' << std::quoted(scene.name()) << '\n';
+    output << "ASTRO_SCENE 3\nSCENE " << scene.id() << ' ' << std::quoted(scene.name()) << '\n';
     for (const auto& entity : scene.entities())
         output << "ENTITY " << entity.id << ' ' << entity.parent.value_or(0) << ' '
                << std::quoted(entity.name) << '\n';
@@ -59,6 +59,11 @@ std::string serialize(const Scene& scene)
                    << component.value.rotationDegrees.x << ' ' << component.value.rotationDegrees.y << ' '
                    << component.value.rotationDegrees.z << ' ' << component.value.scale.x << ' '
                    << component.value.scale.y << ' ' << component.value.scale.z << '\n';
+    for (const auto& entity : scene.entities())
+        if (entity.spriteRenderer)
+            output << "COMPONENT " << entity.spriteRenderer->id << ' ' << entity.id << ' '
+                   << std::quoted("astro.SpriteRenderer") << ' ' << entity.spriteRenderer->schemaVersion << ' '
+                   << entity.spriteRenderer->texture.value << ' ' << (entity.spriteRenderer->visible ? 1 : 0) << '\n';
     output << "END\n";
     return output.str();
 }
@@ -184,7 +189,7 @@ core::Result<Scene> loadSceneFile(const std::filesystem::path& file)
     std::string magic;
     if (!(header >> magic >> version) || hasExtra(header) || magic != "ASTRO_SCENE")
         return fileError(core::ErrorCode::ParseError, "Invalid scene file header");
-    if (version != 1 && version != 2)
+    if (version != 1 && version != 2 && version != 3)
         return fileError(core::ErrorCode::VersionMismatch, "Unsupported scene file version");
 
     if (!nextLine()) return fileError(core::ErrorCode::ParseError, "Scene metadata is missing");
@@ -215,26 +220,40 @@ core::Result<Scene> loadSceneFile(const std::filesystem::path& file)
             if (parent != 0) entity.parent = parent;
             entities.push_back(std::move(entity));
         }
-        else if (marker == "COMPONENT" && version == 2)
+        else if (marker == "COMPONENT" && version >= 2)
         {
             ComponentId componentId = 0;
             EntityId ownerId = 0;
             std::string type;
             std::uint32_t componentVersion = 0;
-            Transform transform;
-            if (!(record >> componentId >> ownerId >> std::quoted(type) >> componentVersion
-                >> transform.position.x >> transform.position.y >> transform.position.z
-                >> transform.rotationDegrees.x >> transform.rotationDegrees.y >> transform.rotationDegrees.z
-                >> transform.scale.x >> transform.scale.y >> transform.scale.z) || hasExtra(record))
+            if (!(record >> componentId >> ownerId >> std::quoted(type) >> componentVersion))
                 return fileError(core::ErrorCode::ParseError, "Invalid component record");
-            if (type != "astro.Transform")
-                return fileError(core::ErrorCode::ValidationError, "Unknown component type: " + type);
             const auto owner = std::find_if(entities.begin(), entities.end(), [ownerId](const Entity& entity) {
                 return entity.id == ownerId;
             });
             if (owner == entities.end())
                 return fileError(core::ErrorCode::NotFound, "Component owner entity does not exist");
-            owner->components.push_back({componentId, componentVersion, transform});
+            if (type == "astro.Transform")
+            {
+                Transform transform;
+                if (!(record >> transform.position.x >> transform.position.y >> transform.position.z
+                    >> transform.rotationDegrees.x >> transform.rotationDegrees.y >> transform.rotationDegrees.z
+                    >> transform.scale.x >> transform.scale.y >> transform.scale.z) || hasExtra(record))
+                    return fileError(core::ErrorCode::ParseError, "Invalid Transform component record");
+                owner->components.push_back({componentId, componentVersion, transform});
+            }
+            else if (type == "astro.SpriteRenderer" && version >= 3)
+            {
+                if (owner->spriteRenderer)
+                    return fileError(core::ErrorCode::AlreadyExists, "Entity contains duplicate SpriteRenderer components");
+                std::uint64_t assetId = 0;
+                unsigned visible = 0;
+                if (!(record >> assetId >> visible) || visible > 1 || hasExtra(record))
+                    return fileError(core::ErrorCode::ParseError, "Invalid SpriteRenderer component record");
+                owner->spriteRenderer = SpriteRendererComponent{componentId, componentVersion, {assetId}, visible != 0};
+            }
+            else
+                return fileError(core::ErrorCode::ValidationError, "Unknown component type: " + type);
         }
         else
             return fileError(core::ErrorCode::ParseError, "Unknown or unsupported scene record");

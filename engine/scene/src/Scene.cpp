@@ -112,6 +112,17 @@ core::Result<Scene> restoreScene(const SceneId id, std::string name, std::vector
         if (!componentIds.emplace(componentId).second)
             return core::Result<Scene>::failure({core::ErrorCode::AlreadyExists, "Scene contains a duplicate component ID"});
         maximumComponentId = std::max(maximumComponentId, componentId);
+        if (entity.spriteRenderer)
+        {
+            const auto& sprite = *entity.spriteRenderer;
+            if (sprite.id == 0 || sprite.id == std::numeric_limits<ComponentId>::max()
+                || sprite.schemaVersion != 1 || sprite.texture.value == 0)
+                return core::Result<Scene>::failure({core::ErrorCode::ValidationError,
+                    "SpriteRenderer requires a valid component ID and texture asset ID"});
+            if (!componentIds.emplace(sprite.id).second)
+                return core::Result<Scene>::failure({core::ErrorCode::AlreadyExists, "Scene contains a duplicate component ID"});
+            maximumComponentId = std::max(maximumComponentId, sprite.id);
+        }
     }
     for (const auto& entity : entities)
         if (entity.parent && !byId.contains(*entity.parent))
@@ -173,6 +184,39 @@ const TransformComponent* Scene::transform(const EntityId entityId) const noexce
 {
     const auto* entity = find(entityId);
     return entity && !entity->components.empty() ? &entity->components.front() : nullptr;
+}
+
+const SpriteRendererComponent* Scene::spriteRenderer(const EntityId entityId) const noexcept
+{
+    const auto* entity = find(entityId);
+    return entity && entity->spriteRenderer ? &*entity->spriteRenderer : nullptr;
+}
+
+core::Result<void> Scene::setSpriteRenderer(const EntityId entityId, const assets::AssetId texture, const bool visible)
+{
+    auto* entity = find(entityId);
+    if (!entity) return core::Result<void>::failure({core::ErrorCode::NotFound, "Entity does not exist"});
+    if (texture.value == 0) return core::Result<void>::failure({core::ErrorCode::ValidationError, "Texture asset ID must not be zero"});
+    if (!entity->spriteRenderer)
+    {
+        if (nextComponentId_ == 0 || nextComponentId_ == std::numeric_limits<ComponentId>::max())
+            return core::Result<void>::failure({core::ErrorCode::InvalidState, "Component ID space is exhausted"});
+        entity->spriteRenderer = SpriteRendererComponent{nextComponentId_++, 1, texture, visible};
+    }
+    else
+    {
+        entity->spriteRenderer->texture = texture;
+        entity->spriteRenderer->visible = visible;
+    }
+    return core::Result<void>::success();
+}
+
+core::Result<void> Scene::removeSpriteRenderer(const EntityId entityId)
+{
+    auto* entity = find(entityId);
+    if (!entity) return core::Result<void>::failure({core::ErrorCode::NotFound, "Entity does not exist"});
+    entity->spriteRenderer.reset();
+    return core::Result<void>::success();
 }
 
 core::Result<void> Scene::setTransform(const EntityId entityId, const Transform& value)

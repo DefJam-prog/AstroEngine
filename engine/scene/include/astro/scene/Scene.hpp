@@ -2,6 +2,7 @@
 
 #include "astro/core/CommandRegistry.hpp"
 #include "astro/core/Result.hpp"
+#include "astro/assets/AssetRegistry.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -42,6 +43,14 @@ struct TransformComponent
     Transform value{};
 };
 
+struct SpriteRendererComponent
+{
+    ComponentId id = 0;
+    std::uint32_t schemaVersion = 1;
+    assets::AssetId texture{};
+    bool visible = true;
+};
+
 enum class PropertyType
 {
     Utf8String,
@@ -69,6 +78,7 @@ struct Entity
     std::string name;
     std::optional<EntityId> parent;
     std::vector<TransformComponent> components;
+    std::optional<SpriteRendererComponent> spriteRenderer;
 };
 
 // Scene and component IDs are stable across save/load. Entity IDs are unique in
@@ -86,6 +96,9 @@ public:
     [[nodiscard]] TransformComponent* findTransform(ComponentId id) noexcept;
     [[nodiscard]] const TransformComponent* findTransform(ComponentId id) const noexcept;
     [[nodiscard]] const TransformComponent* transform(EntityId entity) const noexcept;
+    [[nodiscard]] const SpriteRendererComponent* spriteRenderer(EntityId entity) const noexcept;
+    core::Result<void> setSpriteRenderer(EntityId entity, assets::AssetId texture, bool visible = true);
+    core::Result<void> removeSpriteRenderer(EntityId entity);
     core::Result<void> setTransform(EntityId entity, const Transform& value);
     core::Result<PropertyValue> getProperty(EntityId entity, std::string_view property) const;
     core::Result<void> validateProperty(EntityId entity, std::string_view property, const PropertyValue& value) const;
@@ -111,6 +124,13 @@ struct SetScenePropertyPayload
     EntityId entity = 0;
     std::string property;
     PropertyValue value;
+};
+
+struct SetSpriteRendererPayload
+{
+    EntityId entity = 0;
+    assets::AssetId texture{};
+    bool visible = true;
 };
 
 core::Result<void> registerSceneCommands(core::CommandRegistry& commands, Scene& scene);

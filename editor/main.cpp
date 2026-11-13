@@ -2,6 +2,7 @@
 #include <fstream>
 #include <string>
 #include "ProjectFile.hpp"
+#include "astro/assets/AssetRegistry.hpp"
 #include "astro/scene/Scene.hpp"
 #include "astro/scene/SceneFile.hpp"
 #include <SDL3/SDL.h>
@@ -10,6 +11,9 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_impl_sdl3.h>
+#include <windows.h>
+#include <wincodec.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
@@ -21,6 +25,9 @@
 #include <string_view>
 #include <vector>
 #include <iterator>
+#include <map>
+#include <memory>
+#include <limits>
 
 // Upstream bgfx shader binaries; licenses remain in the dependency cache.
 #include <vs_ocornut_imgui.bin.h>
@@ -31,6 +38,49 @@ namespace
 using astro::scene::Entity;
 using astro::scene::EntityId;
 using astro::scene::Scene;
+using Microsoft::WRL::ComPtr;
+
+void appendPngBe32(std::vector<std::uint8_t>& output, const std::uint32_t value)
+{
+    output.push_back(static_cast<std::uint8_t>(value >> 24));
+    output.push_back(static_cast<std::uint8_t>(value >> 16));
+    output.push_back(static_cast<std::uint8_t>(value >> 8));
+    output.push_back(static_cast<std::uint8_t>(value));
+}
+
+std::uint32_t pngCrc32(const std::uint8_t* bytes, const std::size_t size)
+{
+    std::uint32_t crc = 0xFFFFFFFFu;
+    for (std::size_t i = 0; i < size; ++i)
+    {
+        crc ^= bytes[i];
+        for (int bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+
+void appendPngChunk(std::vector<std::uint8_t>& png, const std::array<char, 4> type,
+    const std::vector<std::uint8_t>& data)
+{
+    appendPngBe32(png, static_cast<std::uint32_t>(data.size()));
+    const auto start = png.size();
+    for (const auto c : type) png.push_back(static_cast<std::uint8_t>(c));
+    png.insert(png.end(), data.begin(), data.end());
+    appendPngBe32(png, pngCrc32(png.data() + start, png.size() - start));
+}
+
+std::vector<std::uint8_t> makeSmokePng()
+{
+    std::vector<std::uint8_t> png{137,80,78,71,13,10,26,10};
+    std::vector<std::uint8_t> header;
+    appendPngBe32(header, 1); appendPngBe32(header, 1);
+    header.insert(header.end(), {8, 6, 0, 0, 0});
+    appendPngChunk(png, {'I','H','D','R'}, header);
+    const std::vector<std::uint8_t> compressed{0x78,0x01,0x01,0x05,0x00,0xFA,0xFF,0x00,0xFF,0x00,0x00,0xFF,0x05,0x00,0x01,0xFF};
+    appendPngChunk(png, {'I','D','A','T'}, compressed);
+    appendPngChunk(png, {'I','E','N','D'}, {});
+    return png;
+}
 
 bool hasChildren(const Scene& scene, const EntityId id)
 {
@@ -70,6 +120,7 @@ struct SceneNodeLayout
 void drawInspector(Scene& scene, std::optional<EntityId>& selected, astro::core::CommandRegistry& commands,
     std::array<char, 256>& textDraft, std::optional<EntityId>& draftEntity,
     std::optional<astro::scene::SceneId>& draftScene, bool& sceneDirty, std::string& message,
+    const astro::assets::AssetRegistry* assets, const std::map<std::uint64_t, bgfx::TextureHandle>& textures,
     const std::function<void(const std::string&)>& reportError)
 {
     if (!selected || !scene.find(*selected))
@@ -125,6 +176,52 @@ void drawInspector(Scene& scene, std::optional<EntityId>& selected, astro::core:
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::TextDisabled("UTF-8, max %zu bytes", property.maxLengthBytes);
+    }
+    ImGui::Separator();
+    ImGui::TextUnformatted("SpriteRenderer");
+    if (!assets || assets->entries().empty()) ImGui::TextDisabled("Import a PNG or JPEG in Project first.");
+    else
+    {
+        const auto* sprite = scene.spriteRenderer(entityId);
+        std::uint64_t selectedAsset = sprite ? sprite->texture.value : assets->entries().begin()->first.value;
+        if (ImGui::BeginCombo("Texture Asset", std::to_string(selectedAsset).c_str()))
+        {
+            for (const auto& [id, reference] : assets->entries())
+            {
+                const bool isSelected = selectedAsset == id.value;
+                const auto label = std::to_string(id.value) + " — " + reference.sourceRelativePath;
+                if (ImGui::Selectable(label.c_str(), isSelected)) selectedAsset = id.value;
+                if (isSelected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        const bool hasMatchingAsset = assets->find({selectedAsset}) != nullptr;
+        const bool changed = !sprite || sprite->texture.value != selectedAsset;
+        ImGui::BeginDisabled(!changed || !hasMatchingAsset);
+        if (ImGui::Button(sprite ? "Assign texture" : "Add SpriteRenderer"))
+        {
+            const astro::scene::SetSpriteRendererPayload payload{entityId, {selectedAsset}, true};
+            auto result = commands.execute<astro::scene::SetSpriteRendererPayload, void>(
+                "entity.set_sprite_renderer", 1, payload);
+            if (result) { sceneDirty = true; message = "SpriteRenderer assigned through command API"; }
+            else reportError(result.error().message);
+        }
+        ImGui::EndDisabled();
+        if (sprite)
+        {
+            const auto asset = assets->find(sprite->texture);
+            if (!asset) ImGui::TextColored(ImVec4(1, 0.35f, 0.25f, 1), "Missing texture AssetId %llu",
+                static_cast<unsigned long long>(sprite->texture.value));
+            else
+            {
+                const auto texture = textures.find(sprite->texture.value);
+                if (texture != textures.end() && bgfx::isValid(texture->second))
+                    ImGui::Image(static_cast<ImTextureID>(texture->second.idx + 1), ImVec2(160, 120));
+                else ImGui::TextDisabled("Image preview unavailable (decode/upload failed)");
+                ImGui::TextWrapped("AssetId %llu — %s", static_cast<unsigned long long>(asset->id.value),
+                    asset->sourceRelativePath.c_str());
+            }
+        }
     }
 }
 
@@ -211,6 +308,7 @@ class Editor
     bgfx::TextureHandle font = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle sampler = BGFX_INVALID_HANDLE, outputMode = BGFX_INVALID_HANDLE;
     bgfx::VertexLayout layout;
+    std::map<std::uint64_t, bgfx::TextureHandle> spriteTextures;
 
 public:
     ~Editor()
@@ -219,6 +317,8 @@ public:
         if (gui) ImGui::DestroyContext();
         if (graphics)
         {
+            for (const auto& [id, texture] : spriteTextures)
+                if (bgfx::isValid(texture)) bgfx::destroy(texture);
             if (bgfx::isValid(font)) bgfx::destroy(font);
             if (bgfx::isValid(program)) bgfx::destroy(program);
             if (bgfx::isValid(sampler)) bgfx::destroy(sampler);
@@ -227,6 +327,34 @@ public:
         }
         if (window) SDL_DestroyWindow(window);
         if (sdl) SDL_Quit();
+    }
+
+    bgfx::TextureHandle loadSpriteTexture(const std::filesystem::path& file)
+    {
+        ComPtr<IWICImagingFactory> factory;
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory)))) return BGFX_INVALID_HANDLE;
+        ComPtr<IWICBitmapDecoder> decoder;
+        if (FAILED(factory->CreateDecoderFromFilename(file.c_str(), nullptr, GENERIC_READ,
+            WICDecodeMetadataCacheOnLoad, &decoder))) return BGFX_INVALID_HANDLE;
+        ComPtr<IWICBitmapFrameDecode> frame;
+        if (FAILED(decoder->GetFrame(0, &frame))) return BGFX_INVALID_HANDLE;
+        UINT width = 0, height = 0;
+        if (FAILED(frame->GetSize(&width, &height)) || width == 0 || height == 0
+            || width > 16384 || height > 16384 || std::uint64_t(width) * height > 64ull * 1024 * 1024)
+            return BGFX_INVALID_HANDLE;
+        ComPtr<IWICFormatConverter> converter;
+        if (FAILED(factory->CreateFormatConverter(&converter))
+            || FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA,
+                WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom))) return BGFX_INVALID_HANDLE;
+        const auto byteCount = std::uint64_t(width) * height * 4;
+        if (byteCount > std::numeric_limits<UINT>::max()) return BGFX_INVALID_HANDLE;
+        std::vector<std::uint8_t> pixels(static_cast<std::size_t>(byteCount));
+        if (FAILED(converter->CopyPixels(nullptr, width * 4, static_cast<UINT>(byteCount), pixels.data())))
+            return BGFX_INVALID_HANDLE;
+        const auto* memory = bgfx::copy(pixels.data(), static_cast<std::uint32_t>(pixels.size()));
+        return bgfx::createTexture2D(static_cast<std::uint16_t>(width), static_cast<std::uint16_t>(height),
+            false, 1, bgfx::TextureFormat::BGRA8, BGFX_TEXTURE_NONE, memory);
     }
 
     void init()
@@ -328,6 +456,7 @@ public:
         bool showProject = true, showDiagnostics = true;
         char path[1024] = "";
         char scenePathInput[1024] = "";
+        char assetPathInput[512] = "";
         char name[256] = "My Game";
         std::string activeProject, message = "Create or open a project using File.";
         Scene scene(1, "Main Scene");
@@ -344,7 +473,9 @@ public:
         bool sceneDirty = false;
         bool dialog = false, create = false, sceneDialog = false;
         std::filesystem::path activeProjectRoot, currentScenePath;
+        std::optional<astro::assets::AssetRegistry> assetRegistry;
         std::vector<std::string> diagnostics;
+        std::optional<astro::assets::AssetId> smokeSpriteAsset;
         int undoShortcuts = 0, redoShortcuts = 0, saveShortcuts = 0, openShortcuts = 0;
         auto reportError = [&](const std::string& error) {
             message = error;
@@ -426,9 +557,16 @@ public:
             if (sceneDirty) throw std::runtime_error("Save the current scene before opening another project");
             auto result = astro::editor::readProject(file);
             if (!result) throw std::runtime_error(result.error().message);
+            auto projectRoot = file.parent_path();
+            if (projectRoot.empty()) projectRoot = std::filesystem::current_path();
+            auto registry = astro::assets::AssetRegistry::open(projectRoot);
+            if (!registry) throw std::runtime_error(registry.error().message);
             activeProject = result.value().name;
-            activeProjectRoot = file.parent_path();
-            if (activeProjectRoot.empty()) activeProjectRoot = std::filesystem::current_path();
+            activeProjectRoot = projectRoot;
+            for (const auto& [id, texture] : spriteTextures)
+                if (bgfx::isValid(texture)) bgfx::destroy(texture);
+            spriteTextures.clear();
+            assetRegistry = std::move(registry).value();
             startNewScene();
             message = "Project opened: " + result.value().name;
         };
@@ -436,8 +574,14 @@ public:
             if (sceneDirty) throw std::runtime_error("Save the current scene before creating another project");
             auto result = astro::editor::createProject(directory, title);
             if (!result) throw std::runtime_error(result.error().message);
+            auto registry = astro::assets::AssetRegistry::open(directory);
+            if (!registry) throw std::runtime_error(registry.error().message);
             activeProject = result.value().name;
             activeProjectRoot = directory;
+            for (const auto& [id, texture] : spriteTextures)
+                if (bgfx::isValid(texture)) bgfx::destroy(texture);
+            spriteTextures.clear();
+            assetRegistry = std::move(registry).value();
             startNewScene();
             message = "Project created: " + result.value().name;
         };
@@ -479,6 +623,16 @@ public:
             createProject(smokeDirectory, "Smoke project Ω");
             activeProject.clear();
             openProject(smokeDirectory / "project.astro");
+            std::filesystem::create_directories(smokeDirectory / "Assets" / "Sprites");
+            const auto smokePng = makeSmokePng();
+            { std::ofstream imageFile(smokeDirectory / "Assets" / "Sprites" / "smoke.png", std::ios::binary);
+              imageFile.write(reinterpret_cast<const char*>(smokePng.data()), static_cast<std::streamsize>(smokePng.size())); }
+            auto importedSmokeImage = assetRegistry->importImage(std::filesystem::path("Sprites") / "smoke.png");
+            if (!importedSmokeImage) throw std::runtime_error("Smoke image import failed: " + importedSmokeImage.error().message);
+            smokeSpriteAsset = importedSmokeImage.value().id;
+            const auto smokeTexture = loadSpriteTexture(assetRegistry->cachedPath(importedSmokeImage.value().id));
+            if (!bgfx::isValid(smokeTexture)) throw std::runtime_error("Smoke image WIC decode/BGFX upload failed");
+            spriteTextures[importedSmokeImage.value().id.value] = smokeTexture;
             const auto occupied = smokeDirectory / "occupied";
             std::filesystem::create_directory(occupied);
             { std::ofstream sentinel(occupied / "keep.txt", std::ios::binary); sentinel << "preserve"; }
@@ -507,6 +661,10 @@ public:
                 || !commands.execute<astro::scene::SetScenePropertyPayload, void>("entity.set_property", 1, editName)
                 || scene.find(root.value())->name != "Edited Root Ω")
                 throw std::runtime_error("Inspector command smoke failed");
+            const astro::scene::SetSpriteRendererPayload setSprite{root.value(), importedSmokeImage.value().id, true};
+            if (!commands.execute<astro::scene::SetSpriteRendererPayload, void>("entity.set_sprite_renderer", 1, setSprite)
+                || !scene.spriteRenderer(root.value()))
+                throw std::runtime_error("SpriteRenderer command smoke failed");
             sceneDirty = true;
             if (!saveCurrentScene() || !queueShortcut(SDLK_Z) || !queueShortcut(SDLK_Y)
                 || !queueShortcut(SDLK_S) || !queueShortcut(SDLK_O))
@@ -549,6 +707,19 @@ public:
                 swapChain.width = width; swapChain.height = height;
                 bgfx::reset(BGFX_RESET_VSYNC, &swapChain);
             }
+            if (assetRegistry)
+                for (const auto& entity : scene.entities())
+                    if (entity.spriteRenderer && assetRegistry->find(entity.spriteRenderer->texture)
+                        && !spriteTextures.contains(entity.spriteRenderer->texture.value))
+                    {
+                        const auto cached = assetRegistry->cachedPath(entity.spriteRenderer->texture);
+                        std::error_code cacheError;
+                        if (std::filesystem::exists(cached, cacheError) && !cacheError)
+                        {
+                            const auto handle = loadSpriteTexture(cached);
+                            if (bgfx::isValid(handle)) spriteTextures.emplace(entity.spriteRenderer->texture.value, handle);
+                        }
+                    }
             ImGui_ImplSDL3_NewFrame();
             ImGui::NewFrame();
             if (ImGui::BeginMainMenuBar())
@@ -619,7 +790,31 @@ public:
                 docked = ImGui::IsWindowDocked();
                 ImGui::TextUnformatted(activeProject.empty() ? "No project open" : activeProject.c_str());
                 ImGui::Separator();
-                ImGui::TextWrapped("Project workspace. Scene files are stored under Scenes.");
+                ImGui::TextWrapped("Scene files are stored under Scenes. Import PNG/JPEG source files from Assets/.");
+                if (assetRegistry)
+                {
+                    ImGui::InputText("Assets-relative image path", assetPathInput, sizeof(assetPathInput));
+                    if (ImGui::Button("Import PNG/JPEG"))
+                    {
+                        const std::u8string encoded(reinterpret_cast<const char8_t*>(assetPathInput));
+                        auto imported = assetRegistry->importImage(std::filesystem::path(encoded));
+                        if (!imported) reportError(imported.error().message);
+                        else
+                        {
+                            message = "Imported image as AssetId " + std::to_string(imported.value().id.value);
+                            const auto handle = loadSpriteTexture(assetRegistry->cachedPath(imported.value().id));
+                            if (!bgfx::isValid(handle)) reportError("Image imported, but WIC could not decode it for preview");
+                            else spriteTextures[imported.value().id.value] = handle;
+                        }
+                    }
+                    for (const auto missing : assetRegistry->missingAssets())
+                        ImGui::TextColored(ImVec4(1, 0.35f, 0.25f, 1), "Missing source for AssetId %llu",
+                            static_cast<unsigned long long>(missing.value));
+                    if (ImGui::CollapsingHeader("Imported images"))
+                        for (const auto& [id, ref] : assetRegistry->entries())
+                            ImGui::BulletText("%llu — %s (%u x %u)", static_cast<unsigned long long>(id.value),
+                                ref.sourceRelativePath.c_str(), ref.width, ref.height);
+                }
                 ImGui::End();
             }
             if (ImGui::Begin("Hierarchy"))
@@ -682,7 +877,8 @@ public:
                 docked = docked && ImGui::IsWindowDocked();
                 if (activeProjectRoot.empty()) ImGui::TextDisabled("Create or open a project first.");
                 else drawInspector(scene, selectedEntity, commands, inspectorDraft, inspectorDraftEntity,
-                    inspectorDraftScene, sceneDirty, message, reportError);
+                    inspectorDraftScene, sceneDirty, message, assetRegistry ? &*assetRegistry : nullptr,
+                    spriteTextures, reportError);
             }
             ImGui::End();
             if (ImGui::Begin("Scene View"))
@@ -761,7 +957,8 @@ public:
             sceneDialog = false;
             if (undoShortcuts != 1 || redoShortcuts != 1 || saveShortcuts != 1 || openShortcuts != 1
                 || !openSceneFile(currentScenePath) || sceneDirty || !scene.find(1)
-                || scene.find(1)->name != "Edited Root Ω")
+                || scene.find(1)->name != "Edited Root Ω"
+                || !scene.spriteRenderer(1) || !smokeSpriteAsset || scene.spriteRenderer(1)->texture != *smokeSpriteAsset)
                 throw std::runtime_error("Scene persistence/shortcut smoke failed");
             const auto loadedPath = currentScenePath;
             const auto invalidScenePath = smokeDirectory / "invalid.astro-scene";
@@ -782,7 +979,11 @@ public:
             std::filesystem::remove(smokeDirectory / "occupied");
             std::error_code ignored;
             std::filesystem::remove(currentScenePath, ignored);
-            std::filesystem::remove(smokeDirectory / "Scenes");
+            std::filesystem::remove_all(smokeDirectory / "Assets", ignored);
+            std::filesystem::remove_all(smokeDirectory / "Library", ignored);
+            std::filesystem::remove_all(smokeDirectory / ".astro", ignored);
+            std::filesystem::remove_all(smokeDirectory / "Scenes", ignored);
+            std::filesystem::remove(smokeDirectory / "project.astro");
             std::filesystem::remove(smokeDirectory);
         }
         return smoke && !(frames == 90 && docked && rendered && activeProject == "Smoke project Ω"
@@ -794,6 +995,9 @@ public:
 int main(int argc, char** argv)
 {
     if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--smoke")) return 2;
+    const auto comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(comResult)) { std::cerr << "COM initialization failed\n"; return 1; }
+    struct ComLifetime { ~ComLifetime() { CoUninitialize(); } } comLifetime;
     try { Editor editor; editor.init(); return editor.run(argc == 2); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

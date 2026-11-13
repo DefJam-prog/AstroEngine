@@ -59,9 +59,9 @@ save.trigger и save.restore имеют runtime-контекст и ограни
 
 ## Scene / ECS
 
-Подэтап 02.2 добавляет в `engine/scene` минимальный in-memory `Scene`: имя и ID сцены, сущности с именем, монотонным ID и необязательным parent ID; создание, reparent и удаление с проверкой циклов и ссылочной целостности. Эти ID стабильны только на время жизни экземпляра Scene: формат, уникальность после перезапуска и миграции относятся к 03.1/02.4. Компоненты, свойства и Transform здесь ещё отсутствуют.
+`engine/scene` содержит Scene/Entity с именами и стабильными сериализуемыми ID, parent, обязательный Transform и необязательный SpriteRenderer (AssetId/visible). Transform и SpriteRenderer пишутся в Astro Scene v3, загрузчик поддерживает v1/v2 миграции; операции проверяют циклы и ссылочную целостность.
 
-В редакторе Hierarchy показывает дерево и позволяет создавать root/child entities и удалять выбранное поддерево. Scene View в 02.2 — прокручиваемое графическое представление дерева с выбором сущности, не пространственная сцена: Transform и runtime-представление относятся к 03.1/03.3. Изменения пока существуют только в памяти; сериализация сцены относится к 02.4.
+В редакторе Hierarchy показывает дерево и позволяет создавать root/child entities и удалять выбранное поддерево. Выбранный SpriteRenderer показывает WIC/BGFX image preview в Inspector; полноценное пространственное отображение компонентов и runtime rendering ещё отсутствуют.
 
 Дальнейшая модель должна включать Scene ID, Entity ID, Component type/version, Property schema, hierarchy/parenting, transform, lifetime, validation и serialization.
 
@@ -73,7 +73,7 @@ save.trigger и save.restore имеют runtime-контекст и ограни
 
 Исходные ресурсы неизменны; производные данные помещаются в пересоздаваемый кэш. Изменение модели сохраняет ID объекта и ссылки; несовместимые привязки диагностируются. Предусмотреть темы интерфейса и пользовательские UI-шаблоны.
 
-В 03.2 добавлен `astro_assets::AssetRegistry`: project-root `Assets/` — source root, `.astro/assets.index` хранит AssetId, относительный UTF-8 путь и инспектированные metadata, `Library/Assets` — игнорируемый кэш файлов по SHA-256 и importer revision. Удалённый/изменённый источник не переписывается автоматически; повторный импорт вызывается явно по AssetId. `missingAssets()` позволяет запросить отсутствующие источники; панель редакторской диагностики остаётся будущей работой. PNG проверяет структуру chunk/CRC и размеры, JPEG — SOI/EOI, сегменты и SOF-размеры. Декодирование пикселей/полная проверка компрессированного потока не выполняются. Публичный API и лимиты: [ASSET_PIPELINE.md](ASSET_PIPELINE.md).
+В 03.2 добавлен `astro_assets::AssetRegistry`: project-root `Assets/` — source root, `.astro/assets.index` хранит AssetId, относительный UTF-8 путь и metadata, `Library/Assets` — игнорируемый кэш по SHA-256. Удалённый/изменённый источник не переписывается автоматически. Панель редактора показывает missing source; Windows WIC декодирует изображения для preview. PNG/JPEG importer checks остаются структурными и не гарантируют успешного WIC decode. Публичный API и лимиты: [ASSET_PIPELINE.md](ASSET_PIPELINE.md).
 
 ## Prefab
 
@@ -100,10 +100,10 @@ Save System & Checkpoint Editor — обязательный модуль про
 
 ## Файловая сцена и история (02.4)
 
-В 02.4 `astro::scene::saveSceneFile`/`loadSceneFile` впервые сериализовали Scene/Entity в Astro Scene v1. Текущая версия формата — v2 (добавлены Component ID и Transform в 03.1); формат и ограничения указаны в [FILE_FORMATS.md](FILE_FORMATS.md). Загрузка валидирует полную структуру до замены открытой модели. Команда `entity.set_property` Name транзакционная и использует существующую историю CommandRegistry. Создание/удаление сущностей пока выполняются напрямую моделью и не отменяются; редактор очищает историю при смене/создании сцены.
+В 02.4 `astro::scene::saveSceneFile`/`loadSceneFile` впервые сериализовали Scene/Entity в Astro Scene v1. Текущая версия формата — v3: v2 добавил Transform, v3 — SpriteRenderer/AssetId. Загрузчик читает v1 и v2, полная валидация выполняется до публикации модели; формат описан в [FILE_FORMATS.md](FILE_FORMATS.md). `entity.set_property` и `entity.set_sprite_renderer` транзакционны и используют историю CommandRegistry. Создание/удаление сущностей пока выполняются напрямую моделью и не отменяются; редактор очищает историю при смене/создании сцены.
 
 ## Компоненты и Transform (03.1)
 
-Каждая `Entity` содержит обязательный `TransformComponent` версии 1. `ComponentId` уникален в пределах сцены и сохраняется вместе с сущностью; удалённые ID не переиспользуются в течение жизни сцены. `Transform` содержит translation/position, Euler rotation в градусах и scale как три `double`. `Scene::setTransform` отклоняет NaN и бесконечности; это локальные значения, мировые матрицы, наследование преобразований и отображение Scene View пока не реализованы. Компонентная модель пока типизирована только Transform: неизвестные типы файла не игнорируются, а дают ошибку диагностики.
+Каждая `Entity` содержит обязательный `TransformComponent` версии 1 и может содержать один `SpriteRendererComponent` версии 1 с AssetId и видимостью. `ComponentId` уникален в пределах сцены и сохраняется вместе с сущностью; удалённые ID не переиспользуются в течение жизни сцены. Transform хранит локальные position, Euler rotation и scale; матрицы и пространственная композиция пока не реализованы. Неизвестные типы файла дают ошибку диагностики.
 
-Astro Scene v2 сериализует ID и значения Transform. Загрузчик продолжает читать v1 и детерминированно добавляет Transform по порядку сущностей с единичным масштабом; сохранение такого файла записывает v2. Формат и миграционное правило: [FILE_FORMATS.md](FILE_FORMATS.md).
+Astro Scene v3 сериализует ID, Transform и необязательный SpriteRenderer. Загрузчик читает v1/v2 и сохранение явно мигрированной сцены создаёт v3. Формат и миграционное правило: [FILE_FORMATS.md](FILE_FORMATS.md).

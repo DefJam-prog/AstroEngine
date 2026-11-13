@@ -134,3 +134,7 @@ ctest --test-dir build/stack-spike --output-on-failure
 ## Подэтап 03.1 — Transform и миграция схемы
 
 `scene.unit` проверяет обязательный Transform, default scale, Component ID lookup, принятие конечных значений и отклонение бесконечности. `scene.file.integration` проверяет точный round-trip Transform и Component ID, чтение Astro Scene v1 с default Transform, запись мигрированного документа как v2 с сохранением нового ID, и диагностику неизвестного компонента. Полный регрессионный CTest: 9/9.
+
+## 03.3 результаты
+
+Windows x64, MSVC 14.44, Debug, BGFX D3D11: `cmake --build build/stack-spike --parallel 4` успешно; CTest 11/11 успешно (`build/03.3-build.log`, `build/03.3-ctest.log`). Покрыты SpriteRenderer command validation/Undo/Redo и Scene v3 serialization. `editor.smoke` импортирует собственный PNG, проверяет WIC decode/BGFX texture upload и scene round-trip, плюс запуск UI и project/scene regression. Визуальный pixel-diff эталон не снимается.

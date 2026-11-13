@@ -1,6 +1,6 @@
 # AstroEngine
 
-Начало разработки модульного 2D/3D-движка на C++20. Headless-приложение выводит информацию о запуске. В `astro_core` есть базовые сервисы, ModuleRegistry, typed EventBus, TimeService/fixed timestep, typed CommandRegistry и in-memory транзакции/Undo/Redo. Optional Windows editor показывает Hierarchy, structural Scene View и Inspector с редактированием Name через `entity.set_property`; сцены поддерживают сохранение Scene/Entity и Transform. Игровые системы ещё не реализованы.
+Начало разработки модульного 2D/3D-движка на C++20. Headless-приложение выводит информацию о запуске. В `astro_core` есть базовые сервисы, ModuleRegistry, typed EventBus, TimeService/fixed timestep, typed CommandRegistry и in-memory транзакции/Undo/Redo. Optional Windows editor показывает Hierarchy, Inspector с Name и SpriteRenderer, сохраняет Astro Scene v3 и показывает WIC image preview; игровой runtime renderer и игровые системы ещё не реализованы.
 
 В 00.2 добавлены локальные проверки с JSON-отчётом, настройка форматирования и опциональный статический анализ. Фактические результаты и ограничения: [отчёт 00.2](docs/reports/00.2.md). Подэтапы ядра 01.1–01.5 покрыты в [отчётах](docs/reports/).
 
@@ -43,11 +43,13 @@ ctest --preset windows-debug
 
 Редактор 02.1: [запуск и ограничения](docs/reports/02.1.md). EXE: build/stack-spike/editor/astro_editor.exe.
 Редактор 02.2: [модель сцены, Hierarchy и Scene View](docs/reports/02.2.md). Панели позволяют создавать сцену, root/child сущности, выбирать и удалять поддеревья. Scene View показывает структуру, не пространственные объекты.
+
+Подэтап 03.3: [SpriteRenderer и image preview](docs/reports/03.3.md). AssetId сохраняется в сцене, компонент редактируется транзакционной командой; это preview выбранного компонента, не пространственный/runtime renderer.
 Редактор 02.3: [Inspector и schema properties](docs/reports/02.3.md). Сейчас схема включает обязательное имя сущности и read-only ID; команда изменения проверяет UTF-8 и ограничение 240 байт.
 
 ### Сцены редактора (02.4)
 
-В редакторе доступны сохранение/открытие сцены (Ctrl+S, Ctrl+O), Undo/Redo (Ctrl+Z, Ctrl+Y или Ctrl+Shift+Z) и панель Diagnostics. Astro Scene v2 сохраняет ID/имена сцены и сущностей, иерархию, ID компонентов и Transform. При несохранённых правках переключение проекта/сцены блокируется. Формат и миграция v1 описаны в [FILE_FORMATS.md](docs/FILE_FORMATS.md).
+В редакторе доступны сохранение/открытие сцены (Ctrl+S, Ctrl+O), Undo/Redo (Ctrl+Z, Ctrl+Y или Ctrl+Shift+Z) и панель Diagnostics. Astro Scene v3 сохраняет ID/имена сцены и сущностей, иерархию, Transform и SpriteRenderer AssetId. Загрузчик также читает v1 и v2. При несохранённых правках переключение проекта/сцены блокируется. Формат и миграции описаны в [FILE_FORMATS.md](docs/FILE_FORMATS.md).
 
 Каждая новая сущность получает обязательный Transform с позицией, углами Эйлера в градусах и масштабом. Доступен C++ API `scene.transform(entityId)` и `scene.setTransform(entityId, value)`; значения должны быть конечными числами. Пространственный рендеринг и вычисление мировых матриц пока отсутствуют.
 

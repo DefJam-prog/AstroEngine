@@ -1,6 +1,6 @@
 add_library(astro_scene src/Scene.cpp src/SceneCommands.cpp src/SceneFile.cpp)
 target_include_directories(astro_scene PUBLIC include)
-target_link_libraries(astro_scene PUBLIC astro_core)
+target_link_libraries(astro_scene PUBLIC astro_core astro_assets)
 target_compile_features(astro_scene PUBLIC cxx_std_20)
 set_target_properties(astro_scene PROPERTIES CXX_EXTENSIONS OFF)
 if(MSVC)

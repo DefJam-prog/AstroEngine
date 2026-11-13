@@ -47,6 +47,15 @@ int main()
     check(commands.redo().hasValue() && document.find(entity.value())->name == "Новое имя Ω",
         "redo reapplies the schema value");
 
+    const scene::SetSpriteRendererPayload sprite{entity.value(), {501}, true};
+    check(commands.validate("entity.set_sprite_renderer", 1, sprite).hasValue()
+        && !document.spriteRenderer(entity.value()), "sprite command dry-run leaves scene unchanged");
+    check(commands.execute<scene::SetSpriteRendererPayload, void>("entity.set_sprite_renderer", 1, sprite).hasValue()
+        && document.spriteRenderer(entity.value())->texture.value == 501, "sprite command assigns stable asset reference");
+    check(commands.undo().hasValue() && !document.spriteRenderer(entity.value()), "undo removes newly added SpriteRenderer");
+    check(commands.redo().hasValue() && document.spriteRenderer(entity.value())->texture.value == 501,
+        "redo restores SpriteRenderer");
+
     const scene::SetScenePropertyPayload blankName{entity.value(), "name", std::string{" \t"}};
     check(!commands.validate("entity.set_property", 1, blankName), "schema rejects blank property values");
     const scene::SetScenePropertyPayload invalidUtf8{entity.value(), "name", std::string{"\xC0\xAF", 2}};

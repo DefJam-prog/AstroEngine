@@ -146,3 +146,9 @@ Windows x64, MSVC 14.44, Debug, BGFX D3D11: `cmake --build build/stack-spike --p
 ## 03.5 результаты
 
 `assets.registry.integration` теперь проверяет graph save/load, cycle rejection, closure, упаковку reachable assets, повторное использование cache, ремонт повреждённого артефакта и различие target tag. Полная MSVC Debug сборка прошла; CTest 13/13. `build/03.5-build.log` и `build/03.5-ctest.log`. Не проверялись межплатформенная сборка, декодирование/перекодирование текстур и визуальные golden images: код сохраняет байты исходных image payload.
+
+
+
+## 04.1 результаты
+
+`core.unit` покрывает fixed-step TimeService и paused manual step. `runtime.session.unit` проверяет копирование Scene, неизменность authoring state, переходы, число шагов, Pause/Resume/Step/Stop, ошибки Result и исключения callback. Windows x64/MSVC Debug сборка успешна; полный CTest: 14/14. `editor.smoke` прошёл регрессионно, но Play UI не реализован.

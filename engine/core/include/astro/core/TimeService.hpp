@@ -30,6 +30,7 @@ public:
 
     Result<void> configure(TimeConfiguration configuration);
     Result<FrameTiming> advance(double realDeltaSeconds);
+    Result<FrameTiming> stepOnce();
     void setPaused(bool paused) noexcept;
 
     [[nodiscard]] bool isPaused() const noexcept { return paused_; }

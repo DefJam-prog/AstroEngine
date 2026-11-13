@@ -1,3 +1,15 @@
+add_library(astro_runtime_session runtime/RuntimeSession.cpp)
+target_include_directories(astro_runtime_session PUBLIC include)
+target_link_libraries(astro_runtime_session PUBLIC astro_core astro_scene)
+target_compile_features(astro_runtime_session PUBLIC cxx_std_20)
+set_target_properties(astro_runtime_session PROPERTIES CXX_EXTENSIONS OFF)
+
+if(MSVC)
+    target_compile_options(astro_runtime_session PRIVATE /W4 /permissive- /Zc:__cplusplus /utf-8)
+else()
+    target_compile_options(astro_runtime_session PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 add_executable(astro_headless main.cpp)
 target_compile_features(astro_headless PRIVATE cxx_std_20)
 set_target_properties(astro_headless PROPERTIES CXX_EXTENSIONS OFF)

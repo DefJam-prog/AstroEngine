@@ -593,6 +593,12 @@ void testTimeService()
     time.setPaused(false);
     auto resumed = time.advance(0.1);
     check(resumed && resumed.value().fixedStepCount == 1, "Simulation resumes after unpausing");
+    check(!time.stepOnce(), "Manual fixed step requires paused simulation");
+    time.setPaused(true);
+    const auto manualStep = time.stepOnce();
+    check(manualStep && manualStep.value().fixedStepCount == 1
+        && manualStep.value().simulationTimeSeconds == time.simulationTimeSeconds(),
+        "Manual fixed step advances simulation time exactly once while paused");
 }
 
 void testModuleFixedTick()

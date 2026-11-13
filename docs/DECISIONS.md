@@ -225,3 +225,9 @@ AssetId назначается монотонно и сохраняется в �
 - Dependency edges are explicit AssetId links; scene/prefab dependency extraction is not automatic yet. Cycles and invalid IDs are rejected; the sorted transitive closure is deterministic.
 - The initial package preserves validated encoded PNG/JPEG bytes and metadata, tags a target profile in the content hash, and writes beneath ignored `Library/Derived`. Cache reuse requires exact byte equality; damaged output is atomically replaced.
 - Target tags do not claim platform codec compatibility. Texture transcoding, platform toolchain builds, runtime package loading, and full game export remain separate work. No external dependency was added.
+
+## D026 — Runtime Session and isolated Play Mode (04.1)
+
+- Play owns a deep value-copy of the authoring Scene. Runtime callbacks cannot mutate editor state unless external state is captured by the callback; that remains the caller's responsibility.
+- Runtime Session controls fixed-tick dispatch and explicit Stopped/Playing/Paused/Faulted states. Manual single-step is legal only while paused and advances the simulation clock once.
+- A callback error faults the session and retains the runtime Scene for inspection; Stop clears it. Rendering, input, editor controls, and actual game systems are not implied by this controller.

@@ -60,6 +60,18 @@ Result<FrameTiming> TimeService::advance(double realDeltaSeconds)
     return Result<FrameTiming>::success(timing);
 }
 
+Result<FrameTiming> TimeService::stepOnce()
+{
+    if (!paused_)
+        return Result<FrameTiming>::failure({ErrorCode::InvalidState, "A single fixed step is available only while paused"});
+    simulationTimeSeconds_ += configuration_.fixedDeltaSeconds;
+    FrameTiming timing;
+    timing.fixedDeltaSeconds = configuration_.fixedDeltaSeconds;
+    timing.fixedStepCount = 1;
+    timing.simulationTimeSeconds = simulationTimeSeconds_;
+    return Result<FrameTiming>::success(timing);
+}
+
 void TimeService::setPaused(bool paused) noexcept
 {
     if (paused && !paused_) accumulatorSeconds_ = 0.0;

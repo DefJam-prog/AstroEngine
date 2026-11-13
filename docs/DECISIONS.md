@@ -243,3 +243,9 @@ AssetId назначается монотонно и сохраняется в �
 - Camera mode presets produce a tested world-space pose convention; target follow uses the target entity's stored Transform position plus world-space offset.
 - Smoothing is exponential and frame-delta aware; optional bounds clamp both desired and resulting camera position. Zoom is a scalar range, not a projection/FOV contract.
 - No look-at except FirstPerson's rotation inheritance, world-transform hierarchy composition, projection matrices, Scene camera component, serialization, renderer adapter, or editor UI is claimed. The rig is useful/testable pose logic but not a rendered camera feature.
+
+## D029 — Runtime interaction behaviors and typed events (04.4)
+
+- `InteractionSystem` stores code-defined runtime behavior bindings keyed by EntityId; it reuses the typed core EventBus for sequenced Requested/Activated/Rejected events rather than adding a second event transport.
+- Eligibility checks actor/target existence, enabled state, Transform and Euclidean range before invoking the behavior callback on the supplied runtime Scene.
+- Bindings are not Scene-serialized and are not editor-authored; physics triggers, UI prompts, input routing and undo are not implied. Callbacks and post-activation observers can cause non-transactional side effects; the caller owns the runtime copy and recovery policy.

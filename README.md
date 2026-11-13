@@ -70,3 +70,5 @@ ctest --preset windows-debug
 Подэтап 04.3: добавлен headless `CameraRig` для camera pose, preset modes, следования за target Transform, smoothing, bounds и zoom. Он не визуализирует изображение и не добавляет camera component в формат Scene. См. [описание](docs/CAMERA_RIG.md) и [отчёт 04.3](docs/reports/04.3.md).
 
 Подэтап 04.3: runtime CameraRig для pose/follow, пресетов, smoothing, границ и zoom. Рендеринг камеры и Scene camera component пока отсутствуют; [API](docs/CAMERA_RIG.md), [отчёт](docs/reports/04.3.md).
+
+Подэтап 04.4: runtime InteractionSystem связывает entity с code-defined InteractableBehavior, проверяет дальность/активацию и публикует события Requested/Activated/Rejected через typed EventBus. Система может менять только переданную runtime Scene; это не сохранённый no-code component. [API и ограничения](docs/INTERACTION_SYSTEM.md), [отчёт](docs/reports/04.4.md).

@@ -160,3 +160,7 @@ Windows x64, MSVC 14.44, Debug, BGFX D3D11: `cmake --build build/stack-spike --p
 ## 04.3 результаты
 
 `camera.rig.unit` проверяет Custom pose, mode presets, target follow, frame-delta smoothing, zero/invalid delta, bounds, zoom clamp, rotation inheritance, missing target and invalid settings without changing pose. Полный CTest — 17/17; `editor.smoke`/graphics regression прошли, но camera image output отсутствует, так как renderer ещё не подключён.
+
+## 04.4 результаты
+
+`runtime.interaction.integration` проверяет Requested/Activated/Rejected event order/sequence, registered/duplicate/missing behaviors, enabled-state, in/out-of-range activation, callback mutation isolation on Runtime Scene, Result error and thrown exception diagnostics. Полный Windows x64/MSVC CTest — 18/18; editor/graphics smoke прошли regression, но визуальный interaction test не выполнялся.

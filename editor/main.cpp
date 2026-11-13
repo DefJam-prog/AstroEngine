@@ -142,7 +142,7 @@ void layoutSceneBranch(const Scene& scene, const std::optional<EntityId> parent,
 void drawSceneView(const Scene& scene, std::optional<EntityId>& selected)
 {
     ImGui::Text("%s — hierarchy preview", scene.name().c_str());
-    ImGui::TextDisabled("Structural view only; spatial Transform and runtime rendering are later stages.");
+    ImGui::TextDisabled("Transform data is stored; this view remains structural and has no spatial rendering.");
     std::vector<SceneNodeLayout> nodes;
     int nextRow = 0;
     layoutSceneBranch(scene, std::nullopt, 0, nextRow, nodes);

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
@@ -53,6 +54,14 @@ bool validName(const std::string_view name)
     return true;
 }
 
+bool validTransform(const Transform& value)
+{
+    const auto finite = [](const Vec3& v) {
+        return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+    };
+    return finite(value.position) && finite(value.rotationDegrees) && finite(value.scale);
+}
+
 const PropertyDefinition* findProperty(const std::string_view id)
 {
     for (const auto& definition : entityPropertySchema())
@@ -82,8 +91,11 @@ core::Result<Scene> restoreScene(const SceneId id, std::string name, std::vector
         return core::Result<Scene>::failure({core::ErrorCode::ValidationError, "Scene exceeds the entity-count limit"});
 
     std::unordered_map<EntityId, const Entity*> byId;
+    std::unordered_set<ComponentId> componentIds;
     byId.reserve(entities.size());
+    componentIds.reserve(entities.size());
     EntityId maximumId = 0;
+    ComponentId maximumComponentId = 0;
     for (const auto& entity : entities)
     {
         if (entity.id == 0 || entity.id == std::numeric_limits<EntityId>::max() || !validName(entity.name))
@@ -91,6 +103,15 @@ core::Result<Scene> restoreScene(const SceneId id, std::string name, std::vector
         if (!byId.emplace(entity.id, &entity).second)
             return core::Result<Scene>::failure({core::ErrorCode::AlreadyExists, "Scene contains a duplicate entity ID"});
         maximumId = std::max(maximumId, entity.id);
+        if (entity.components.size() != 1 || entity.components.front().id == 0
+            || entity.components.front().id == std::numeric_limits<ComponentId>::max()
+            || entity.components.front().schemaVersion != 1 || !validTransform(entity.components.front().value))
+            return core::Result<Scene>::failure({core::ErrorCode::ValidationError,
+                "Each entity must contain exactly one valid Transform component"});
+        const auto componentId = entity.components.front().id;
+        if (!componentIds.emplace(componentId).second)
+            return core::Result<Scene>::failure({core::ErrorCode::AlreadyExists, "Scene contains a duplicate component ID"});
+        maximumComponentId = std::max(maximumComponentId, componentId);
     }
     for (const auto& entity : entities)
         if (entity.parent && !byId.contains(*entity.parent))
@@ -116,6 +137,7 @@ core::Result<Scene> restoreScene(const SceneId id, std::string name, std::vector
     Scene restored(id, std::move(name));
     restored.entities_ = std::move(entities);
     restored.nextEntityId_ = maximumId + 1;
+    restored.nextComponentId_ = maximumComponentId + 1;
     return core::Result<Scene>::success(std::move(restored));
 }
 
@@ -129,6 +151,39 @@ Entity* Scene::find(const EntityId id) noexcept
 {
     const auto it = std::find_if(entities_.begin(), entities_.end(), [id](const Entity& entity) { return entity.id == id; });
     return it == entities_.end() ? nullptr : &*it;
+}
+
+TransformComponent* Scene::findTransform(const ComponentId id) noexcept
+{
+    for (auto& entity : entities_)
+        for (auto& component : entity.components)
+            if (component.id == id) return &component;
+    return nullptr;
+}
+
+const TransformComponent* Scene::findTransform(const ComponentId id) const noexcept
+{
+    for (const auto& entity : entities_)
+        for (const auto& component : entity.components)
+            if (component.id == id) return &component;
+    return nullptr;
+}
+
+const TransformComponent* Scene::transform(const EntityId entityId) const noexcept
+{
+    const auto* entity = find(entityId);
+    return entity && !entity->components.empty() ? &entity->components.front() : nullptr;
+}
+
+core::Result<void> Scene::setTransform(const EntityId entityId, const Transform& value)
+{
+    auto* entity = find(entityId);
+    if (!entity)
+        return core::Result<void>::failure({core::ErrorCode::NotFound, "Entity does not exist"});
+    if (!validTransform(value))
+        return core::Result<void>::failure({core::ErrorCode::ValidationError, "Transform values must be finite"});
+    entity->components.front().value = value;
+    return core::Result<void>::success();
 }
 
 core::Result<PropertyValue> Scene::getProperty(const EntityId entityId, const std::string_view property) const
@@ -206,9 +261,11 @@ core::Result<EntityId> Scene::createEntity(std::string name, const std::optional
         return core::Result<EntityId>::failure({core::ErrorCode::NotFound, "Parent entity does not exist"});
     if (nextEntityId_ == 0 || nextEntityId_ == std::numeric_limits<EntityId>::max())
         return core::Result<EntityId>::failure({core::ErrorCode::InvalidState, "Entity ID space is exhausted"});
+    if (nextComponentId_ == 0 || nextComponentId_ == std::numeric_limits<ComponentId>::max())
+        return core::Result<EntityId>::failure({core::ErrorCode::InvalidState, "Component ID space is exhausted"});
 
     const auto id = nextEntityId_++;
-    entities_.push_back({id, std::move(name), parent});
+    entities_.push_back({id, std::move(name), parent, {{nextComponentId_++, 1, {}}}});
     return core::Result<EntityId>::success(id);
 }
 

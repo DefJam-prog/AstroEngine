@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 
 namespace
 {
@@ -23,6 +24,31 @@ int main()
     astro::scene::Scene defaults(2, "Defaults");
     const auto defaultEntity = defaults.createEntity();
     check(defaultEntity && defaults.find(defaultEntity.value())->name == "Entity", "apply schema default on creation");
+    check(defaultEntity && defaults.transform(defaultEntity.value()) != nullptr
+        && defaults.transform(defaultEntity.value())->value.scale == astro::scene::Vec3{1.0, 1.0, 1.0},
+        "attach a default Transform component with unit scale");
+    check(defaultEntity && defaults.transform(defaultEntity.value())->id != 0
+        && defaults.findTransform(defaults.transform(defaultEntity.value())->id) != nullptr,
+        "assign a stable addressable component ID");
+    const auto anotherEntity = defaults.createEntity("Second");
+    check(anotherEntity && defaults.transform(anotherEntity.value())->id > defaults.transform(defaultEntity.value())->id,
+        "component IDs are scene-unique and monotonically allocated");
+    if (anotherEntity)
+    {
+        const auto removedComponentId = defaults.transform(anotherEntity.value())->id;
+        check(defaults.erase(anotherEntity.value()).hasValue(), "remove entity with its component");
+        const auto afterRemoval = defaults.createEntity("Third");
+        check(afterRemoval && defaults.transform(afterRemoval.value())->id > removedComponentId,
+            "do not reuse removed component IDs");
+    }
+    if (defaultEntity)
+    {
+        auto changed = defaults.transform(defaultEntity.value())->value;
+        changed.position = {12.5, -4.0, 3.25};
+        check(defaults.setTransform(defaultEntity.value(), changed).hasValue(), "set a finite Transform");
+        changed.position.x = std::numeric_limits<double>::infinity();
+        check(!defaults.setTransform(defaultEntity.value(), changed), "reject non-finite Transform values");
+    }
     const auto root = scene.createEntity("Игрок Ω");
     check(root.hasValue(), "create UTF-8 root entity");
     const auto child = scene.createEntity("Камера", root ? std::optional{root.value()} : std::nullopt);

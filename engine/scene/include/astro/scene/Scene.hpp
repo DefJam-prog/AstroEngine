@@ -16,7 +16,31 @@ namespace astro::scene
 {
 using SceneId = std::uint64_t;
 using EntityId = std::uint64_t;
+using ComponentId = std::uint64_t;
 using PropertyValue = std::variant<std::string, EntityId>;
+
+struct Vec3
+{
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+    friend bool operator==(const Vec3&, const Vec3&) = default;
+};
+
+struct Transform
+{
+    Vec3 position{};
+    Vec3 rotationDegrees{};
+    Vec3 scale{1.0, 1.0, 1.0};
+    friend bool operator==(const Transform&, const Transform&) = default;
+};
+
+struct TransformComponent
+{
+    ComponentId id = 0;
+    std::uint32_t schemaVersion = 1;
+    Transform value{};
+};
 
 enum class PropertyType
 {
@@ -44,10 +68,11 @@ struct Entity
     EntityId id = 0;
     std::string name;
     std::optional<EntityId> parent;
+    std::vector<TransformComponent> components;
 };
 
-// In-memory document model for the early editor. IDs are unique within a scene
-// instance, but are not persisted across process restarts yet.
+// Scene and component IDs are stable across save/load. Entity IDs are unique in
+// the scene; component IDs are unique within the scene.
 class Scene final
 {
 public:
@@ -58,6 +83,10 @@ public:
     [[nodiscard]] const std::vector<Entity>& entities() const noexcept { return entities_; }
     [[nodiscard]] Entity* find(EntityId id) noexcept;
     [[nodiscard]] const Entity* find(EntityId id) const noexcept;
+    [[nodiscard]] TransformComponent* findTransform(ComponentId id) noexcept;
+    [[nodiscard]] const TransformComponent* findTransform(ComponentId id) const noexcept;
+    [[nodiscard]] const TransformComponent* transform(EntityId entity) const noexcept;
+    core::Result<void> setTransform(EntityId entity, const Transform& value);
     core::Result<PropertyValue> getProperty(EntityId entity, std::string_view property) const;
     core::Result<void> validateProperty(EntityId entity, std::string_view property, const PropertyValue& value) const;
     core::Result<void> setProperty(EntityId entity, std::string_view property, const PropertyValue& value);
@@ -71,6 +100,7 @@ private:
     SceneId id_;
     std::string name_;
     EntityId nextEntityId_ = 1;
+    ComponentId nextComponentId_ = 1;
     std::vector<Entity> entities_;
 };
 

@@ -65,3 +65,5 @@ ctest --test-dir build/stack-spike --output-on-failure
 ```
 
 Результаты прогона сохранены в `build/02.4-build.log` и `build/02.4-ctest.log`. Каталог сборки должен быть сконфигурирован заранее; для чистой конфигурации выберите новый каталог и следуйте инструкциям выше.
+
+Подэтап 03.1 проверялся теми же командами. Итоговые логи: `build/03.1-build.log`, `build/03.1-ctest.log`; Windows x64/MSVC Debug, CTest 9/9.

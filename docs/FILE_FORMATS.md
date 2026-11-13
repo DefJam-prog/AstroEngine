@@ -56,3 +56,22 @@ END
 `.astro/assets.dependencies` — UTF-8 text: `ASTRO_DEPENDENCIES 1`, затем отсортированные `NODE <asset-id> <count>` и `DEP <asset-id>` строки, завершённые `END`. Циклы, нулевые ID, дубликаты, неизвестная версия, неверная структура и лишние данные отклоняются. Лимиты: 16 MiB, 100000 узлов, 500000 связей. Граф содержит только явно записанные AssetId связи.
 
 `Library/Derived/<platform>/<sha256>.v1.astro-pack` — бинарный детерминированный контейнер: ASCII `ASTRO_PACK`, little-endian version (u32), длина и UTF-8 platform tag, число записей, далее для каждой записи ID (u64), формат (u32: 1 PNG/2 JPEG), width/height (u32), длина (u64), 64 ASCII hex SHA-256 и payload. Порядок записей — возрастание AssetId; предел — 1 GiB. Hash включает target tag и все package bytes. Atomic replacement используется для публикации; аварийный временный файл может сохраниться. Target tags не подтверждают платформенную совместимость или оптимизацию.
+
+## Save slot v1 (05.4)
+
+`<user-data-root>/slot-<index>.astro-save` — UTF-8 text; `<user-data-root>` задаёт приложение, индекс — целое 0-based значение в диапазоне настроенного SaveStore. Имя файла не принимается от пользовательского slot input. Максимум 100 слотов; по умолчанию каждый ограничен 4 MiB, жёсткий максимум configurable — 16 MiB.
+
+```text
+ASTRO_SAVE 1
+META <slot> <scene-id> "<profile-id>" <profile-version> <profile-fingerprint-crc32> "<game-version>" <unix-utc-seconds>
+RECORDS <count>
+FIELD <entity-id> "<property-id>" S "<utf8-string>"
+FIELD <entity-id> "<property-id>" D <finite-double>
+FIELD <entity-id> "<property-id>" B <0-or-1>
+END
+CHECKSUM <crc32-hex>
+```
+
+`FIELD` записывает только значения, перечисленные SaveProfile для точного Entity ID. Поддерживаемые property IDs: `entity.name`, `transform.position.x/y/z`, `transform.rotation.x/y/z`, `transform.scale.x/y/z`, `sprite_renderer.visible`. Fingerprint включает profile ID/version и выбранный набор entity/property; изменение набора без version bump также отклоняется. Дубликат поля, неверный typed value, неизвестная запись/версия, лишний хвост, checksum mismatch, несовпадающая Scene/game/profile выдаются как ошибка; формат v1 не мигрируется автоматически. CRC32 — только detection случайного повреждения, не мера защиты от читов.
+
+Публикация использует уникальный файл рядом со slot, flush перед атомарной заменой. Валидная прежняя версия сохраняется рядом как `slot-<index>.astro-save.bak`. Load при ошибке checksum/структуры основного файла может использовать валидную backup-копию; fallback отражается в результате и не переписывает основной файл. Временные файлы после падения процесса не считаются слотами.

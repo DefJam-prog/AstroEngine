@@ -129,7 +129,7 @@
 Приёмка: подтверждённые сборки на реальных целевых toolchains;
 Windows не должен ломаться. Не обещать iOS-сборку на Windows без Mac.
 
-02.1–03.5, 04.1–04.4 и 05.1–05.3 реализованы в пределах ограничений [отчётов](reports/). Следующий рекомендуемый подэтап — 05.4 (Save System v1), только после отдельного подтверждения пользователя.
+02.1–03.5, 04.1–04.4 и 05.1–05.4 реализованы в пределах ограничений [отчётов](reports/). Следующий рекомендуемый подэтап — 05.5 (Checkpoint v1), только после отдельного подтверждения пользователя.
 
 ## Подэтап 03.5 — граф ресурсов и детерминированный package
 
@@ -154,3 +154,7 @@ Windows не должен ломаться. Не обещать iOS-сборку
 ## Подэтап 05.3 — звук, анимации и игровая логика головоломки
 
 Добавлены backend-neutral правила match-three и детерминированное sampling scalar animation tracks. Optional SDL3 adapter queues synthesized UI/gameplay cues; реальный выход проверяется через dummy driver. Нет visual puzzle board, asset audio playback, смешивания дорожек или editor authoring. Описание и ограничения: [PUZZLE_AND_ANIMATION.md](PUZZLE_AND_ANIMATION.md), [отчёт](reports/05.3.md).
+
+## Подэтап 05.4 — Save System v1
+
+Добавлен `astro_runtime_save`: ручные numbered slots, явно перечисляемые profile fields, game/profile/schema metadata, CRC32, ограничение размера, временная запись, атомарная замена, `.bak` и fallback при повреждении основного слота. В v1 доступны Name, scalar Transform и SpriteRenderer visibility; нет автоматического сохранения, schema migrations, tag/group rules, checkpoint/respawn, editor UI или платформенного выбора user-data root. См. [SAVE_SYSTEM.md](SAVE_SYSTEM.md), [FILE_FORMATS.md](FILE_FORMATS.md), [отчёт](reports/05.4.md).

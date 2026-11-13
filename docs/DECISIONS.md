@@ -267,3 +267,10 @@ AssetId назначается монотонно и сохраняется в �
 - Puzzle rules and scalar animation sampling live in dependency-light `astro_runtime_puzzle`; state is currently runtime-only. Match-three uses orthogonal swaps, run clearing, gravity/refill, seeded randomness, cascade scoring and score thresholds. It is not yet connected to a visual board or project/scene serializer.
 - The audio adapter reuses SDL3 already present in the optional demo profile. It queues short generated sine cues to the default device rather than introducing an audio library or claiming a general asset playback/mixing system. Failure to open audio is reported by the demo and does not block gameplay UI.
 - SDL audio smoke uses the dummy driver; it validates queueing through SDL's output stream, not audible speaker output. No new external dependency or installation was needed.
+
+## D033 — Explicit selective SaveProfile and bounded Save v1 slots (05.4)
+
+- SaveProfile is opt-in and starts with no fields. In v1 the caller names Entity IDs and property IDs directly; no whole-scene default, tag/group inference, or implicit persistence is permitted. Changing the selected field set changes a profile fingerprint, and compatibility requires matching profile ID/version/fingerprint, game version and Scene ID.
+- `SaveStore` receives an application-owned user-data root and generates numeric slot filenames. It uses a bounded UTF-8 text format, CRC32 for accidental corruption detection, unique temp files and atomic replacement. A prior parseable slot is atomically preserved as `.bak`; load falls back to it if primary data is malformed. CRC32 is not anti-cheat protection.
+- Save v1 supports entity name, scalar Transform values and SpriteRenderer visibility only. Unsupported gameplay components and property migrations are rejected/deferred. Missing entities/components are reported and skipped; restore is applied to a Scene copy before publication.
+- No JSON dependency, editor UI, automatic trigger, platform-specific root discovery, checkpoint, respawn, or migration framework was added. `ASTRO_BUILD_SAVE_RUNTIME` gates the library for non-test builds.

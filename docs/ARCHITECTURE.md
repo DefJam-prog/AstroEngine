@@ -91,7 +91,7 @@ Export создаёт самостоятельный runtime с минималь
 
 ## Границы текущего решения
 
-Save System & Checkpoint Editor — обязательный модуль продукта с явным выбором сохраняемых объектов, компонентов и свойств. Требования к SaveProfile, checkpoint, respawn, хранению и проверкам описаны в [SAVE_SYSTEM.md](SAVE_SYSTEM.md). Автоматическое сохранение всего мира без выбора профиля/правил запрещено. Настройки проекта и прогресс игрока хранятся отдельно. Реализация модуля отсутствует.
+Save System & Checkpoint Editor — обязательный модуль продукта с явным выбором сохраняемых объектов, компонентов и свойств. Требования к SaveProfile, checkpoint, respawn, хранению и проверкам описаны в [SAVE_SYSTEM.md](SAVE_SYSTEM.md). Автоматическое сохранение всего мира без выбора профиля/правил запрещено. В 05.4 реализовано selective runtime save для Name, Transform scalar fields и SpriteRenderer visibility; SaveStore пишет в переданный user-data root, а не в проект. Checkpoint, respawn и GUI authoring ещё отсутствуют.
 
 Адаптеры рендеринга, физики, звука и импорта должны позволять заменять библиотеки без переписывания ядра. Бинарный ABI, схемы payload, правила владения конкретными объектами и детали миграций пока не определены. Их нельзя считать готовыми контрактами реализации.
 
@@ -139,3 +139,7 @@ Astro Scene v4 сериализует ID, Transform, SpriteRenderer и prefab in
 ## Runtime gameplay helpers (05.3)
 
 `astro_runtime_puzzle` provides deterministic match-three rules and scalar keyframe sampling without platform dependencies; it is included when tests are enabled or explicitly requested with `ASTRO_BUILD_PUZZLE_RUNTIME`. The optional SDL3 audio adapter is built only with the Game UI demo profile and queues short synthesized cue tones. There is no scene-bound animation/audio component, asset playback/mixing, or visual puzzle renderer; see [PUZZLE_AND_ANIMATION.md](PUZZLE_AND_ANIMATION.md).
+
+## Runtime save slots (05.4)
+
+`astro_runtime_save` is an optional Scene-state persistence target. A versioned `SaveProfile` starts empty and explicitly selects individual properties by stable Entity ID; `SaveStore` writes numbered slots with CRC32 integrity checks, a bounded file size, atomic replacement, and `.bak` fallback. Loading validates before applying to a Scene copy. It does not serialize whole scenes or automatically persist anything; supported fields and limits are in [SAVE_SYSTEM.md](SAVE_SYSTEM.md) and [FILE_FORMATS.md](FILE_FORMATS.md).

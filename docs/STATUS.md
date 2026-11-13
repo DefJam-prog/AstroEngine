@@ -9,7 +9,7 @@
 | Решение о стеке | Предложение D001 в DECISIONS.md |
 | Слои архитектуры и контракты | Требования раздела 04 записаны в ARCHITECTURE.md и D002; реализация отсутствует |
 | Графический редактор и UX | Требования раздела 05 записаны в EDITOR_UX.md и D003; реализация отсутствует |
-| Save System & Checkpoint Editor | Обязательные требования раздела 06 записаны в SAVE_SYSTEM.md и D004; реализация и тесты отсутствуют |
+| Save System & Checkpoint Editor | 05.4: selective runtime SaveProfile/slots/checksum/atomic replacement/backup; checkpoint, respawn и editor UI ещё отсутствуют |
 | Игровые системы и расширения | Требования раздела 07 записаны в GAME_SYSTEMS.md и D005; реализация отсутствует, требуется проверенная основа |
 | Шаблоны игр T01–T10 | Требования раздела 08 записаны в GAME_TEMPLATES.md и D006; шаблоны, конструктор и smoke-тесты отсутствуют |
 | Codex / AI Integration и безопасность | Требования раздела 09 записаны в AI_INTEGRATION.md и D007; API, адаптер, sandbox и AI Game Tester не реализованы |
@@ -28,14 +28,15 @@
 | Подэтап 05.1 | Runtime PhysicsWorld2D: static/dynamic bodies, XY AABB overlap, gravity, simple resolution, Enter/Stay/Exit events; кодовые привязки, не сериализуются |
 | Подэтап 05.2 | GameUiModel для меню/HUD/паузы/настроек; optional SDL3/ImGui demo, не зависит от Editor target |
 | Подэтап 05.3 | Optional match-three rules (`ASTRO_BUILD_PUZZLE_RUNTIME`), scalar animation tracks, SDL synthesized audio cues; нет visual puzzle board или audio asset playback |
-| Сборка и тесты | Windows x64/MSVC Debug: clean headless CTest 19/19; optional UI/graphics/audio CTest 24/24; логи build/05.3-* |
+| Подэтап 05.4 | Explicit Entity/property profiles, indexed slots, schema/game version checks, CRC32, atomic write and backup fallback |
+| Сборка и тесты | Windows x64/MSVC Debug: baseline headless 19/19, UI/graphics/audio 24/24; полный 05.4 regression: см. build/05.4-ctest.log |
 | Политика проверок и документации | Требования записаны в TESTING.md и D009; это не результаты выполненных тестов |
 | Недостающие документы целевого комплекта | docs/FILE_FORMATS.md, docs/TEMPLATE_GUIDE.md |
 | Совместимость и лицензии зависимостей | Не проверены |
 
 Сборка проверена из Visual Studio 2022 Developer Command Prompt x64; инструменты доступны через среду VS, хотя в обычном PowerShell не все присутствуют в PATH.
 
-00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4 и 05.1–05.3: см. отчёты этапов. Следующий рекомендуемый подэтап — 05.4.
+00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4 и 05.1–05.4: см. отчёты этапов. Следующий рекомендуемый подэтап — 05.5.
 
 ## Подэтап 05.1
 
@@ -48,6 +49,10 @@
 ## Подэтап 05.3
 
 `astro_runtime_puzzle` реализует deterministic seeded match-three rules, cascades, refill, score и level thresholds; `AnimationTrack` валидирует и интерполирует scalar keyframes. Optional SDL3 audio stream queues short synthesized cues and is used by the Game UI demo when available. Build/test profile: Windows x64/MSVC Debug, CTest 24/24. Нету serialized level/progress, visible puzzle board, scene animation binding, audio assets/mixer, spatialization или physical-speaker verification. См. [PUZZLE_AND_ANIMATION.md](PUZZLE_AND_ANIMATION.md) и [отчёт](reports/05.3.md).
+
+## Подэтап 05.4
+
+`astro_runtime_save` сохраняет только поля, перечисленные в `SaveProfile`, в слотах под заданным приложением user-data root. Поддержка v1: `entity.name`, scalar Transform fields и `sprite_renderer.visible`. Есть strict format/game/profile selection compatibility, CRC32 corruption detection, ограничение размера, atomic temp replace, `.bak` и backup fallback; отсутствующие объекты/компоненты учитываются в результате. Windows x64/MSVC optional CTest — 25/25 после реализации; headless профиль — 20/20. Миграций, автосохранения, tag/group profiles, checkpoint/respawn и GUI нет. См. [SAVE_SYSTEM.md](SAVE_SYSTEM.md) и [отчёт](reports/05.4.md).
 
 ## Подэтап 02.1
 Добавлен optional astro_editor: окно, docking, меню и project.astro. Создание проекта отказывает для существующего каталога до каких-либо изменений; файл записывается во временный файл и публикуется без замены. Некорректное открытие не меняет активный проект. На завершении 02.1 CTest 6/6, включая smoke этих сценариев. См. [отчёт 02.1](reports/02.1.md).

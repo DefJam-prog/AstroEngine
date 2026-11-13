@@ -1,6 +1,6 @@
 # AstroEngine
 
-Начало разработки модульного 2D/3D-движка на C++20. Headless-приложение выводит информацию о запуске. В `astro_core` есть базовые сервисы, ModuleRegistry, typed EventBus, TimeService/fixed timestep, typed CommandRegistry и in-memory транзакции/Undo/Redo. Optional Windows editor показывает Hierarchy, Inspector с Name и SpriteRenderer, сохраняет Astro Scene v4 и показывает WIC image preview. Core API поддерживает nested prefabs, overrides и обновление экземпляров; UI управления префабами ещё нет. Игровой runtime renderer и игровые системы ещё не реализованы.
+Начало разработки модульного 2D/3D-движка на C++20. Headless-приложение выводит информацию о запуске. В `astro_core` есть базовые сервисы, ModuleRegistry, typed EventBus, TimeService/fixed timestep, typed CommandRegistry и in-memory транзакции/Undo/Redo. Optional Windows editor показывает Hierarchy, Inspector с Name и SpriteRenderer, сохраняет Astro Scene v4 и показывает WIC image preview. Core API поддерживает nested prefabs, overrides и обновление экземпляров; UI управления префабами ещё нет. Общего игрового renderer пока нет; есть необязательный UI-демо backend.
 
 В 00.2 добавлены локальные проверки с JSON-отчётом, настройка форматирования и опциональный статический анализ. Фактические результаты и ограничения: [отчёт 00.2](docs/reports/00.2.md). Подэтапы ядра 01.1–01.5 покрыты в [отчётах](docs/reports/).
 
@@ -37,7 +37,7 @@ ctest --preset windows-debug
 - `tests/smoke/` — проверка запуска процесса, кода возврата и вывода.
 - `docs/` — требования, архитектура, дорожная карта и фактический статус.
 
-Основная headless-сборка не требует внешних библиотек. Optional Windows editor и экспериментальный графический spike используют локальные SDL3/bgfx/ImGui из build-кэша. Runtime-графика, физика, AI API и платформы кроме Windows пока не реализованы. Лицензия проекта не выбрана.
+Основная headless-сборка не требует внешних библиотек. Optional Windows editor, графический spike и Game UI demo используют локальные SDL3/bgfx/ImGui из build-кэша. Runtime имеет только минимальную 2D AABB физику; общего gameplay renderer, AI API и платформ кроме Windows пока нет. Лицензия проекта не выбрана.
 
 См. [архитектуру](docs/ARCHITECTURE.md), [план](docs/ROADMAP.md), [статус](docs/STATUS.md), [решения](docs/DECISIONS.md), [проверки](docs/TESTING.md) и [отчёт 00.1](docs/reports/00.1.md).
 
@@ -74,3 +74,5 @@ ctest --preset windows-debug
 Подэтап 04.4: runtime InteractionSystem связывает entity с code-defined InteractableBehavior, проверяет дальность/активацию и публикует события Requested/Activated/Rejected через typed EventBus. Система может менять только переданную runtime Scene; это не сохранённый no-code component. [API и ограничения](docs/INTERACTION_SYSTEM.md), [отчёт](docs/reports/04.4.md).
 
 Подэтап 05.1: `astro_runtime_physics2d` предоставляет fixed-step runtime API для динамических тел, axis-aligned box overlaps, простого solid resolution и collision Enter/Stay/Exit events. Данные пока не сериализуются и не настраиваются через GUI; ограничения и пример: [PHYSICS_2D](docs/PHYSICS_2D.md), [отчёт 05.1](docs/reports/05.1.md).
+
+Подэтап 05.2: `GameUiModel` управляет меню, запуском/паузой `RuntimeSession`, HUD и настройками. Дополнительный `astro_game_ui_demo.exe` показывает SDL3/ImGui меню/HUD/настройки отдельно от Editor; включается опцией `ASTRO_BUILD_GAME_UI_DEMO`. Настройки ещё не сохраняются, audio runtime отсутствует; [руководство](docs/GAME_UI.md), [отчёт](docs/reports/05.2.md).

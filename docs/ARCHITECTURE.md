@@ -131,3 +131,7 @@ Astro Scene v4 сериализует ID, Transform, SpriteRenderer и prefab in
 ## Runtime 2D physics and collision events (05.1)
 
 `astro_runtime_physics2d` binds runtime-only static/dynamic bodies and axis-aligned box colliders to one SceneId. Its caller supplies fixed steps and the runtime Scene; collision enter/stay/exit events use the core EventBus. Solid response is limited to axis positional correction; triggers report overlap without correction. It does not change the serialized Scene component model. Details: [PHYSICS_2D.md](PHYSICS_2D.md).
+
+## Runtime Game UI (05.2)
+
+`astro_runtime_game_ui` owns screen transitions, available menu actions, HUD fields and typed settings independently of rendering. Transitions to gameplay/pause coordinate with `RuntimeSession` and notify through the existing typed EventBus. Optional `astro_runtime_sdl_game_ui` presents the model using SDL3/ImGui and is built separately from Editor. Default headless builds do not link this adapter. Persistence, audio integration and general-purpose game rendering are not included. See [GAME_UI.md](GAME_UI.md).

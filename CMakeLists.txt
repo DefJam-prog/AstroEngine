@@ -29,8 +29,13 @@ endif()
 
 option(ASTRO_BUILD_STACK_SPIKE "Build the isolated Windows SDL3/bgfx/ImGui experiment" OFF)
 option(ASTRO_BUILD_EDITOR "Build Windows editor" OFF)
-if(ASTRO_BUILD_STACK_SPIKE OR ASTRO_BUILD_EDITOR)
+option(ASTRO_BUILD_GAME_UI_DEMO "Build optional SDL3/ImGui runtime Game UI demo" OFF)
+if(ASTRO_BUILD_STACK_SPIKE OR ASTRO_BUILD_EDITOR OR ASTRO_BUILD_GAME_UI_DEMO)
     add_subdirectory(samples/stack_spike)
+endif()
+
+if(ASTRO_BUILD_GAME_UI_DEMO)
+    add_subdirectory(samples/game_ui_demo)
 endif()
 
 if(ASTRO_BUILD_EDITOR)

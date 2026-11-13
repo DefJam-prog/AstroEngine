@@ -255,3 +255,9 @@ AssetId назначается монотонно и сохраняется в �
 - `PhysicsWorld2D` is a separate optional C++20 target and introduces no third-party physics dependency. 2D body/collider data remains runtime-owned and binds to one SceneId; callers step it inside RuntimeSession using the play Scene copy.
 - The first verified slice uses static/dynamic bodies, gravity, axis-aligned boxes in XY, discrete pairwise overlap checks, basic positional correction and EventBus Enter/Stay/Exit notifications. Triggers report overlaps without resolving them.
 - This is deliberately not a full physics engine. Rotation, mass/material response, CCD, joints, persistence, editor authoring and rendering are deferred; high-speed tunneling and O(n²) scaling are known limitations.
+
+## D031 — Backend-neutral Game UI with optional SDL3/ImGui adapter (05.2)
+
+- `GameUiModel` is always available as a dependency-light runtime state/controller API. It coordinates menu/pause transitions with RuntimeSession, exposes HUD/settings data, and emits typed notifications.
+- Visual presentation is an optional `ASTRO_BUILD_GAME_UI_DEMO` target using existing SDL3 and Dear ImGui cache. It is independent of Editor source/target and is not linked into the default headless runtime.
+- HUD and settings remain in memory. Audio, persistence, localization, gamepad UI navigation and non-Windows adapters are not claimed. Observer failure after a transition does not roll back the model/session state.

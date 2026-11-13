@@ -129,7 +129,7 @@
 Приёмка: подтверждённые сборки на реальных целевых toolchains;
 Windows не должен ломаться. Не обещать iOS-сборку на Windows без Mac.
 
-02.1–03.5 и 04.1–05.1 реализованы в пределах ограничений [отчётов](reports/). Следующий рекомендуемый подэтап — 05.2 (Game UI), только после отдельного подтверждения пользователя.
+02.1–03.5 и 04.1–05.2 реализованы в пределах ограничений [отчётов](reports/). Следующий рекомендуемый подэтап — 05.3 (звук, анимации и игровая логика головоломки), только после отдельного подтверждения пользователя.
 
 ## Подэтап 03.5 — граф ресурсов и детерминированный package
 
@@ -145,4 +145,8 @@ Windows не должен ломаться. Не обещать iOS-сборку
 
 ## Подэтап 05.1 — минимальная 2D-физика и collision events
 
-Добавлены runtime body/collider bindings, gravity, fixed-step XY AABB collision detection, базовая positional correction и sequenced Enter/Stay/Exit events. Данные остаются вне Scene serialization; ограничения — [PHYSICS_2D.md](PHYSICS_2D.md) и [отчёт](reports/05.1.md). Следующий рекомендуемый подэтап — 05.2 Game UI.
+Добавлены runtime body/collider bindings, gravity, fixed-step XY AABB collision detection, базовая positional correction и sequenced Enter/Stay/Exit events. Данные остаются вне Scene serialization; ограничения — [PHYSICS_2D.md](PHYSICS_2D.md) и [отчёт](reports/05.1.md).
+
+## Подэтап 05.2 — Game UI
+
+Добавлена backend-neutral GameUiModel для Main Menu, Gameplay/HUD, Pause и Settings с координацией RuntimeSession. Optional SDL3/ImGui adapter и `astro_game_ui_demo` дают видимые экраны; настройки остаются in-memory. Ограничения и команды: [GAME_UI.md](GAME_UI.md), [отчёт](reports/05.2.md). Следующий рекомендуемый подэтап — 05.3.

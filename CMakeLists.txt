@@ -12,6 +12,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 include(CTest)
+option(ASTRO_BUILD_PUZZLE_RUNTIME "Build the optional backend-neutral puzzle/animation runtime module" OFF)
 option(ASTRO_ENABLE_CLANG_TIDY "Run clang-tidy during compilation" OFF)
 if(ASTRO_ENABLE_CLANG_TIDY)
     find_program(ASTRO_CLANG_TIDY NAMES clang-tidy REQUIRED)

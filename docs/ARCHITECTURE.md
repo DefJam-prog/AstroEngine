@@ -135,3 +135,7 @@ Astro Scene v4 сериализует ID, Transform, SpriteRenderer и prefab in
 ## Runtime Game UI (05.2)
 
 `astro_runtime_game_ui` owns screen transitions, available menu actions, HUD fields and typed settings independently of rendering. Transitions to gameplay/pause coordinate with `RuntimeSession` and notify through the existing typed EventBus. Optional `astro_runtime_sdl_game_ui` presents the model using SDL3/ImGui and is built separately from Editor. Default headless builds do not link this adapter. Persistence, audio integration and general-purpose game rendering are not included. See [GAME_UI.md](GAME_UI.md).
+
+## Runtime gameplay helpers (05.3)
+
+`astro_runtime_puzzle` provides deterministic match-three rules and scalar keyframe sampling without platform dependencies; it is included when tests are enabled or explicitly requested with `ASTRO_BUILD_PUZZLE_RUNTIME`. The optional SDL3 audio adapter is built only with the Game UI demo profile and queues short synthesized cue tones. There is no scene-bound animation/audio component, asset playback/mixing, or visual puzzle renderer; see [PUZZLE_AND_ANIMATION.md](PUZZLE_AND_ANIMATION.md).

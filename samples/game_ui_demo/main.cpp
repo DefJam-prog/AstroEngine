@@ -1,4 +1,5 @@
 #include "astro/runtime/ImGuiGameUiAdapter.hpp"
+#include "astro/runtime/SdlAudioCuePlayer.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -19,7 +20,7 @@ class SdlLifetime final
 public:
     SdlLifetime()
     {
-        if (!SDL_Init(SDL_INIT_VIDEO)) throw std::runtime_error(SDL_GetError());
+        if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) throw std::runtime_error(SDL_GetError());
     }
     ~SdlLifetime() { SDL_Quit(); }
     SdlLifetime(const SdlLifetime&) = delete;
@@ -56,10 +57,22 @@ public:
                 if (!SDL_SetWindowFullscreen(window_, std::get<bool>(event.settingValue)))
                     throw std::runtime_error(SDL_GetError());
             }
+            if (!smoke_ && event.kind == astro::runtime::GameUiEventKind::StartRequested)
+                (void)audio_.play(astro::runtime::AudioCue::Select);
+            if (!smoke_ && event.kind == astro::runtime::GameUiEventKind::PauseChanged)
+                (void)audio_.play(event.screen == astro::runtime::GameUiScreen::Paused
+                    ? astro::runtime::AudioCue::Select : astro::runtime::AudioCue::Match);
+            if (!smoke_ && event.kind == astro::runtime::GameUiEventKind::ReturnedToMenu)
+                (void)audio_.play(astro::runtime::AudioCue::LevelUp);
         });
         if (!subscription) throw std::runtime_error(subscription.error().message);
         const auto initialized = adapter_.initialize(window_, renderer_);
         if (!initialized) throw std::runtime_error(initialized.error().message);
+        if (!smoke_)
+        {
+            const auto audioOpened = audio_.open();
+            if (!audioOpened) std::cerr << "Audio disabled: " << audioOpened.error().message << '\n';
+        }
         if (smoke_) return runSmoke();
 
         bool running = true;
@@ -197,6 +210,7 @@ private:
     astro::runtime::RuntimeSession session_;
     astro::core::EventBus events_;
     astro::scene::Scene scene_;
+    astro::runtime::SdlAudioCuePlayer audio_;
     int score_ = 0;
     astro::runtime::ImGuiGameUiAdapter adapter_;
 };

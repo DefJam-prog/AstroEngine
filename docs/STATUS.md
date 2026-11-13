@@ -27,14 +27,15 @@
 | Исходники и API | Core API 01.1–01.5; Scene v4 читает v1–v3; Transform, SpriteRenderer и prefab instance metadata; `astro_prefabs` с nested prefab, source mapping, overrides, update API и транзакционными командами |
 | Подэтап 05.1 | Runtime PhysicsWorld2D: static/dynamic bodies, XY AABB overlap, gravity, simple resolution, Enter/Stay/Exit events; кодовые привязки, не сериализуются |
 | Подэтап 05.2 | GameUiModel для меню/HUD/паузы/настроек; optional SDL3/ImGui demo, не зависит от Editor target |
-| Сборка и тесты | Windows x64/MSVC Debug: чистый headless build и CTest 18/18; optional UI/graphics профиль CTest 22/22; логи build/05.2-* |
+| Подэтап 05.3 | Optional match-three rules (`ASTRO_BUILD_PUZZLE_RUNTIME`), scalar animation tracks, SDL synthesized audio cues; нет visual puzzle board или audio asset playback |
+| Сборка и тесты | Windows x64/MSVC Debug: clean headless CTest 19/19; optional UI/graphics/audio CTest 24/24; логи build/05.3-* |
 | Политика проверок и документации | Требования записаны в TESTING.md и D009; это не результаты выполненных тестов |
 | Недостающие документы целевого комплекта | docs/FILE_FORMATS.md, docs/TEMPLATE_GUIDE.md |
 | Совместимость и лицензии зависимостей | Не проверены |
 
 Сборка проверена из Visual Studio 2022 Developer Command Prompt x64; инструменты доступны через среду VS, хотя в обычном PowerShell не все присутствуют в PATH.
 
-00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4 и 05.1–05.2: см. отчёты этапов. Следующий рекомендуемый подэтап — 05.3.
+00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4 и 05.1–05.3: см. отчёты этапов. Следующий рекомендуемый подэтап — 05.4.
 
 ## Подэтап 05.1
 
@@ -43,6 +44,10 @@
 ## Подэтап 05.2
 
 `astro_runtime_game_ui` управляет переходами экранов, HUD-полями и схемой настроек; старт/пауза/возобновление/выход в меню синхронизированы с RuntimeSession. Optional ImGui adapter рисует экраны в SDL3 demo окне. HUD/settings не сериализуются; нет аудиосистемы, локализации и контроллерной навигации. Полный CTest 22/22. См. [GAME_UI.md](GAME_UI.md) и [отчёт](reports/05.2.md).
+
+## Подэтап 05.3
+
+`astro_runtime_puzzle` реализует deterministic seeded match-three rules, cascades, refill, score и level thresholds; `AnimationTrack` валидирует и интерполирует scalar keyframes. Optional SDL3 audio stream queues short synthesized cues and is used by the Game UI demo when available. Build/test profile: Windows x64/MSVC Debug, CTest 24/24. Нету serialized level/progress, visible puzzle board, scene animation binding, audio assets/mixer, spatialization или physical-speaker verification. См. [PUZZLE_AND_ANIMATION.md](PUZZLE_AND_ANIMATION.md) и [отчёт](reports/05.3.md).
 
 ## Подэтап 02.1
 Добавлен optional astro_editor: окно, docking, меню и project.astro. Создание проекта отказывает для существующего каталога до каких-либо изменений; файл записывается во временный файл и публикуется без замены. Некорректное открытие не меняет активный проект. На завершении 02.1 CTest 6/6, включая smoke этих сценариев. См. [отчёт 02.1](reports/02.1.md).

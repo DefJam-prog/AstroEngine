@@ -261,3 +261,9 @@ AssetId назначается монотонно и сохраняется в �
 - `GameUiModel` is always available as a dependency-light runtime state/controller API. It coordinates menu/pause transitions with RuntimeSession, exposes HUD/settings data, and emits typed notifications.
 - Visual presentation is an optional `ASTRO_BUILD_GAME_UI_DEMO` target using existing SDL3 and Dear ImGui cache. It is independent of Editor source/target and is not linked into the default headless runtime.
 - HUD and settings remain in memory. Audio, persistence, localization, gamepad UI navigation and non-Windows adapters are not claimed. Observer failure after a transition does not roll back the model/session state.
+
+## D032 — Minimal puzzle rules, scalar animation sampling, optional SDL audio cues (05.3)
+
+- Puzzle rules and scalar animation sampling live in dependency-light `astro_runtime_puzzle`; state is currently runtime-only. Match-three uses orthogonal swaps, run clearing, gravity/refill, seeded randomness, cascade scoring and score thresholds. It is not yet connected to a visual board or project/scene serializer.
+- The audio adapter reuses SDL3 already present in the optional demo profile. It queues short generated sine cues to the default device rather than introducing an audio library or claiming a general asset playback/mixing system. Failure to open audio is reported by the demo and does not block gameplay UI.
+- SDL audio smoke uses the dummy driver; it validates queueing through SDL's output stream, not audible speaker output. No new external dependency or installation was needed.

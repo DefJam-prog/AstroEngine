@@ -129,7 +129,7 @@
 Приёмка: подтверждённые сборки на реальных целевых toolchains;
 Windows не должен ломаться. Не обещать iOS-сборку на Windows без Mac.
 
-02.1–03.5 и 04.1–05.2 реализованы в пределах ограничений [отчётов](reports/). Следующий рекомендуемый подэтап — 05.3 (звук, анимации и игровая логика головоломки), только после отдельного подтверждения пользователя.
+02.1–03.5, 04.1–04.4 и 05.1–05.3 реализованы в пределах ограничений [отчётов](reports/). Следующий рекомендуемый подэтап — 05.4 (Save System v1), только после отдельного подтверждения пользователя.
 
 ## Подэтап 03.5 — граф ресурсов и детерминированный package
 
@@ -149,4 +149,8 @@ Windows не должен ломаться. Не обещать iOS-сборку
 
 ## Подэтап 05.2 — Game UI
 
-Добавлена backend-neutral GameUiModel для Main Menu, Gameplay/HUD, Pause и Settings с координацией RuntimeSession. Optional SDL3/ImGui adapter и `astro_game_ui_demo` дают видимые экраны; настройки остаются in-memory. Ограничения и команды: [GAME_UI.md](GAME_UI.md), [отчёт](reports/05.2.md). Следующий рекомендуемый подэтап — 05.3.
+Добавлена backend-neutral GameUiModel для Main Menu, Gameplay/HUD, Pause и Settings с координацией RuntimeSession. Optional SDL3/ImGui adapter и `astro_game_ui_demo` дают видимые экраны; настройки остаются in-memory. Ограничения и команды: [GAME_UI.md](GAME_UI.md), [отчёт](reports/05.2.md).
+
+## Подэтап 05.3 — звук, анимации и игровая логика головоломки
+
+Добавлены backend-neutral правила match-three и детерминированное sampling scalar animation tracks. Optional SDL3 adapter queues synthesized UI/gameplay cues; реальный выход проверяется через dummy driver. Нет visual puzzle board, asset audio playback, смешивания дорожек или editor authoring. Описание и ограничения: [PUZZLE_AND_ANIMATION.md](PUZZLE_AND_ANIMATION.md), [отчёт](reports/05.3.md).

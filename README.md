@@ -75,4 +75,4 @@ ctest --preset windows-debug
 
 Подэтап 05.1: `astro_runtime_physics2d` предоставляет fixed-step runtime API для динамических тел, axis-aligned box overlaps, простого solid resolution и collision Enter/Stay/Exit events. Данные пока не сериализуются и не настраиваются через GUI; ограничения и пример: [PHYSICS_2D](docs/PHYSICS_2D.md), [отчёт 05.1](docs/reports/05.1.md).
 
-Подэтап 05.2: `GameUiModel` управляет меню, запуском/паузой `RuntimeSession`, HUD и настройками. Дополнительный `astro_game_ui_demo.exe` показывает SDL3/ImGui меню/HUD/настройки отдельно от Editor; включается опцией `ASTRO_BUILD_GAME_UI_DEMO`. Настройки ещё не сохраняются, audio runtime отсутствует; [руководство](docs/GAME_UI.md), [отчёт](docs/reports/05.2.md).
+Подэтап 05.2: `GameUiModel` управляет меню, запуском/паузой `RuntimeSession`, HUD и настройками. Подэтап 05.3 добавляет backend-neutral match-three rules, scalar animation sampling и опциональные короткие SDL3 audio cues. Это ещё не визуально игровая головоломка, asset audio system или editor animation tool; подробности — [описание 05.3](docs/PUZZLE_AND_ANIMATION.md) и [отчёт](docs/reports/05.3.md).

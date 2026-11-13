@@ -138,3 +138,7 @@ ctest --test-dir build/stack-spike --output-on-failure
 ## 03.3 результаты
 
 Windows x64, MSVC 14.44, Debug, BGFX D3D11: `cmake --build build/stack-spike --parallel 4` успешно; CTest 11/11 успешно (`build/03.3-build.log`, `build/03.3-ctest.log`). Покрыты SpriteRenderer command validation/Undo/Redo и Scene v3 serialization. `editor.smoke` импортирует собственный PNG, проверяет WIC decode/BGFX texture upload и scene round-trip, плюс запуск UI и project/scene regression. Визуальный pixel-diff эталон не снимается.
+
+## 03.4 результаты
+
+Полная Windows x64/MSVC Debug сборка успешна; CTest 13/13. `prefab.unit` покрывает локальные ID, parent, root и hierarchy cycle validation. `prefab.integration` проверяет file round-trip, nested instantiate, graph cycle rejection без изменения Scene, Scene v4 persistence, command Undo/Redo, prefab source update, сохранение EntityId и override, повторное update после загрузки. См. `build/03.4-build.log` и `build/03.4-ctest.log`. Нет отдельного editor smoke для prefab authoring, так как UI в 03.4 не добавлялся.

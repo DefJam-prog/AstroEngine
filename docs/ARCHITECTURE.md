@@ -59,7 +59,7 @@ save.trigger и save.restore имеют runtime-контекст и ограни
 
 ## Scene / ECS
 
-`engine/scene` содержит Scene/Entity с именами и стабильными сериализуемыми ID, parent, обязательный Transform и необязательный SpriteRenderer (AssetId/visible). Transform и SpriteRenderer пишутся в Astro Scene v3, загрузчик поддерживает v1/v2 миграции; операции проверяют циклы и ссылочную целостность.
+`engine/scene` содержит Scene/Entity с именами и стабильными сериализуемыми ID, parent, обязательный Transform и необязательный SpriteRenderer (AssetId/visible). Transform и SpriteRenderer пишутся в Astro Scene v4 вместе с prefab instance map/overrides; загрузчик поддерживает v1–v3 миграции, операции проверяют циклы и ссылочную целостность.
 
 В редакторе Hierarchy показывает дерево и позволяет создавать root/child entities и удалять выбранное поддерево. Выбранный SpriteRenderer показывает WIC/BGFX image preview в Inspector; полноценное пространственное отображение компонентов и runtime rendering ещё отсутствуют.
 
@@ -77,7 +77,7 @@ save.trigger и save.restore имеют runtime-контекст и ограни
 
 ## Prefab
 
-Требуются вложенные префабы, варианты, overrides, обнаружение циклов и применение обновлений с сохранением локальных переопределений.
+В 03.4 добавлен `astro_prefabs`: project-local `Prefabs/<id>.astro-prefab` хранит дерево с локальными стабильными ID, Transform, SpriteRenderer и вложенными prefab ссылками. `capturePrefab` копирует выбранное поддерево Scene. `instantiatePrefab` проверяет граф и создаёт развернутое дерево; source keys связывают asset nodes с EntityId экземпляра. Overrides Name/Transform/SpriteRenderer записываются в Scene v4, а `updatePrefabInstance` применяет новые базовые значения, сохраняя EntityId и локальные overrides. Устаревший source key с override отклоняет обновление, не теряя данные. `prefab.instantiate`, `prefab.set_override`, `prefab.update_instance` зарегистрированы как транзакционные команды с Undo/Redo по полному снимку Scene. Пока нет редакторского UI, variant prefabs, granular conflict merge и истории изменений между пользователями.
 
 ## Serialization
 
@@ -106,4 +106,4 @@ Save System & Checkpoint Editor — обязательный модуль про
 
 Каждая `Entity` содержит обязательный `TransformComponent` версии 1 и может содержать один `SpriteRendererComponent` версии 1 с AssetId и видимостью. `ComponentId` уникален в пределах сцены и сохраняется вместе с сущностью; удалённые ID не переиспользуются в течение жизни сцены. Transform хранит локальные position, Euler rotation и scale; матрицы и пространственная композиция пока не реализованы. Неизвестные типы файла дают ошибку диагностики.
 
-Astro Scene v3 сериализует ID, Transform и необязательный SpriteRenderer. Загрузчик читает v1/v2 и сохранение явно мигрированной сцены создаёт v3. Формат и миграционное правило: [FILE_FORMATS.md](FILE_FORMATS.md).
+Astro Scene v4 сериализует ID, Transform, SpriteRenderer и prefab instance metadata. Загрузчик читает v1–v3, а сохранение явно мигрированной сцены создаёт v4. Формат и миграционное правило: [FILE_FORMATS.md](FILE_FORMATS.md).

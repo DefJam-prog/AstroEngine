@@ -21,6 +21,7 @@ void check(const bool condition, const char* message)
 int main()
 {
     astro::scene::Scene scene(1, "Основная сцена");
+    check(scene.prefabInstances().empty(), "new scene starts without prefab instance metadata");
     astro::scene::Scene defaults(2, "Defaults");
     const auto defaultEntity = defaults.createEntity();
     check(defaultEntity && defaults.find(defaultEntity.value())->name == "Entity", "apply schema default on creation");

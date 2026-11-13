@@ -960,6 +960,7 @@ public:
                 || scene.find(1)->name != "Edited Root Ω"
                 || !scene.spriteRenderer(1) || !smokeSpriteAsset || scene.spriteRenderer(1)->texture != *smokeSpriteAsset)
                 throw std::runtime_error("Scene persistence/shortcut smoke failed");
+            if (!scene.prefabInstances().empty()) throw std::runtime_error("Empty prefab metadata smoke failed");
             const auto loadedPath = currentScenePath;
             const auto invalidScenePath = smokeDirectory / "invalid.astro-scene";
             { std::ofstream invalidScene(invalidScenePath, std::ios::binary); invalidScene << "ASTRO_SCENE 999\n"; }

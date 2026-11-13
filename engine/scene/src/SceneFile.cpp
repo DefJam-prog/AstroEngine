@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <limits>
 #include <locale>
+#include <map>
 #include <sstream>
 #include <string_view>
 #include <utility>
@@ -47,7 +48,7 @@ std::string serialize(const Scene& scene)
     std::ostringstream output;
     output.imbue(std::locale::classic());
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
-    output << "ASTRO_SCENE 3\nSCENE " << scene.id() << ' ' << std::quoted(scene.name()) << '\n';
+    output << "ASTRO_SCENE 4\nSCENE " << scene.id() << ' ' << std::quoted(scene.name()) << '\n';
     for (const auto& entity : scene.entities())
         output << "ENTITY " << entity.id << ' ' << entity.parent.value_or(0) << ' '
                << std::quoted(entity.name) << '\n';
@@ -64,6 +65,34 @@ std::string serialize(const Scene& scene)
             output << "COMPONENT " << entity.spriteRenderer->id << ' ' << entity.id << ' '
                    << std::quoted("astro.SpriteRenderer") << ' ' << entity.spriteRenderer->schemaVersion << ' '
                    << entity.spriteRenderer->texture.value << ' ' << (entity.spriteRenderer->visible ? 1 : 0) << '\n';
+    for (const auto& instance : scene.prefabInstances())
+    {
+        output << "PREFAB_INSTANCE " << instance.rootEntity << ' ' << instance.prefab << ' '
+               << instance.sourceToEntity.size() << ' ' << instance.overrides.size() << '\n';
+        for (const auto& [key, entity] : instance.sourceToEntity)
+            output << "PREFAB_LINK " << instance.rootEntity << ' ' << std::quoted(key) << ' ' << entity << '\n';
+        for (const auto& overrideValue : instance.overrides)
+        {
+            output << "PREFAB_OVERRIDE " << instance.rootEntity << ' ' << std::quoted(overrideValue.sourceKey)
+                   << ' ' << static_cast<unsigned>(overrideValue.property) << ' ';
+            if (overrideValue.property == PrefabOverrideProperty::Name)
+                output << std::quoted(std::get<std::string>(overrideValue.value));
+            else if (overrideValue.property == PrefabOverrideProperty::Transform)
+            {
+                const auto& value = std::get<Transform>(overrideValue.value);
+                output << value.position.x << ' ' << value.position.y << ' ' << value.position.z << ' '
+                       << value.rotationDegrees.x << ' ' << value.rotationDegrees.y << ' ' << value.rotationDegrees.z << ' '
+                       << value.scale.x << ' ' << value.scale.y << ' ' << value.scale.z;
+            }
+            else
+            {
+                const auto& value = std::get<std::optional<PrefabSpriteValue>>(overrideValue.value);
+                output << (value ? 1 : 0);
+                if (value) output << ' ' << value->texture.value << ' ' << (value->visible ? 1 : 0);
+            }
+            output << '\n';
+        }
+    }
     output << "END\n";
     return output.str();
 }
@@ -158,7 +187,7 @@ core::Result<void> publishAtomically(const std::filesystem::path& target, const 
 core::Result<void> saveSceneFile(const std::filesystem::path& file, const Scene& scene)
 {
     if (file.empty()) return writeError(core::ErrorCode::InvalidArgument, "Scene file path is empty");
-    auto validation = restoreScene(scene.id(), scene.name(), scene.entities());
+    auto validation = restoreScene(scene.id(), scene.name(), scene.entities(), scene.prefabInstances());
     if (!validation) return writeError(validation.error().code, validation.error().message);
     const auto contents = serialize(scene);
     if (contents.size() > MaxSceneFileBytes)
@@ -189,7 +218,7 @@ core::Result<Scene> loadSceneFile(const std::filesystem::path& file)
     std::string magic;
     if (!(header >> magic >> version) || hasExtra(header) || magic != "ASTRO_SCENE")
         return fileError(core::ErrorCode::ParseError, "Invalid scene file header");
-    if (version != 1 && version != 2 && version != 3)
+    if (version < 1 || version > 4)
         return fileError(core::ErrorCode::VersionMismatch, "Unsupported scene file version");
 
     if (!nextLine()) return fileError(core::ErrorCode::ParseError, "Scene metadata is missing");
@@ -201,6 +230,9 @@ core::Result<Scene> loadSceneFile(const std::filesystem::path& file)
         return fileError(core::ErrorCode::ParseError, "Invalid scene metadata");
 
     std::vector<Entity> entities;
+    std::vector<PrefabInstanceInfo> prefabInstances;
+    std::map<EntityId, std::size_t> prefabInstanceIndexes;
+    std::map<EntityId, std::pair<std::size_t, std::size_t>> prefabExpectedCounts;
     entities.reserve(static_cast<std::size_t>(std::min<std::uintmax_t>(size / 24, MaxSceneEntities)));
     bool ended = false;
     while (nextLine())
@@ -255,10 +287,88 @@ core::Result<Scene> loadSceneFile(const std::filesystem::path& file)
             else
                 return fileError(core::ErrorCode::ValidationError, "Unknown component type: " + type);
         }
+        else if (marker == "PREFAB_INSTANCE" && version >= 4)
+        {
+            PrefabInstanceInfo instance;
+            std::size_t linkCount = 0, overrideCount = 0;
+            if (!(record >> instance.rootEntity >> instance.prefab >> linkCount >> overrideCount) || hasExtra(record)
+                || linkCount > MaxSceneEntities || overrideCount > MaxSceneEntities)
+                return fileError(core::ErrorCode::ParseError, "Invalid prefab instance record");
+            if (!prefabInstanceIndexes.emplace(instance.rootEntity, prefabInstances.size()).second)
+                return fileError(core::ErrorCode::AlreadyExists, "Duplicate prefab instance root");
+            prefabExpectedCounts.emplace(instance.rootEntity, std::pair{linkCount, overrideCount});
+            prefabInstances.push_back(std::move(instance));
+        }
+        else if (marker == "PREFAB_LINK" && version >= 4)
+        {
+            EntityId root = 0, entity = 0;
+            std::string key;
+            if (!(record >> root >> std::quoted(key) >> entity) || hasExtra(record))
+                return fileError(core::ErrorCode::ParseError, "Invalid prefab source link record");
+            const auto instance = prefabInstanceIndexes.find(root);
+            if (instance == prefabInstanceIndexes.end())
+                return fileError(core::ErrorCode::ParseError, "Prefab source link precedes its instance record");
+            if (!prefabInstances[instance->second].sourceToEntity.emplace(std::move(key), entity).second)
+                return fileError(core::ErrorCode::AlreadyExists, "Duplicate prefab source key");
+        }
+        else if (marker == "PREFAB_OVERRIDE" && version >= 4)
+        {
+            EntityId root = 0;
+            std::string key;
+            unsigned property = 0;
+            if (!(record >> root >> std::quoted(key) >> property))
+                return fileError(core::ErrorCode::ParseError, "Invalid prefab override record");
+            const auto instance = prefabInstanceIndexes.find(root);
+            if (instance == prefabInstanceIndexes.end())
+                return fileError(core::ErrorCode::ParseError, "Prefab override precedes its instance record");
+            PrefabOverride value;
+            value.sourceKey = std::move(key);
+            value.property = static_cast<PrefabOverrideProperty>(property);
+            if (value.property == PrefabOverrideProperty::Name)
+            {
+                std::string name;
+                if (!(record >> std::quoted(name)) || hasExtra(record))
+                    return fileError(core::ErrorCode::ParseError, "Invalid prefab name override");
+                value.value = std::move(name);
+            }
+            else if (value.property == PrefabOverrideProperty::Transform)
+            {
+                Transform transform;
+                if (!(record >> transform.position.x >> transform.position.y >> transform.position.z
+                    >> transform.rotationDegrees.x >> transform.rotationDegrees.y >> transform.rotationDegrees.z
+                    >> transform.scale.x >> transform.scale.y >> transform.scale.z) || hasExtra(record))
+                    return fileError(core::ErrorCode::ParseError, "Invalid prefab Transform override");
+                value.value = transform;
+            }
+            else if (value.property == PrefabOverrideProperty::SpriteRenderer)
+            {
+                unsigned present = 0, visible = 0;
+                std::uint64_t assetId = 0;
+                if (!(record >> present) || present > 1)
+                    return fileError(core::ErrorCode::ParseError, "Invalid prefab SpriteRenderer override");
+                std::optional<PrefabSpriteValue> sprite;
+                if (present)
+                {
+                    if (!(record >> assetId >> visible) || visible > 1)
+                        return fileError(core::ErrorCode::ParseError, "Invalid prefab SpriteRenderer override");
+                    sprite = PrefabSpriteValue{{assetId}, visible != 0};
+                }
+                if (hasExtra(record)) return fileError(core::ErrorCode::ParseError, "Invalid prefab SpriteRenderer override");
+                value.value = sprite;
+            }
+            else return fileError(core::ErrorCode::ValidationError, "Unknown prefab override property");
+            prefabInstances[instance->second].overrides.push_back(std::move(value));
+        }
         else
             return fileError(core::ErrorCode::ParseError, "Unknown or unsupported scene record");
     }
     if (!ended) return fileError(core::ErrorCode::ParseError, "Scene terminator is missing");
+    for (const auto& instance : prefabInstances)
+    {
+        const auto expected = prefabExpectedCounts.at(instance.rootEntity);
+        if (instance.sourceToEntity.size() != expected.first || instance.overrides.size() != expected.second)
+            return fileError(core::ErrorCode::ParseError, "Prefab instance records do not match declared counts");
+    }
     while (nextLine())
         if (!line.empty() && line.find_first_not_of(" \t\r") != std::string::npos)
             return fileError(core::ErrorCode::ParseError, "Unexpected data after scene terminator");
@@ -273,6 +383,6 @@ core::Result<Scene> loadSceneFile(const std::filesystem::path& file)
             entity.components.push_back({nextComponentId++, 1, {}});
         }
     }
-    return restoreScene(sceneId, std::move(name), std::move(entities));
+    return restoreScene(sceneId, std::move(name), std::move(entities), std::move(prefabInstances));
 }
 }

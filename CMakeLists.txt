@@ -21,6 +21,7 @@ add_subdirectory(engine/runtime)
 add_subdirectory(engine/core)
 add_subdirectory(engine/assets)
 add_subdirectory(engine/scene)
+add_subdirectory(engine/prefabs)
 
 if(BUILD_TESTING)
     add_subdirectory(tests)

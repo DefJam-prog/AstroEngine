@@ -24,6 +24,7 @@ int main()
     core::EngineContext context;
     core::CommandRegistry commands(context);
     scene::Scene document(7, "Командная сцена");
+    check(document.prefabInstances().empty(), "scene exposes an empty prefab instance set by default");
     auto entity = document.createEntity("Старое имя Ω");
     check(entity.hasValue(), "create test entity");
     check(scene::entityPropertySchema().size() == 2, "schema exposes editable Name and read-only ID");

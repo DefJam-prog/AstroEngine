@@ -24,15 +24,15 @@
 | Подэтап 01.3 | EventBus, TimeService/fixed timestep и ModuleRegistry::tick реализованы; unit-тесты добавлены |
 | Подэтап 01.4 | Typed CommandRegistry, версия/type checks, validation, execute/result и audit реализованы; unit-тесты добавлены |
 | Подэтап 01.5 | In-memory transactions, transactional commands, Undo/Redo, rollback/barrier semantics реализованы; unit-тесты добавлены |
-| Исходники и API | Core API 01.1–01.5; Scene/Entity с Transform и SpriteRenderer; Astro Scene v3 читает v1/v2; Asset Registry PNG/JPEG metadata, AssetId, SHA-256 cache/reimport; Windows Editor WIC preview и missing-source diagnostics |
-| Сборка и тесты | Windows x64/MSVC Debug сборка успешна; CTest 11/11, включая sprite command undo/redo, Astro Scene v3 round-trip и editor/runtime smoke; логи build/03.3-build.log, build/03.3-ctest.log |
+| Исходники и API | Core API 01.1–01.5; Scene v4 читает v1–v3; Transform, SpriteRenderer и prefab instance metadata; `astro_prefabs` с nested prefab, source mapping, overrides, update API и транзакционными командами |
+| Сборка и тесты | Windows x64/MSVC Debug сборка успешна; итоговый CTest 13/13; логи build/03.4-build.log, build/03.4-ctest.log |
 | Политика проверок и документации | Требования записаны в TESTING.md и D009; это не результаты выполненных тестов |
 | Недостающие документы целевого комплекта | docs/FILE_FORMATS.md, docs/TEMPLATE_GUIDE.md |
 | Совместимость и лицензии зависимостей | Не проверены |
 
 Сборка проверена из Visual Studio 2022 Developer Command Prompt x64; инструменты доступны через среду VS, хотя в обычном PowerShell не все присутствуют в PATH.
 
-00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4 и 03.1–03.3: см. отчёты этапов. Следующий рекомендуемый подэтап — 03.4.
+00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4 и 03.1–03.4: см. отчёты этапов. Следующий рекомендуемый подэтап — 03.5.
 
 ## Подэтап 02.1
 Добавлен optional astro_editor: окно, docking, меню и project.astro. Создание проекта отказывает для существующего каталога до каких-либо изменений; файл записывается во временный файл и публикуется без замены. Некорректное открытие не меняет активный проект. На завершении 02.1 CTest 6/6, включая smoke этих сценариев. См. [отчёт 02.1](reports/02.1.md).
@@ -51,6 +51,9 @@ Astro Scene v1 сохраняет ID, имя сцены, иерархию и и�
 
 ## Подэтап 03.3
 Добавлен SpriteRenderer с AssetId/visible и транзакционная `entity.set_sprite_renderer`; ссылки проходят scene persistence v3, загрузчик сохраняет поддержку v1/v2. Windows Editor импортирует PNG/JPEG, отображает WIC preview выбранного компонента и сообщает об отсутствующих источниках/AssetId. Компонент не является runtime/spatial renderer. CTest 11/11; детали — [отчёт 03.3](reports/03.3.md).
+
+## Подэтап 03.4
+Добавлен `astro_prefabs`: versioned `.astro-prefab` файлы, capture/instantiate, nested references с cycle/depth checks, source key mapping, Name/Transform/SpriteRenderer overrides, update с сохранением EntityId и локальных overrides. `prefab.instantiate`, `prefab.set_override`, `prefab.update_instance` транзакционные; Scene v4 сохраняет instance metadata/overrides, мигрирует v1–v3 при явном сохранении. Полный CTest 13/13; editor UI отсутствует. См. [отчёт 03.4](reports/03.4.md).
 
 ## Подэтап 03.1
 Каждая сущность получает один обязательный `astro.Transform` версии 1 с устойчивым в пределах сцены Component ID, позицией, вращением Эйлера в градусах и масштабом. Astro Scene v2 записывает Transform и ID; файлы v1 мигрируют к значениям по умолчанию. CTest 9/9; ограничения — [отчёт 03.1](reports/03.1.md).

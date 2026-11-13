@@ -47,6 +47,7 @@ int main()
     const auto invalidUtf8Path = directory / "invalid utf8.scene";
     const auto legacyPath = directory / "legacy v1.scene";
     const auto legacyV2Path = directory / "legacy v2.scene";
+    const auto legacyV3Path = directory / "legacy v3.scene";
     const auto unknownComponentPath = directory / "unknown component.scene";
 
     Scene source(42, "Уровень Ω");
@@ -72,6 +73,7 @@ int main()
             check(loaded.value().id() == source.id() && loaded.value().name() == source.name(),
                 "preserve scene identity and Unicode name");
             check(loaded.value().entities().size() == 2, "round-trip entity count");
+            check(loaded.value().prefabInstances().empty(), "ordinary scene round-trip has no prefab instances");
             check(loaded.value().find(root.value())->name == "Корень Ω"
                 && loaded.value().find(child.value())->parent == root.value(), "preserve entity IDs and hierarchy");
             const auto* loadedTransform = loaded.value().transform(root.value());
@@ -120,6 +122,22 @@ int main()
         check(roundTripV2 && roundTripV2.value().transform(4)->id == 9,
             "preserve v2 component ID through v3 save/load");
     }
+    writeText(legacyV3Path,
+        "ASTRO_SCENE 3\nSCENE 9 \"Legacy v3\"\nENTITY 5 0 \"Sprite node\"\n"
+        "COMPONENT 11 5 \"astro.Transform\" 1 0 0 0 0 0 0 1 1 1\n"
+        "COMPONENT 12 5 \"astro.SpriteRenderer\" 1 33 1\nEND\n");
+    auto migratedV3 = loadSceneFile(legacyV3Path);
+    check(migratedV3 && migratedV3.value().spriteRenderer(5)
+        && migratedV3.value().spriteRenderer(5)->id == 12
+        && migratedV3.value().spriteRenderer(5)->texture.value == 33,
+        "migrate v3 sprite component without changing component or asset IDs");
+    if (migratedV3)
+    {
+        check(saveSceneFile(legacyV3Path, migratedV3.value()).hasValue(), "write migrated v3 scene as v4");
+        auto roundTripV3 = loadSceneFile(legacyV3Path);
+        check(roundTripV3 && roundTripV3.value().spriteRenderer(5)->id == 12,
+            "preserve migrated v3 sprite through v4 save/load");
+    }
     writeText(unknownComponentPath, "ASTRO_SCENE 2\nSCENE 1 \"X\"\nENTITY 1 0 \"Node\"\nCOMPONENT 1 1 \"astro.Unknown\" 1 0 0 0 0 0 0 1 1 1\nEND\n");
     auto unknownComponent = loadSceneFile(unknownComponentPath);
     check(!unknownComponent && unknownComponent.error().message.find("Unknown component type") != std::string::npos,
@@ -136,7 +154,7 @@ int main()
     check(!loadSceneFile(directory / "absent.scene"), "report missing file");
 
     for (const auto& file : {scenePath, versionPath, missingParentPath, cyclePath, trailingPath, invalidUtf8Path,
-        legacyPath, legacyV2Path, unknownComponentPath})
+        legacyPath, legacyV2Path, legacyV3Path, unknownComponentPath})
         std::filesystem::remove(file, fsError);
     check(std::filesystem::remove(directory, fsError), "remove only the test-owned empty directory");
 

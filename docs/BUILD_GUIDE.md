@@ -69,3 +69,5 @@ ctest --test-dir build/stack-spike --output-on-failure
 Подэтап 03.1 проверялся теми же командами. Итоговые логи: `build/03.1-build.log`, `build/03.1-ctest.log`; Windows x64/MSVC Debug, CTest 9/9.
 
 Подэтап 03.3 проверен тем же Windows x64/MSVC Debug preset. CTest может отсутствовать в PATH даже в Developer shell; в данной установке используйте `& 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\ctest.exe' --test-dir build/stack-spike --output-on-failure`. Логи: `build/03.3-build.log`, `build/03.3-ctest.log`. Editor использует встроенный Windows Imaging Component (WIC), внешняя библиотека не добавляется.
+
+Подэтап 03.4 добавляет `astro_prefabs`, который собирается штатной CMake-конфигурацией без внешних зависимостей. Windows x64/MSVC Debug сборка и полный CTest 13/13 прошли; логи `build/03.4-build.log`, `build/03.4-ctest.log`. Отдельно: `ctest --test-dir build/stack-spike -R '^prefab\.' --output-on-failure`.

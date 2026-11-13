@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -18,6 +19,7 @@ namespace astro::scene
 using SceneId = std::uint64_t;
 using EntityId = std::uint64_t;
 using ComponentId = std::uint64_t;
+using PrefabId = std::uint64_t;
 using PropertyValue = std::variant<std::string, EntityId>;
 
 struct Vec3
@@ -49,6 +51,31 @@ struct SpriteRendererComponent
     std::uint32_t schemaVersion = 1;
     assets::AssetId texture{};
     bool visible = true;
+};
+
+struct PrefabSpriteValue
+{
+    assets::AssetId texture{};
+    bool visible = true;
+    friend bool operator==(const PrefabSpriteValue&, const PrefabSpriteValue&) = default;
+};
+
+enum class PrefabOverrideProperty : std::uint8_t { Name = 1, Transform = 2, SpriteRenderer = 3 };
+using PrefabOverrideValue = std::variant<std::string, Transform, std::optional<PrefabSpriteValue>>;
+
+struct PrefabOverride
+{
+    std::string sourceKey;
+    PrefabOverrideProperty property = PrefabOverrideProperty::Name;
+    PrefabOverrideValue value;
+};
+
+struct PrefabInstanceInfo
+{
+    EntityId rootEntity = 0;
+    PrefabId prefab = 0;
+    std::map<std::string, EntityId> sourceToEntity;
+    std::vector<PrefabOverride> overrides;
 };
 
 enum class PropertyType
@@ -91,6 +118,7 @@ public:
     [[nodiscard]] SceneId id() const noexcept { return id_; }
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
     [[nodiscard]] const std::vector<Entity>& entities() const noexcept { return entities_; }
+    [[nodiscard]] const std::vector<PrefabInstanceInfo>& prefabInstances() const noexcept { return prefabInstances_; }
     [[nodiscard]] Entity* find(EntityId id) noexcept;
     [[nodiscard]] const Entity* find(EntityId id) const noexcept;
     [[nodiscard]] TransformComponent* findTransform(ComponentId id) noexcept;
@@ -99,6 +127,10 @@ public:
     [[nodiscard]] const SpriteRendererComponent* spriteRenderer(EntityId entity) const noexcept;
     core::Result<void> setSpriteRenderer(EntityId entity, assets::AssetId texture, bool visible = true);
     core::Result<void> removeSpriteRenderer(EntityId entity);
+    core::Result<void> setPrefabInstance(PrefabInstanceInfo instance);
+    core::Result<void> removePrefabInstance(EntityId rootEntity);
+    [[nodiscard]] PrefabInstanceInfo* prefabInstance(EntityId rootEntity) noexcept;
+    [[nodiscard]] const PrefabInstanceInfo* prefabInstance(EntityId rootEntity) const noexcept;
     core::Result<void> setTransform(EntityId entity, const Transform& value);
     core::Result<PropertyValue> getProperty(EntityId entity, std::string_view property) const;
     core::Result<void> validateProperty(EntityId entity, std::string_view property, const PropertyValue& value) const;
@@ -109,15 +141,18 @@ public:
     core::Result<void> erase(EntityId id, bool recursive = false);
 
 private:
-    friend core::Result<Scene> restoreScene(SceneId id, std::string name, std::vector<Entity> entities);
+    friend core::Result<Scene> restoreScene(SceneId id, std::string name, std::vector<Entity> entities,
+        std::vector<PrefabInstanceInfo> prefabInstances);
     SceneId id_;
     std::string name_;
     EntityId nextEntityId_ = 1;
     ComponentId nextComponentId_ = 1;
     std::vector<Entity> entities_;
+    std::vector<PrefabInstanceInfo> prefabInstances_;
 };
 
-core::Result<Scene> restoreScene(SceneId id, std::string name, std::vector<Entity> entities);
+core::Result<Scene> restoreScene(SceneId id, std::string name, std::vector<Entity> entities,
+    std::vector<PrefabInstanceInfo> prefabInstances = {});
 
 struct SetScenePropertyPayload
 {

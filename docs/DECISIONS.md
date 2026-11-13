@@ -211,3 +211,11 @@ AssetId назначается монотонно и сохраняется в �
 - `entity.set_sprite_renderer` v1 является транзакционной командой, поддерживает Undo/Redo. Astro Scene v3 записывает компонент; загрузчик сохраняет чтение v1/v2, а сохранение мигрирует при явной записи.
 - Windows Editor использует системный WIC как локальный декодирующий adapter и BGFX для текстурного preview, без добавления сторонней библиотеки. Лимит preview — 16384 на сторону и 64 млн пикселей.
 - Изображение показано как preview выбранного компонента в Inspector; это не пространственная сцена, runtime renderer, кроссплатформенный decoder или гарантированный golden-image результат.
+
+## D024 — Prefab assets, instances and updates (03.4)
+
+- Prefab assets use a project-local numeric ID and a versioned UTF-8 `.astro-prefab` file; Transform/SpriteRenderer data is copied into the asset, nested links remain PrefabId references.
+- Nested prefab links expand beneath their owning node. Repeated PrefabId in the active expansion stack is a cycle; depth is limited to 64 and expansion to 100000 Scene entities. Local hierarchy depth is limited to 256.
+- Scene v4 stores each instance root, flattened source key → EntityId mapping and explicit typed Name/Transform/SpriteRenderer overrides. v1/v2/v3 scenes still load and upgrade only on explicit save.
+- Update computes/prevalidates the new graph on a Scene copy, keeps IDs for source keys that still exist and applies base values before overrides. Overrides whose source key disappears reject the update; the live Scene stays unchanged. Removed prefab nodes with non-prefab children also reject rather than delete those children.
+- `prefab.instantiate`, `prefab.set_override`, and `prefab.update_instance` are transactional. Undo/Redo keeps full Scene snapshots for this early implementation; memory use scales with scene size. Editor authoring UI and merge of simultaneous source/instance edits remain future work.

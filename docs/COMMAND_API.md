@@ -96,3 +96,13 @@ auto applied = commands.execute<astro::scene::SetScenePropertyPayload, void>(
 `validate` проверяет схему и не меняет сцену; `execute` проверяет повторно и применяет изменение. Payload содержит `std::variant<std::string, EntityId>`, однако текущая схема разрешает изменять только `name`. Значение имени обязано быть валидным UTF-8, непустым (кроме пробелов), не содержать NUL и занимать не более 240 байт. `id` доступен только для чтения.
 
 В 02.4 команда `entity.set_property` Name стала транзакционной: предыдущая строка восстанавливается через Undo, повторное применение — через Redo. В 03.3 добавлена `entity.set_sprite_renderer` v1 с payload `{entity, AssetId, visible}`; новая компонента удаляется Undo, Redo возвращает прежнее значение. Она проверяет entity и ненулевой AssetId, но наличие AssetId в проектном Registry отдельно диагностируется редактором. Это покрыто integration-тестами. Нет внешнего/неизменяемого audit, `dry-run diff`, сохранения истории и гарантированного восстановления при сбое rollback. Подробности: [отчёт 02.4](reports/02.4.md), [03.3](reports/03.3.md).
+
+## Prefab-команды (03.4)
+
+После `astro::prefabs::registerPrefabCommands(registry, library, scene)` доступны:
+
+- `prefab.instantiate` v1 (`PrefabId`, optional parent EntityId) → новый root EntityId.
+- `prefab.set_override` v1 (`instanceRoot`, source key, property kind, typed value).
+- `prefab.update_instance` v1 (`instanceRoot`) — обновляет дерево по текущим файлам библиотеки.
+
+Все три команды транзакционные. Undo/Redo сохраняют полные копии Scene, что просто и проверяемо, но потребляет память пропорционально размеру сцены. Валидация выполняет операцию на копии и не меняет live Scene. Пример API и сериализации: [отчёт 03.4](reports/03.4.md).

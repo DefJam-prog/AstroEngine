@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -83,7 +84,8 @@ std::span<const PropertyDefinition> entityPropertySchema() noexcept
 
 Scene::Scene(const SceneId id, std::string name) : id_(id), name_(std::move(name)) {}
 
-core::Result<Scene> restoreScene(const SceneId id, std::string name, std::vector<Entity> entities)
+core::Result<Scene> restoreScene(const SceneId id, std::string name, std::vector<Entity> entities,
+    std::vector<PrefabInstanceInfo> prefabInstances)
 {
     if (id == 0 || id == std::numeric_limits<SceneId>::max() || !validName(name))
         return core::Result<Scene>::failure({core::ErrorCode::ValidationError, "Scene ID or name is invalid"});
@@ -128,6 +130,54 @@ core::Result<Scene> restoreScene(const SceneId id, std::string name, std::vector
         if (entity.parent && !byId.contains(*entity.parent))
             return core::Result<Scene>::failure({core::ErrorCode::NotFound, "Scene contains a missing parent entity"});
 
+    std::unordered_set<EntityId> instanceRoots;
+    std::unordered_set<EntityId> linkedEntities;
+    instanceRoots.reserve(prefabInstances.size());
+    linkedEntities.reserve(prefabInstances.size());
+    for (const auto& instance : prefabInstances)
+    {
+        if (instance.rootEntity == 0 || instance.prefab == 0
+            || instance.prefab == std::numeric_limits<PrefabId>::max() || !byId.contains(instance.rootEntity)
+            || !instanceRoots.emplace(instance.rootEntity).second || instance.sourceToEntity.empty())
+            return core::Result<Scene>::failure({core::ErrorCode::ValidationError, "Prefab instance metadata is invalid"});
+        if (std::none_of(instance.sourceToEntity.begin(), instance.sourceToEntity.end(), [&instance](const auto& link) {
+            return link.second == instance.rootEntity;
+        }))
+            return core::Result<Scene>::failure({core::ErrorCode::ValidationError, "Prefab instance root is not linked to a source entity"});
+        for (const auto& [key, entityId] : instance.sourceToEntity)
+        {
+            if (key.empty() || key.size() > 4096 || !validUtf8(key)
+                || !byId.contains(entityId) || !linkedEntities.emplace(entityId).second)
+                return core::Result<Scene>::failure({core::ErrorCode::ValidationError, "Prefab source mapping is invalid or duplicated"});
+        }
+        std::set<std::pair<std::string, PrefabOverrideProperty>> overrideKeys;
+        for (const auto& overrideValue : instance.overrides)
+        {
+            if (!instance.sourceToEntity.contains(overrideValue.sourceKey)
+                || !overrideKeys.emplace(overrideValue.sourceKey, overrideValue.property).second)
+                return core::Result<Scene>::failure({core::ErrorCode::ValidationError, "Prefab override refers to a missing source or is duplicated"});
+            if (overrideValue.property == PrefabOverrideProperty::Name)
+            {
+                const auto* value = std::get_if<std::string>(&overrideValue.value);
+                if (!value || !validName(*value))
+                    return core::Result<Scene>::failure({core::ErrorCode::ValidationError, "Prefab name override is invalid"});
+            }
+            else if (overrideValue.property == PrefabOverrideProperty::Transform)
+            {
+                const auto* value = std::get_if<Transform>(&overrideValue.value);
+                if (!value || !validTransform(*value))
+                    return core::Result<Scene>::failure({core::ErrorCode::ValidationError, "Prefab Transform override is invalid"});
+            }
+            else if (overrideValue.property == PrefabOverrideProperty::SpriteRenderer)
+            {
+                const auto* value = std::get_if<std::optional<PrefabSpriteValue>>(&overrideValue.value);
+                if (!value || (*value && (*value)->texture.value == 0))
+                    return core::Result<Scene>::failure({core::ErrorCode::ValidationError, "Prefab SpriteRenderer override is invalid"});
+            }
+            else return core::Result<Scene>::failure({core::ErrorCode::ValidationError, "Unknown prefab override property"});
+        }
+    }
+
     std::unordered_map<EntityId, std::uint8_t> state;
     state.reserve(entities.size());
     for (const auto& entity : entities)
@@ -147,6 +197,7 @@ core::Result<Scene> restoreScene(const SceneId id, std::string name, std::vector
 
     Scene restored(id, std::move(name));
     restored.entities_ = std::move(entities);
+    restored.prefabInstances_ = std::move(prefabInstances);
     restored.nextEntityId_ = maximumId + 1;
     restored.nextComponentId_ = maximumComponentId + 1;
     return core::Result<Scene>::success(std::move(restored));
@@ -216,6 +267,45 @@ core::Result<void> Scene::removeSpriteRenderer(const EntityId entityId)
     auto* entity = find(entityId);
     if (!entity) return core::Result<void>::failure({core::ErrorCode::NotFound, "Entity does not exist"});
     entity->spriteRenderer.reset();
+    return core::Result<void>::success();
+}
+
+PrefabInstanceInfo* Scene::prefabInstance(const EntityId rootEntity) noexcept
+{
+    const auto found = std::find_if(prefabInstances_.begin(), prefabInstances_.end(), [rootEntity](const auto& value) {
+        return value.rootEntity == rootEntity;
+    });
+    return found == prefabInstances_.end() ? nullptr : &*found;
+}
+
+const PrefabInstanceInfo* Scene::prefabInstance(const EntityId rootEntity) const noexcept
+{
+    const auto found = std::find_if(prefabInstances_.begin(), prefabInstances_.end(), [rootEntity](const auto& value) {
+        return value.rootEntity == rootEntity;
+    });
+    return found == prefabInstances_.end() ? nullptr : &*found;
+}
+
+core::Result<void> Scene::setPrefabInstance(PrefabInstanceInfo instance)
+{
+    auto updated = prefabInstances_;
+    const auto found = std::find_if(updated.begin(), updated.end(), [&instance](const auto& value) {
+        return value.rootEntity == instance.rootEntity;
+    });
+    if (found == updated.end()) updated.push_back(std::move(instance));
+    else *found = std::move(instance);
+    auto validation = restoreScene(id_, name_, entities_, updated);
+    if (!validation) return core::Result<void>::failure(validation.error());
+    prefabInstances_ = std::move(updated);
+    return core::Result<void>::success();
+}
+
+core::Result<void> Scene::removePrefabInstance(const EntityId rootEntity)
+{
+    const auto before = prefabInstances_.size();
+    std::erase_if(prefabInstances_, [rootEntity](const auto& value) { return value.rootEntity == rootEntity; });
+    if (before == prefabInstances_.size())
+        return core::Result<void>::failure({core::ErrorCode::NotFound, "Prefab instance does not exist"});
     return core::Result<void>::success();
 }
 
@@ -355,6 +445,18 @@ core::Result<void> Scene::erase(const EntityId id, const bool recursive)
     }
     std::erase_if(entities_, [&removals](const Entity& entity) {
         return std::find(removals.begin(), removals.end(), entity.id) != removals.end();
+    });
+    for (auto& instance : prefabInstances_)
+    {
+        std::erase_if(instance.sourceToEntity, [&removals](const auto& link) {
+            return std::find(removals.begin(), removals.end(), link.second) != removals.end();
+        });
+        std::erase_if(instance.overrides, [&instance](const auto& overrideValue) {
+            return !instance.sourceToEntity.contains(overrideValue.sourceKey);
+        });
+    }
+    std::erase_if(prefabInstances_, [&removals](const auto& instance) {
+        return std::find(removals.begin(), removals.end(), instance.rootEntity) != removals.end();
     });
     return core::Result<void>::success();
 }

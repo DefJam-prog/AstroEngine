@@ -143,3 +143,7 @@ Astro Scene v4 сериализует ID, Transform, SpriteRenderer и prefab in
 ## Runtime save slots (05.4)
 
 `astro_runtime_save` is an optional Scene-state persistence target. A versioned `SaveProfile` starts empty and explicitly selects individual properties by stable Entity ID; `SaveStore` writes numbered slots with CRC32 integrity checks, a bounded file size, atomic replacement, and `.bak` fallback. Loading validates before applying to a Scene copy. It does not serialize whole scenes or automatically persist anything; supported fields and limits are in [SAVE_SYSTEM.md](SAVE_SYSTEM.md) and [FILE_FORMATS.md](FILE_FORMATS.md).
+
+## Runtime checkpoints and respawn (05.5)
+
+`astro_runtime_checkpoint` detects actor XY entry into code-registered 2D AABBs, applies optional runtime conditions, tracks one-shot/repeatable use, and emits typed events. A definition explicitly chooses position-only or a named SaveProfile/slot. Respawn is called by the host game; selected-profile restore is opt-in and the checkpoint spawn position is applied after save-state load. Definitions/state are runtime-only; no death detector, Scene component, physics trigger, visual area or editor authoring is implied. See [SAVE_SYSTEM.md](SAVE_SYSTEM.md).

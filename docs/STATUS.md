@@ -9,7 +9,7 @@
 | Решение о стеке | Предложение D001 в DECISIONS.md |
 | Слои архитектуры и контракты | Требования раздела 04 записаны в ARCHITECTURE.md и D002; реализация отсутствует |
 | Графический редактор и UX | Требования раздела 05 записаны в EDITOR_UX.md и D003; реализация отсутствует |
-| Save System & Checkpoint Editor | 05.4: selective runtime SaveProfile/slots/checksum/atomic replacement/backup; checkpoint, respawn и editor UI ещё отсутствуют |
+| Save System & Checkpoint Editor | 05.4–05.5: selective slots + runtime checkpoint/respawn; editor authoring и расширенные игровые поля отсутствуют |
 | Игровые системы и расширения | Требования раздела 07 записаны в GAME_SYSTEMS.md и D005; реализация отсутствует, требуется проверенная основа |
 | Шаблоны игр T01–T10 | Требования раздела 08 записаны в GAME_TEMPLATES.md и D006; шаблоны, конструктор и smoke-тесты отсутствуют |
 | Codex / AI Integration и безопасность | Требования раздела 09 записаны в AI_INTEGRATION.md и D007; API, адаптер, sandbox и AI Game Tester не реализованы |
@@ -29,14 +29,15 @@
 | Подэтап 05.2 | GameUiModel для меню/HUD/паузы/настроек; optional SDL3/ImGui demo, не зависит от Editor target |
 | Подэтап 05.3 | Optional match-three rules (`ASTRO_BUILD_PUZZLE_RUNTIME`), scalar animation tracks, SDL synthesized audio cues; нет visual puzzle board или audio asset playback |
 | Подэтап 05.4 | Explicit Entity/property profiles, indexed slots, schema/game version checks, CRC32, atomic write and backup fallback |
-| Сборка и тесты | Windows x64/MSVC Debug: baseline headless 19/19, UI/graphics/audio 24/24; полный 05.4 regression: см. build/05.4-ctest.log |
+| Подэтап 05.5 | Runtime XY checkpoint triggers, callback conditions, one-shot/repeatable use, typed events, opt-in selected-profile respawn |
+| Сборка и тесты | Windows x64/MSVC Debug: baseline optional 25/25, headless 20/20; полный 05.5 regression — optional 26/26, headless 21/21 |
 | Политика проверок и документации | Требования записаны в TESTING.md и D009; это не результаты выполненных тестов |
 | Недостающие документы целевого комплекта | docs/FILE_FORMATS.md, docs/TEMPLATE_GUIDE.md |
 | Совместимость и лицензии зависимостей | Не проверены |
 
 Сборка проверена из Visual Studio 2022 Developer Command Prompt x64; инструменты доступны через среду VS, хотя в обычном PowerShell не все присутствуют в PATH.
 
-00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4 и 05.1–05.4: см. отчёты этапов. Следующий рекомендуемый подэтап — 05.5.
+00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5, 04.1–04.4 и 05.1–05.5: см. отчёты этапов. Следующий рекомендуемый подэтап — 05.6.
 
 ## Подэтап 05.1
 
@@ -53,6 +54,10 @@
 ## Подэтап 05.4
 
 `astro_runtime_save` сохраняет только поля, перечисленные в `SaveProfile`, в слотах под заданным приложением user-data root. Поддержка v1: `entity.name`, scalar Transform fields и `sprite_renderer.visible`. Есть strict format/game/profile selection compatibility, CRC32 corruption detection, ограничение размера, atomic temp replace, `.bak` и backup fallback; отсутствующие объекты/компоненты учитываются в результате. Windows x64/MSVC optional CTest — 25/25 после реализации; headless профиль — 20/20. Миграций, автосохранения, tag/group profiles, checkpoint/respawn и GUI нет. См. [SAVE_SYSTEM.md](SAVE_SYSTEM.md) и [отчёт](reports/05.4.md).
+
+## Подэтап 05.5
+
+`astro_runtime_checkpoint` отслеживает вход actor в XY area зарегистрированных checkpoint entities, evaluates optional condition callbacks and publishes typed activation/rejection/respawn events. Supports one-shot/repeatable, position-only and SaveProfile-backed activation. Selected-profile respawn is opt-in, atomic with the runtime Scene copy, and finally sets checkpoint spawn position. Windows x64/MSVC full CTest: **26/26** optional and **21/21** headless. Definitions/runtime state are not scene-serialized; no death detection, editor UI, physics collision query, visual/sound, no-code conditions, health/inventory policies. См. [SAVE_SYSTEM.md](SAVE_SYSTEM.md) и [отчёт](reports/05.5.md).
 
 ## Подэтап 02.1
 Добавлен optional astro_editor: окно, docking, меню и project.astro. Создание проекта отказывает для существующего каталога до каких-либо изменений; файл записывается во временный файл и публикуется без замены. Некорректное открытие не меняет активный проект. На завершении 02.1 CTest 6/6, включая smoke этих сценариев. См. [отчёт 02.1](reports/02.1.md).

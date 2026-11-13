@@ -24,6 +24,35 @@ auto loaded = saves.value().load(0, runtimeScene, profile.value(), "1.0.0");
 
 Включение модуля: `-DASTRO_BUILD_SAVE_RUNTIME=ON`; при `BUILD_TESTING=ON` target включается для тестов. Хранилище не выбирает платформенный каталог автоматически: приложение должно передать user-data directory. Пользователь сам отвечает за его размещение и backup вне одного слота.
 
+## Реализованный Checkpoint v1 (05.5)
+
+`CheckpointSystem` регистрирует runtime-only definition для существующей Entity с Transform. Activation area — axis-aligned 2D half-width/half-height вокруг текущей XY-позиции Entity; Z и parent/world transform не учитываются. Actor активирует checkpoint при переходе снаружи внутрь. Условие — optional C++ callback `Result<bool>(const Scene&, actorId)`. Отказ условия или ошибки профиля/записи дают `Rejected`; успешный переход публикует typed `Activated` event. Пока actor остаётся внутри, событие повторно не вызывается. При leave/re-enter `Repeatable` может сработать снова, `OneShot` остаётся потраченным.
+
+Два режима разделены явно:
+
+- `RespawnOnly`: переключает активную точку, не вызывает SaveStore и не пишет поля.
+- `SaveSelectedProfile`: при активации требует явные `SaveStore` и существующий SaveProfile, записывает выбранные им поля в назначенный слот; ошибка отклоняет активацию.
+
+Вызов `respawn` производится приложением после своей логики смерти. `RespawnRules` выбирает `PositionOnly` или `SelectedProfile`. По умолчанию — только позиция; выбранный профиль можно восстановить лишь для активного checkpoint в режиме `SaveSelectedProfile`. Сначала профиль применяется к Scene-копии, затем actor получает явную `respawnPosition`; при ошибке исходный runtime Scene не меняется. Без активного checkpoint используется заданный fallback position. Typed `Respawned` event публикуется после применения.
+
+```cpp
+astro::runtime::CheckpointSystem checkpoints;
+astro::runtime::CheckpointDefinition definition;
+definition.entity = checkpointEntity;
+definition.area = {2.0, 1.5};
+definition.respawnPosition = {10.0, 4.0, 0.0};
+definition.mode = astro::runtime::CheckpointMode::SaveSelectedProfile;
+definition.saveProfileId = "puzzle-progress";
+definition.slot = 0;
+checkpoints.registerCheckpoint(playScene, definition);
+
+checkpoints.update(playScene, playerEntity, events, &saveContext);
+checkpoints.respawn(playScene, playerEntity,
+    {astro::runtime::RespawnRestoreMode::SelectedProfile, {}}, events, &saveContext);
+```
+
+Build option: `-DASTRO_BUILD_CHECKPOINT_RUNTIME=ON` (также включает `astro_runtime_save`); при `BUILD_TESTING=ON` модуль собирается для теста. Это не сериализованный Scene component, автоматическое обнаружение смерти, GUI/визуальный checkpoint, physics trigger, health/inventory respawn policy или no-code condition graph. Runtime caller должен регистрировать систему против Play Scene, не authoring Scene.
+
 ## Выбор сохраняемых данных
 
 Разработчик сам выбирает объекты, компоненты и отдельные свойства, которые сохраняются. Автоматически сохранять весь мир без явного выбора профиля или правил запрещено.
@@ -80,7 +109,7 @@ Checkpoint — объект сцены с ID, областью активаци�
 
 ## Обязательные сценарии проверки
 
-Проверки, выполненные для v1:
+Проверки, выполненные для Save v1:
 
 - Выборочная запись имени, Transform X и `SpriteRenderer.visible`; исключённая Transform Y и другие entity остаются без изменений.
 - Round-trip выбранных полей и повторная загрузка без создания entity-дубликатов.
@@ -97,7 +126,9 @@ Checkpoint — объект сцены с ID, областью активаци�
 - Неверную версию сохранения и диагностику несовместимости.
 - Повторную загрузку одного сохранения без непредусмотренного накопления состояния или дублирования объектов.
 - Повреждённый файл и диагностику загрузки.
-- Смерть и respawn с отдельно заданными правилами (05.5).
+- Проверка восстановления при повторном запуске приложения/exported runtime.
+- Смерть и respawn с настройками здоровья/инвентаря и выбранными группами полей (компоненты пока отсутствуют).
+- GUI checkpoint authoring, визуальная область, звук и editor test tools.
 - Полный отдельный process restart/export smoke; в 05.4 проверен reopen `SaveStore` на существующем user-data directory.
 - Выборочную запись: выбранные поля сохраняются, исключённые не попадают в сохранение.
 

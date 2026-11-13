@@ -129,7 +129,7 @@
 Приёмка: подтверждённые сборки на реальных целевых toolchains;
 Windows не должен ломаться. Не обещать iOS-сборку на Windows без Mac.
 
-02.1–03.5, 04.1–04.4 и 05.1–05.4 реализованы в пределах ограничений [отчётов](reports/). Следующий рекомендуемый подэтап — 05.5 (Checkpoint v1), только после отдельного подтверждения пользователя.
+02.1–03.5, 04.1–04.4 и 05.1–05.5 реализованы в пределах ограничений [отчётов](reports/). Следующий рекомендуемый подэтап — 05.6 (Windows runtime packaging), только после отдельного подтверждения пользователя.
 
 ## Подэтап 03.5 — граф ресурсов и детерминированный package
 
@@ -158,3 +158,7 @@ Windows не должен ломаться. Не обещать iOS-сборку
 ## Подэтап 05.4 — Save System v1
 
 Добавлен `astro_runtime_save`: ручные numbered slots, явно перечисляемые profile fields, game/profile/schema metadata, CRC32, ограничение размера, временная запись, атомарная замена, `.bak` и fallback при повреждении основного слота. В v1 доступны Name, scalar Transform и SpriteRenderer visibility; нет автоматического сохранения, schema migrations, tag/group rules, checkpoint/respawn, editor UI или платформенного выбора user-data root. См. [SAVE_SYSTEM.md](SAVE_SYSTEM.md), [FILE_FORMATS.md](FILE_FORMATS.md), [отчёт](reports/05.4.md).
+
+## Подэтап 05.5 — Checkpoint v1
+
+Добавлен runtime-only `CheckpointSystem` с XY area entry, условиями C++ callback, typed Activated/Rejected/Respawned events, one-shot/repeatable поведением и явным respawn. `RespawnOnly` не пишет сохранения; `SaveSelectedProfile` требует зарегистрированный profile и слот из `SaveStore`. Restore выбранного профиля отключён по умолчанию и после load выставляет respawn position. Нет scene/editor authoring, world-space/physics triggers, death detection, sound/visuals, no-code conditions или health/inventory rules. Подробности: [SAVE_SYSTEM.md](SAVE_SYSTEM.md), [отчёт](reports/05.5.md).

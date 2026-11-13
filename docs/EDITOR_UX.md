@@ -44,3 +44,7 @@ Scene View, Game View, Hierarchy, Inspector, Asset Browser, Console/Diagnostics,
 Реализация опирается на механизм свойств, Typed Command API, Undo/Redo, модель сцен и ресурсов из архитектурных требований. Выбор конкретных библиотек остаётся предварительным согласно [TECH_STACK.md](TECH_STACK.md).
 
 При реализации соответствующих подэтапов необходимо проверять эквивалентность GUI и команд, Undo/Redo и сохранность несохранённых правок. GUI Inspector применяет Name через `entity.set_property` Command API; интеграционные и smoke-тесты это проверяют. Полноценный редактор, визуальные эталоны и ручная UX-проверка мышью пока отсутствуют.
+
+## Камеры (04.3)
+
+В 04.3 реализован programmatic runtime CameraRig API для pose/follow и параметров. Это не renderer и не визуально проверенная камера. Для изображения необходима последующая интеграция с Game View/runtime renderer; требования к camera modes описаны выше.

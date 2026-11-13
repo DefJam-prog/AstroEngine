@@ -237,3 +237,9 @@ AssetId назначается монотонно и сохраняется в �
 - Action bindings and state aggregation stay independent of SDL/window APIs; input adapters submit physical state to `InputMapping`.
 - The initial SDL3 adapter translates event-queue key scancodes, mouse buttons/motion/wheel, and gamepad buttons/axes/removal. It remains optional with the editor target and is not linked into headless core.
 - No persistent user profile, remapping UI, device enumeration/ownership, vibration, or non-Windows adapter is claimed. Device behavior was validated with synthetic SDL events only.
+
+## D028 — Runtime Camera Rig pose and follow contract (04.3)
+
+- Camera mode presets produce a tested world-space pose convention; target follow uses the target entity's stored Transform position plus world-space offset.
+- Smoothing is exponential and frame-delta aware; optional bounds clamp both desired and resulting camera position. Zoom is a scalar range, not a projection/FOV contract.
+- No look-at except FirstPerson's rotation inheritance, world-transform hierarchy composition, projection matrices, Scene camera component, serialization, renderer adapter, or editor UI is claimed. The rig is useful/testable pose logic but not a rendered camera feature.

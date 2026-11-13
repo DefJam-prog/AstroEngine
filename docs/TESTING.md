@@ -156,3 +156,7 @@ Windows x64, MSVC 14.44, Debug, BGFX D3D11: `cmake --build build/stack-spike --p
 ## 04.2 результаты
 
 `input.mapping.unit` проверяет bindings, alternative sources, signed axes, deadzone, digital edge transitions, frame reset, transient mouse delta, invalid controls and device clearing. `input.sdl.adapter.smoke` injects SDL3 key, mouse, wheel, gamepad button/axis, removal, and window-focus-loss events without physical hardware. Windows x64/MSVC Debug build successful; full CTest **16/16**. `editor.smoke` passed regression. Physical keyboard/mouse/controller interaction and non-Windows adapters were not tested.
+
+## 04.3 результаты
+
+`camera.rig.unit` проверяет Custom pose, mode presets, target follow, frame-delta smoothing, zero/invalid delta, bounds, zoom clamp, rotation inheritance, missing target and invalid settings without changing pose. Полный CTest — 17/17; `editor.smoke`/graphics regression прошли, но camera image output отсутствует, так как renderer ещё не подключён.

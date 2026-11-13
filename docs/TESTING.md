@@ -142,3 +142,7 @@ Windows x64, MSVC 14.44, Debug, BGFX D3D11: `cmake --build build/stack-spike --p
 ## 03.4 результаты
 
 Полная Windows x64/MSVC Debug сборка успешна; CTest 13/13. `prefab.unit` покрывает локальные ID, parent, root и hierarchy cycle validation. `prefab.integration` проверяет file round-trip, nested instantiate, graph cycle rejection без изменения Scene, Scene v4 persistence, command Undo/Redo, prefab source update, сохранение EntityId и override, повторное update после загрузки. См. `build/03.4-build.log` и `build/03.4-ctest.log`. Нет отдельного editor smoke для prefab authoring, так как UI в 03.4 не добавлялся.
+
+## 03.5 результаты
+
+`assets.registry.integration` теперь проверяет graph save/load, cycle rejection, closure, упаковку reachable assets, повторное использование cache, ремонт повреждённого артефакта и различие target tag. Полная MSVC Debug сборка прошла; CTest 13/13. `build/03.5-build.log` и `build/03.5-ctest.log`. Не проверялись межплатформенная сборка, декодирование/перекодирование текстур и визуальные golden images: код сохраняет байты исходных image payload.

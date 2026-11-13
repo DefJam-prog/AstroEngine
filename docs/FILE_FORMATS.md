@@ -50,3 +50,9 @@ END
 Пути и quoted strings сериализуются через `std::quoted`. Значения ID положительные; `NEXT` больше всех занятых ID. Дубликаты ID и source path, неверный hash/размер/путь/format, неизвестная версия, лишние строки и повреждённый UTF-8 отклоняются. Индекс ограничен 16 MiB, 100000 asset entries и 4096 UTF-8 байт на source path. Сохранение использует временный файл и атомарную замену. Повреждённый индекс остаётся нетронутым и возвращает ошибку.
 
 Кэшированный файл находится в `Library/Assets/<sha256>.v1.<png|jpg>`. Сейчас он побайтно равен encoded source и восстанавливается через импорт; старые хэш-версии не удаляются. `Library/` добавлен в `.gitignore`; `.astro/assets.index` сохраняется в проекте.
+
+## Asset dependencies v1 и package v1 (03.5)
+
+`.astro/assets.dependencies` — UTF-8 text: `ASTRO_DEPENDENCIES 1`, затем отсортированные `NODE <asset-id> <count>` и `DEP <asset-id>` строки, завершённые `END`. Циклы, нулевые ID, дубликаты, неизвестная версия, неверная структура и лишние данные отклоняются. Лимиты: 16 MiB, 100000 узлов, 500000 связей. Граф содержит только явно записанные AssetId связи.
+
+`Library/Derived/<platform>/<sha256>.v1.astro-pack` — бинарный детерминированный контейнер: ASCII `ASTRO_PACK`, little-endian version (u32), длина и UTF-8 platform tag, число записей, далее для каждой записи ID (u64), формат (u32: 1 PNG/2 JPEG), width/height (u32), длина (u64), 64 ASCII hex SHA-256 и payload. Порядок записей — возрастание AssetId; предел — 1 GiB. Hash включает target tag и все package bytes. Atomic replacement используется для публикации; аварийный временный файл может сохраниться. Target tags не подтверждают платформенную совместимость или оптимизацию.

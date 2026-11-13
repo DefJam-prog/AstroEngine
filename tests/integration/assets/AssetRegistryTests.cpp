@@ -1,4 +1,5 @@
 #include "astro/assets/AssetRegistry.hpp"
+#include "astro/assets/AssetBuild.hpp"
 
 #include <algorithm>
 #include <array>
@@ -145,12 +146,34 @@ int main()
         if (imported)
         {
             const auto reference = imported.value();
+            AssetDependencyGraph graph;
+            const auto jpegReference = registry.importImage(std::filesystem::path("background.jpeg"));
+            check(jpegReference && graph.addDependency(reference.id, jpegReference.value().id), "record a direct asset dependency");
+            check(!graph.addDependency(jpegReference.value().id, reference.id), "reject a dependency cycle");
+            const auto graphPath = root / ".astro" / "assets.dependencies";
+            check(static_cast<bool>(graph.save(graphPath)), "persist dependency graph");
+            auto loadedGraph = AssetDependencyGraph::load(graphPath);
+            check(loadedGraph && loadedGraph.value().closure({reference.id})
+                && loadedGraph.value().closure({reference.id}).value().size() == 2, "load graph and resolve transitive closure");
+            if (!loadedGraph) throw std::runtime_error("dependency graph fixture failed to load");
+            auto package = buildAssetPackage(registry, loadedGraph.value(), {reference.id}, AssetPlatform::Windows);
+            check(package && package.value().assetCount == 2 && !package.value().reused, "build platform-tagged package of reachable assets");
+            if (package) {
+                const auto firstHash = package.value().sha256;
+                auto again = buildAssetPackage(registry, loadedGraph.value(), {reference.id}, AssetPlatform::Windows);
+                check(again && again.value().reused && again.value().sha256 == firstHash, "reuse identical derived package");
+                writeBytes(package.value().path, {'b','a','d'});
+                auto repaired = buildAssetPackage(registry, loadedGraph.value(), {reference.id}, AssetPlatform::Windows);
+                check(repaired && !repaired.value().reused && readBytes(repaired.value().path).size() > 3, "replace a corrupted derived package");
+                auto otherTarget = buildAssetPackage(registry, loadedGraph.value(), {reference.id}, AssetPlatform::Android);
+                check(otherTarget && otherTarget.value().sha256 != firstHash, "target label participates in package bytes");
+            }
             check(reference.sha256.size() == 64, "record a SHA-256 content digest");
             check(std::filesystem::exists(registry.cachedPath(reference.id)), "write encoded image to project cache");
             check(readBytes(registry.cachedPath(reference.id)) == originalSourceBytes, "cache preserves source bytes");
             check(readBytes(pngPath) == originalSourceBytes, "import does not modify the source image");
             auto repeated = registry.importImage(utf8Path(u8"картинка.png"));
-            check(repeated && repeated.value().id == reference.id && registry.entries().size() == 1,
+            check(repeated && repeated.value().id == reference.id && registry.entries().size() == 2,
                 "repeat import reuses the stable asset ID");
 
             writeBytes(pngPath, makePng(2, 1));
@@ -160,6 +183,13 @@ int main()
             check(reimported && reimported.value().id == reference.id && reimported.value().width == 2
                 && reimported.value().sha256 != reference.sha256,
                 "reimport updates metadata and content while preserving Asset ID");
+            if (reimported && package)
+            {
+                auto rebuilt = buildAssetPackage(registry, loadedGraph.value(), {reference.id}, AssetPlatform::Windows);
+                check(rebuilt && rebuilt.value().sha256 != package.value().sha256
+                    && loadedGraph.value().dependenciesOf(reference.id) == std::vector<AssetId>{jpegReference.value().id},
+                    "reimport preserves graph references and rebuilds changed package bytes");
+            }
             check(readBytes(pngPath) == makePng(2, 1), "reimport leaves updated source bytes untouched");
             if (reimported)
             {

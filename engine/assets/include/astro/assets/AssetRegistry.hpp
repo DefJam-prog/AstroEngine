@@ -49,6 +49,7 @@ public:
     [[nodiscard]] const AssetReference* find(AssetId id) const noexcept;
     [[nodiscard]] std::vector<AssetId> missingAssets() const;
     [[nodiscard]] std::filesystem::path cachedPath(AssetId id) const;
+    [[nodiscard]] const std::filesystem::path& projectRoot() const noexcept { return projectRoot_; }
     [[nodiscard]] const std::map<AssetId, AssetReference>& entries() const noexcept { return entries_; }
 
 private:

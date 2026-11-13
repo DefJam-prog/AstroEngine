@@ -107,3 +107,7 @@ Save System & Checkpoint Editor — обязательный модуль про
 Каждая `Entity` содержит обязательный `TransformComponent` версии 1 и может содержать один `SpriteRendererComponent` версии 1 с AssetId и видимостью. `ComponentId` уникален в пределах сцены и сохраняется вместе с сущностью; удалённые ID не переиспользуются в течение жизни сцены. Transform хранит локальные position, Euler rotation и scale; матрицы и пространственная композиция пока не реализованы. Неизвестные типы файла дают ошибку диагностики.
 
 Astro Scene v4 сериализует ID, Transform, SpriteRenderer и prefab instance metadata. Загрузчик читает v1–v3, а сохранение явно мигрированной сцены создаёт v4. Формат и миграционное правило: [FILE_FORMATS.md](FILE_FORMATS.md).
+
+## Derived resources и dependency graph (03.5)
+
+`astro_assets` теперь включает явный `AssetDependencyGraph` и детерминированный сбор reachable AssetId в content-addressed `Library/Derived` package. Это слой между registry и будущим export; он не анализирует Scene/Prefab зависимости автоматически, не перекодирует картинки и не считается кроссплатформенным runtime/export.

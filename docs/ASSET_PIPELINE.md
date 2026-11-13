@@ -34,3 +34,11 @@ const auto cachePath = assets.cachedPath(reference.id);
 `.astro/assets.index` записывается во временный файл, созданный эксклюзивно, и атомарно заменяется. На Windows применяются `MoveFileExW` с replace/write-through; переносимость и свойства прочих файловых систем пока не проверены. `cachedPath(id)` возвращает путь только к текущему обычному файлу внутри кэша, иначе пустой путь.
 
 На 03.3 `astro.SpriteRenderer` хранит AssetId и visible; `entity.set_sprite_renderer` поддерживает транзакционный Undo/Redo, а Astro Scene v3 сохраняет ссылку. Windows Editor предлагает ручной Assets-relative PNG/JPEG import, preview выбранного спрайта через WIC/BGFX и показывает missing source/AssetId. WIC ограничивает preview по размерам и пиксельному бюджету; importer metadata validation и codec decoding — отдельные уровни проверки. Нет runtime/spatial renderer, platform adapter кроме Windows, asset browser drag-and-drop, dependency graph, importer plugins, watch service, automatic reimport или очистки старого кэша.
+
+## Граф зависимостей и пакет 03.5
+
+`AssetDependencyGraph` хранит явные связи AssetId -> AssetId, запрещает нулевые ID и циклы, вычисляет отсортированное транзитивное замыкание и сохраняется в `.astro/assets.dependencies` (`ASTRO_DEPENDENCIES 1`). Сцены/prefabs не анализируются автоматически: граф заполняет вызывающий код.
+
+`buildAssetPackage(registry, graph, roots, platform)` включает только корни и их зависимости, сверяет зарегистрированный ID, исходник и cache по размеру/SHA-256 и записывает детерминированный пакет в `Library/Derived/<platform>/<sha256>.v1.astro-pack`. Совпадающий пакет переиспользуется, повреждённый артефакт атомарно заменяется. PNG/JPEG payload остаётся исходными encoded байтами.
+
+Метки `windows`, `macos`, `android`, `ios` — только имена профилей. Нет перекодирования, оптимизации, платформенных codec/runtime adapters, сборки или проверки других платформ. Это cache/package prototype, а не готовый Export.

@@ -25,14 +25,14 @@
 | Подэтап 01.4 | Typed CommandRegistry, версия/type checks, validation, execute/result и audit реализованы; unit-тесты добавлены |
 | Подэтап 01.5 | In-memory transactions, transactional commands, Undo/Redo, rollback/barrier semantics реализованы; unit-тесты добавлены |
 | Исходники и API | Core API 01.1–01.5; Scene v4 читает v1–v3; Transform, SpriteRenderer и prefab instance metadata; `astro_prefabs` с nested prefab, source mapping, overrides, update API и транзакционными командами |
-| Сборка и тесты | Windows x64/MSVC Debug сборка успешна; итоговый CTest 13/13; логи build/03.4-build.log, build/03.4-ctest.log |
+| Сборка и тесты | Windows x64/MSVC Debug сборка успешна; итоговый CTest 13/13; текущие логи build/03.5-build.log, build/03.5-ctest.log |
 | Политика проверок и документации | Требования записаны в TESTING.md и D009; это не результаты выполненных тестов |
 | Недостающие документы целевого комплекта | docs/FILE_FORMATS.md, docs/TEMPLATE_GUIDE.md |
 | Совместимость и лицензии зависимостей | Не проверены |
 
 Сборка проверена из Visual Studio 2022 Developer Command Prompt x64; инструменты доступны через среду VS, хотя в обычном PowerShell не все присутствуют в PATH.
 
-00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4 и 03.1–03.4: см. отчёты этапов. Следующий рекомендуемый подэтап — 03.5.
+00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4 и 03.1–03.5: см. отчёты этапов. Следующий рекомендуемый подэтап — 04.1.
 
 ## Подэтап 02.1
 Добавлен optional astro_editor: окно, docking, меню и project.astro. Создание проекта отказывает для существующего каталога до каких-либо изменений; файл записывается во временный файл и публикуется без замены. Некорректное открытие не меняет активный проект. На завершении 02.1 CTest 6/6, включая smoke этих сценариев. См. [отчёт 02.1](reports/02.1.md).
@@ -57,3 +57,6 @@ Astro Scene v1 сохраняет ID, имя сцены, иерархию и и�
 
 ## Подэтап 03.1
 Каждая сущность получает один обязательный `astro.Transform` версии 1 с устойчивым в пределах сцены Component ID, позицией, вращением Эйлера в градусах и масштабом. Astro Scene v2 записывает Transform и ID; файлы v1 мигрируют к значениям по умолчанию. CTest 9/9; ограничения — [отчёт 03.1](reports/03.1.md).
+
+## Подэтап 03.5
+`AssetDependencyGraph` сохраняет явные связи AssetId с cycle checks. Пакет строится по выбранному dependency closure, проверяет source/cache hash и использует target tags с детерминированным content hash и повторным использованием. Исходники остаются неизменны; payload — исходный PNG/JPEG, платформенная конвертация и Export/runtime loader отсутствуют. CTest 13/13. См. [отчёт 03.5](reports/03.5.md).

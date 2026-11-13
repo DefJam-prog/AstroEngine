@@ -219,3 +219,9 @@ AssetId назначается монотонно и сохраняется в �
 - Scene v4 stores each instance root, flattened source key → EntityId mapping and explicit typed Name/Transform/SpriteRenderer overrides. v1/v2/v3 scenes still load and upgrade only on explicit save.
 - Update computes/prevalidates the new graph on a Scene copy, keeps IDs for source keys that still exist and applies base values before overrides. Overrides whose source key disappears reject the update; the live Scene stays unchanged. Removed prefab nodes with non-prefab children also reject rather than delete those children.
 - `prefab.instantiate`, `prefab.set_override`, and `prefab.update_instance` are transactional. Undo/Redo keeps full Scene snapshots for this early implementation; memory use scales with scene size. Editor authoring UI and merge of simultaneous source/instance edits remain future work.
+
+## D025 — Asset dependency graph and derived package prototype (03.5)
+
+- Dependency edges are explicit AssetId links; scene/prefab dependency extraction is not automatic yet. Cycles and invalid IDs are rejected; the sorted transitive closure is deterministic.
+- The initial package preserves validated encoded PNG/JPEG bytes and metadata, tags a target profile in the content hash, and writes beneath ignored `Library/Derived`. Cache reuse requires exact byte equality; damaged output is atomically replaced.
+- Target tags do not claim platform codec compatibility. Texture transcoding, platform toolchain builds, runtime package loading, and full game export remain separate work. No external dependency was added.

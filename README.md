@@ -62,3 +62,7 @@ ctest --preset windows-debug
 Подэтап 03.5: реализованы явный граф AssetId и target-tagged deterministic package из выбранных ресурсов и зависимостей. Формат сохраняет исходные PNG/JPEG bytes; см. [pipeline](docs/ASSET_PIPELINE.md) и [отчёт](docs/reports/03.5.md). Это не полноценный платформенный экспорт.
 
 Подэтап 04.1: появился headless `RuntimeSession` с изолированной Scene-копией и Play/Pause/Resume/Step/Stop. Проверки и границы: [runtime API](docs/RUNTIME.md), [отчёт 04.1](docs/reports/04.1.md). Редакторские кнопки, рендеринг и игровые системы пока не подключены.
+
+Подэтап 04.2: добавлены backend-neutral actions и optional SDL3 adapter для keyboard/mouse/gamepad событий. Тесты и ограничения: [Input Mapping API](docs/INPUT_MAPPING.md), [отчёт 04.2](docs/reports/04.2.md). Профили ввода, editor UI назначения клавиш и другие платформенные adapters не входят в эту реализацию.
+
+Подэтап 04.2: backend-neutral Input Mapping и optional SDL3 adapter для клавиатуры, мыши и геймпада; [описание API](docs/INPUT_MAPPING.md), [отчёт](docs/reports/04.2.md).

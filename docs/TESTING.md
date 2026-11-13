@@ -152,3 +152,7 @@ Windows x64, MSVC 14.44, Debug, BGFX D3D11: `cmake --build build/stack-spike --p
 ## 04.1 результаты
 
 `core.unit` покрывает fixed-step TimeService и paused manual step. `runtime.session.unit` проверяет копирование Scene, неизменность authoring state, переходы, число шагов, Pause/Resume/Step/Stop, ошибки Result и исключения callback. Windows x64/MSVC Debug сборка успешна; полный CTest: 14/14. `editor.smoke` прошёл регрессионно, но Play UI не реализован.
+
+## 04.2 результаты
+
+`input.mapping.unit` проверяет bindings, alternative sources, signed axes, deadzone, digital edge transitions, frame reset, transient mouse delta, invalid controls and device clearing. `input.sdl.adapter.smoke` injects SDL3 key, mouse, wheel, gamepad button/axis, removal, and window-focus-loss events without physical hardware. Windows x64/MSVC Debug build successful; full CTest **16/16**. `editor.smoke` passed regression. Physical keyboard/mouse/controller interaction and non-Windows adapters were not tested.

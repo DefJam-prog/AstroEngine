@@ -25,14 +25,14 @@
 | Подэтап 01.4 | Typed CommandRegistry, версия/type checks, validation, execute/result и audit реализованы; unit-тесты добавлены |
 | Подэтап 01.5 | In-memory transactions, transactional commands, Undo/Redo, rollback/barrier semantics реализованы; unit-тесты добавлены |
 | Исходники и API | Core API 01.1–01.5; Scene v4 читает v1–v3; Transform, SpriteRenderer и prefab instance metadata; `astro_prefabs` с nested prefab, source mapping, overrides, update API и транзакционными командами |
-| Сборка и тесты | Windows x64/MSVC Debug сборка успешна; CTest 14/14 после 04.1; логи build/04.1-build.log, build/04.1-ctest.log |
+| Сборка и тесты | Windows x64/MSVC Debug сборка успешна; CTest 16/16 после 04.2; логи build/04.2-build.log, build/04.2-ctest.log |
 | Политика проверок и документации | Требования записаны в TESTING.md и D009; это не результаты выполненных тестов |
 | Недостающие документы целевого комплекта | docs/FILE_FORMATS.md, docs/TEMPLATE_GUIDE.md |
 | Совместимость и лицензии зависимостей | Не проверены |
 
 Сборка проверена из Visual Studio 2022 Developer Command Prompt x64; инструменты доступны через среду VS, хотя в обычном PowerShell не все присутствуют в PATH.
 
-00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5 и 04.1: см. отчёты этапов. Следующий рекомендуемый подэтап — 04.2.
+00.1/00.2, 00.3, 01.1–01.5, 02.1–02.4, 03.1–03.5 и 04.1–04.2: см. отчёты этапов. Следующий рекомендуемый подэтап — 04.3.
 
 ## Подэтап 02.1
 Добавлен optional astro_editor: окно, docking, меню и project.astro. Создание проекта отказывает для существующего каталога до каких-либо изменений; файл записывается во временный файл и публикуется без замены. Некорректное открытие не меняет активный проект. На завершении 02.1 CTest 6/6, включая smoke этих сценариев. См. [отчёт 02.1](reports/02.1.md).
@@ -63,3 +63,6 @@ Astro Scene v1 сохраняет ID, имя сцены, иерархию и и�
 
 ## Подэтап 04.1
 `astro::runtime::RuntimeSession` добавлен как headless runtime contract. Scene копируется при Play, фиксированный callback вызывается только по шагам TimeService; Pause suppresses ticks, Step продвигает один шаг под паузой, Stop освобождает runtime-копию. Callback failures переводят сессию в Faulted. CTest 14/14; renderer/input/editor controls/game systems отсутствуют. См. [отчёт 04.1](reports/04.1.md).
+
+## Подэтап 04.2
+`astro_runtime_input` содержит независимые от SDL actions, digital/analog state, alternate bindings, scales/deadzone и edge states. Optional `astro_runtime_sdl_input` адаптирует SDL3 events keyboard/mouse/gamepad в общий API. Полный CTest — 16/16; physical devices и platform adapters кроме Windows не проверялись. UI для настройки bindings и сохранение профилей отсутствуют. См. [INPUT_MAPPING.md](INPUT_MAPPING.md) и [отчёт 04.2](reports/04.2.md).

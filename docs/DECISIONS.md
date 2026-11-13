@@ -231,3 +231,9 @@ AssetId назначается монотонно и сохраняется в �
 - Play owns a deep value-copy of the authoring Scene. Runtime callbacks cannot mutate editor state unless external state is captured by the callback; that remains the caller's responsibility.
 - Runtime Session controls fixed-tick dispatch and explicit Stopped/Playing/Paused/Faulted states. Manual single-step is legal only while paused and advances the simulation clock once.
 - A callback error faults the session and retains the runtime Scene for inspection; Stop clears it. Rendering, input, editor controls, and actual game systems are not implied by this controller.
+
+## D027 — Input Mapping and SDL3 adapter (04.2)
+
+- Action bindings and state aggregation stay independent of SDL/window APIs; input adapters submit physical state to `InputMapping`.
+- The initial SDL3 adapter translates event-queue key scancodes, mouse buttons/motion/wheel, and gamepad buttons/axes/removal. It remains optional with the editor target and is not linked into headless core.
+- No persistent user profile, remapping UI, device enumeration/ownership, vibration, or non-Windows adapter is claimed. Device behavior was validated with synthetic SDL events only.

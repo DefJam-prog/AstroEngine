@@ -31,7 +31,8 @@ else()
 endif()
 
 add_executable(astro_game_ui_demo main.cpp)
-target_link_libraries(astro_game_ui_demo PRIVATE astro_runtime_sdl_game_ui astro_runtime_sdl_audio)
+target_link_libraries(astro_game_ui_demo PRIVATE astro_runtime_sdl_game_ui astro_runtime_sdl_audio
+    astro_runtime_puzzle astro_runtime_puzzle_save)
 target_compile_features(astro_game_ui_demo PRIVATE cxx_std_20)
 if(MSVC)
     target_compile_options(astro_game_ui_demo PRIVATE /W4 /permissive- /Zc:__cplusplus /utf-8)
@@ -52,9 +53,21 @@ if(ASTRO_BUILD_WINDOWS_RUNTIME_PACKAGE)
         DESTINATION licenses RENAME SDL3-LICENSE.txt)
     install(FILES "${ASTRO_SPIKE_DEPS}/imgui/LICENSE.txt"
         DESTINATION licenses RENAME Dear-ImGui-LICENSE.txt)
+    install(DIRECTORY "${PROJECT_SOURCE_DIR}/samples/ПазлКампания/Puzzle"
+        DESTINATION game-data/puzzle-campaign)
+    install(FILES launch_puzzle_campaign.cmd DESTINATION ".")
 endif()
 
 if(BUILD_TESTING)
+    add_test(NAME runtime.game_ui.puzzle.smoke COMMAND astro_game_ui_demo --smoke-puzzle)
+    set_tests_properties(runtime.game_ui.puzzle.smoke PROPERTIES
+        LABELS "smoke;runtime;gameplay;puzzle;ui" TIMEOUT 30 RUN_SERIAL TRUE)
+
+    add_test(NAME runtime.game_ui.campaign.smoke COMMAND astro_game_ui_demo --project-root
+        "${PROJECT_SOURCE_DIR}/samples/ПазлКампания" --campaign starter --smoke)
+    set_tests_properties(runtime.game_ui.campaign.smoke PROPERTIES
+        LABELS "smoke;runtime;gameplay;puzzle;campaign;ui" TIMEOUT 30 RUN_SERIAL TRUE)
+
     add_test(NAME runtime.game_ui.visual.smoke COMMAND astro_game_ui_demo --smoke
         "${PROJECT_SOURCE_DIR}/tests/visual/game_ui_main_menu.bmp")
     set_tests_properties(runtime.game_ui.visual.smoke PROPERTIES

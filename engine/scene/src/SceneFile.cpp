@@ -48,7 +48,7 @@ std::string serialize(const Scene& scene)
     std::ostringstream output;
     output.imbue(std::locale::classic());
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
-    output << "ASTRO_SCENE 4\nSCENE " << scene.id() << ' ' << std::quoted(scene.name()) << '\n';
+    output << "ASTRO_SCENE 6\nSCENE " << scene.id() << ' ' << std::quoted(scene.name()) << '\n';
     for (const auto& entity : scene.entities())
         output << "ENTITY " << entity.id << ' ' << entity.parent.value_or(0) << ' '
                << std::quoted(entity.name) << '\n';
@@ -65,6 +65,18 @@ std::string serialize(const Scene& scene)
             output << "COMPONENT " << entity.spriteRenderer->id << ' ' << entity.id << ' '
                    << std::quoted("astro.SpriteRenderer") << ' ' << entity.spriteRenderer->schemaVersion << ' '
                    << entity.spriteRenderer->texture.value << ' ' << (entity.spriteRenderer->visible ? 1 : 0) << '\n';
+    for (const auto& entity : scene.entities())
+        if (entity.meshRenderer)
+            output << "COMPONENT " << entity.meshRenderer->id << ' ' << entity.id << ' '
+                   << std::quoted("astro.MeshRenderer") << ' ' << entity.meshRenderer->schemaVersion << ' '
+                   << entity.meshRenderer->model.value << ' ' << entity.meshRenderer->meshIndex << ' '
+                   << entity.meshRenderer->primitiveIndex << ' ' << (entity.meshRenderer->visible ? 1 : 0) << '\n';
+    for (const auto& entity : scene.entities())
+        for (const auto& behavior : entity.scriptBehaviors)
+            output << "COMPONENT " << behavior.id << ' ' << entity.id << ' '
+                   << std::quoted("astro.ScriptBehavior") << ' ' << behavior.schemaVersion << ' '
+                   << behavior.scriptAsset.value << ' ' << (behavior.enabled ? 1 : 0) << ' '
+                   << std::quoted(behavior.managedTypeName) << '\n';
     for (const auto& instance : scene.prefabInstances())
     {
         output << "PREFAB_INSTANCE " << instance.rootEntity << ' ' << instance.prefab << ' '
@@ -218,7 +230,7 @@ core::Result<Scene> loadSceneFile(const std::filesystem::path& file)
     std::string magic;
     if (!(header >> magic >> version) || hasExtra(header) || magic != "ASTRO_SCENE")
         return fileError(core::ErrorCode::ParseError, "Invalid scene file header");
-    if (version < 1 || version > 4)
+    if (version < 1 || version > 6)
         return fileError(core::ErrorCode::VersionMismatch, "Unsupported scene file version");
 
     if (!nextLine()) return fileError(core::ErrorCode::ParseError, "Scene metadata is missing");
@@ -283,6 +295,29 @@ core::Result<Scene> loadSceneFile(const std::filesystem::path& file)
                 if (!(record >> assetId >> visible) || visible > 1 || hasExtra(record))
                     return fileError(core::ErrorCode::ParseError, "Invalid SpriteRenderer component record");
                 owner->spriteRenderer = SpriteRendererComponent{componentId, componentVersion, {assetId}, visible != 0};
+            }
+            else if (type == "astro.MeshRenderer" && version >= 6)
+            {
+                if (owner->meshRenderer)
+                    return fileError(core::ErrorCode::AlreadyExists, "Entity contains duplicate MeshRenderer components");
+                std::uint64_t assetId = 0;
+                std::uint32_t meshIndex = 0;
+                std::uint32_t primitiveIndex = 0;
+                unsigned visible = 0;
+                if (!(record >> assetId >> meshIndex >> primitiveIndex >> visible) || visible > 1 || hasExtra(record))
+                    return fileError(core::ErrorCode::ParseError, "Invalid MeshRenderer component record");
+                owner->meshRenderer = MeshRendererComponent{componentId, componentVersion, {assetId},
+                    meshIndex, primitiveIndex, visible != 0};
+            }
+            else if (type == "astro.ScriptBehavior" && version >= 5)
+            {
+                std::uint64_t assetId = 0;
+                unsigned enabled = 0;
+                std::string managedTypeName;
+                if (!(record >> assetId >> enabled >> std::quoted(managedTypeName)) || enabled > 1 || hasExtra(record))
+                    return fileError(core::ErrorCode::ParseError, "Invalid ScriptBehavior component record");
+                owner->scriptBehaviors.push_back({componentId, componentVersion, {assetId},
+                    std::move(managedTypeName), enabled != 0});
             }
             else
                 return fileError(core::ErrorCode::ValidationError, "Unknown component type: " + type);

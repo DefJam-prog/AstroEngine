@@ -1,5 +1,7 @@
 #include "astro/assets/AssetRegistry.hpp"
 #include "astro/assets/AssetBuild.hpp"
+#include "CSharpPlayApproval.hpp"
+#include "astro/scene/Scene.hpp"
 
 #include <algorithm>
 #include <array>
@@ -8,8 +10,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -100,6 +104,16 @@ std::vector<unsigned char> readBytes(const std::filesystem::path& path)
 {
     std::ifstream input(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+std::string hashBytes(const std::vector<unsigned char>& bytes)
+{
+    return astro::assets::sha256Hex(std::span<const std::uint8_t>(bytes.data(), bytes.size()));
+}
+
+void writeText(const std::filesystem::path& path, const std::string& text)
+{
+    writeBytes(path, std::vector<unsigned char>(text.begin(), text.end()));
 }
 
 std::filesystem::path utf8Path(const std::u8string_view value)
@@ -257,6 +271,218 @@ int main()
         check(!registry.importImage(std::filesystem::path("bad.png")), "reject invalid PNG chunk checksum");
         check(!registry.importImage(std::filesystem::path("bad.jpg")), "reject JPEG without a frame header");
         check(!registry.reimport({999999}), "report a missing Asset ID");
+
+        const auto scriptSource = root / utf8Path(u8"Scripts/Gameplay/Игрок.cs");
+        const auto scriptOutput = root / "Library" / "Scripts";
+        std::filesystem::create_directories(scriptSource.parent_path());
+        std::filesystem::create_directories(scriptOutput);
+        const std::string sourceText = "namespace Игра; public sealed class Игрок { }\n";
+        const std::vector<unsigned char> sourceBytes(sourceText.begin(), sourceText.end());
+        const auto assemblyPath = scriptOutput / "GameScripts.dll";
+        const auto runtimeConfigPath = scriptOutput / "GameScripts.runtimeconfig.json";
+        writeBytes(scriptSource, sourceBytes);
+        writeBytes(assemblyPath, {'M','Z'});
+        writeBytes(runtimeConfigPath, {'{','}','\n'});
+        auto script = registry.registerScript(utf8Path(u8"Scripts/Gameplay/Игрок.cs"),
+            "Игра.Игрок", std::filesystem::path("Library/Scripts/GameScripts.dll"),
+            std::filesystem::path("Library/Scripts/GameScripts.runtimeconfig.json"));
+        check(script && script.value().id.value > importedJpeg.value().id.value,
+            "allocate a globally unique AssetId for a script after image assets");
+        check(script && registry.findScript(script.value().id)
+            && registry.find(script.value().id) == nullptr,
+            "keep the script record typed and disjoint from image lookup");
+        auto resolvedScript = script ? registry.resolveScript(script.value().id)
+            : astro::core::Result<ResolvedScriptAsset>::failure({astro::core::ErrorCode::NotFound, "script fixture failed"});
+        check(resolvedScript && resolvedScript.value().managedTypeName == "Игра.Игрок"
+            && resolvedScript.value().sourcePath == std::filesystem::canonical(scriptSource)
+            && resolvedScript.value().assemblyPath == std::filesystem::canonical(assemblyPath)
+            && resolvedScript.value().runtimeConfigPath == std::filesystem::canonical(runtimeConfigPath),
+            "resolve the stable script AssetId to bounded source, assembly, runtimeconfig and UTF-8 type");
+        check(!registry.registerScript(utf8Path(u8"Scripts/Gameplay/Игрок.cs"), "Игра. Другой",
+                std::filesystem::path("Library/Scripts/../Scripts/GameScripts.dll"),
+                std::filesystem::path("Library/Scripts/GameScripts.runtimeconfig.json")),
+            "reject traversal in a managed assembly path");
+        check(!registry.registerScript(utf8Path(u8"Scripts/Gameplay/Игрок.cs"), "Игра. Игрок",
+                std::filesystem::path("Library/Scripts/GameScripts.dll"),
+                std::filesystem::path("Library/Scripts/GameScripts.runtimeconfig.json")),
+            "reject whitespace in a managed type name");
+        if (script)
+        {
+            auto changedSource = sourceBytes;
+            changedSource.push_back(' ');
+            writeBytes(scriptSource, changedSource);
+            auto staleScript = registry.resolveScript(script.value().id);
+            check(!staleScript && staleScript.error().code == astro::core::ErrorCode::InvalidState,
+                "refuse to resolve an assembly after its registered source changed");
+            writeBytes(scriptSource, sourceBytes);
+            std::filesystem::remove(assemblyPath, error);
+            check(!registry.resolveScript(script.value().id), "diagnose a missing compiled script assembly");
+            writeBytes(assemblyPath, {'M','Z'});
+            auto reopenedScripts = AssetRegistry::open(root);
+            check(reopenedScripts && reopenedScripts.value().findScript(script.value().id)
+                && reopenedScripts.value().resolveScript(script.value().id),
+                "round-trip script asset mapping while preserving its global AssetId");
+        }
+        auto updatedScript = registry.registerScript(utf8Path(u8"Scripts/Gameplay/Игрок.cs"),
+            "Игра.ИгрокОбновлённый", std::filesystem::path("Library/Scripts/GameScripts.dll"),
+            std::filesystem::path("Library/Scripts/GameScripts.runtimeconfig.json"));
+        check(script && updatedScript && updatedScript.value().id == script.value().id
+            && registry.resolveScript(script.value().id).value().managedTypeName == "Игра.ИгрокОбновлённый",
+            "update the managed type binding without changing the script AssetId");
+
+        const auto additionalScript = std::string("namespace Игра; public sealed class Ввод { }\n");
+        const std::u8string additionalRelativeU8 = u8"Scripts/Gameplay/Ввод.cs";
+        const std::string additionalRelative(reinterpret_cast<const char*>(additionalRelativeU8.data()), additionalRelativeU8.size());
+        const auto additionalSource = root / utf8Path(additionalRelativeU8);
+        writeText(additionalSource, additionalScript);
+        const auto manifest = std::string("{\"schemaVersion\":1,\"sdkVersion\":\"10.0.404\",\"targetFramework\":\"net10.0\",\"assemblyName\":\"GameScripts\",\"scriptBindings\":[")
+            + "{\"sourcePath\":\"Scripts/Gameplay/Игрок.cs\",\"managedTypeName\":\"Игра.ИгрокОбновлённый\"},"
+            + "{\"sourcePath\":\"Scripts/Gameplay/Ввод.cs\",\"managedTypeName\":\"Игра.Ввод\"}]}\n";
+        writeText(root / ".astro" / "csharp-build.json", manifest);
+        const auto scriptSourceBytesForBuild = readBytes(scriptSource);
+        const auto additionalBytes = readBytes(additionalSource);
+        const auto assemblyBytes = readBytes(assemblyPath);
+        const auto runtimeConfigBytes = readBytes(runtimeConfigPath);
+        std::ostringstream buildState;
+        buildState << "ASTRO_CSHARP_PROJECT_BUILD 1\n"
+            << "FINGERPRINT " << std::string(64, 'a') << "\n"
+            << "MANIFEST_SHA256 " << hashBytes(std::vector<unsigned char>(manifest.begin(), manifest.end())) << "\n"
+            << "SDK_VERSION \"10.0.404\"\nTARGET_FRAMEWORK \"net10.0\"\nASSEMBLY_NAME \"GameScripts\"\n"
+            << "ASSEMBLY_PATH \"Library/Scripts/GameScripts.dll\"\nASSEMBLY_SHA256 " << hashBytes(assemblyBytes) << "\n"
+            << "RUNTIME_CONFIG_PATH \"Library/Scripts/GameScripts.runtimeconfig.json\"\nRUNTIME_CONFIG_SHA256 "
+            << hashBytes(runtimeConfigBytes) << "\nSOURCE_COUNT 2\n"
+            << "SOURCE " << std::quoted(std::string("Scripts/Gameplay/Игрок.cs")) << ' ' << hashBytes(scriptSourceBytesForBuild) << "\n"
+            << "SOURCE " << std::quoted(additionalRelative) << ' ' << hashBytes(additionalBytes) << "\n"
+            << "BINDING_COUNT 2\n"
+            << "BINDING \"Scripts/Gameplay/Игрок.cs\" \"Игра.ИгрокОбновлённый\"\n"
+            << "BINDING " << std::quoted(additionalRelative) << " \"Игра.Ввод\"\nEND\n";
+        const auto buildStateText = buildState.str();
+        writeText(scriptOutput / "asset-bindings.state", buildStateText);
+        const auto buildStateJson = std::string("{\"schemaVersion\":2,\"assetStatePath\":\"Library/Scripts/asset-bindings.state\",\"assetStateSha256\":\"")
+            + hashBytes(std::vector<unsigned char>(buildStateText.begin(), buildStateText.end())) + "\"}\n";
+        writeText(scriptOutput / "build-state.json", buildStateJson);
+        const auto buildReport = registry.inspectScriptBuild();
+        if (buildReport.freshness != ScriptBuildFreshness::Current)
+            for (const auto& diagnostic : buildReport.diagnostics) std::cerr << "C# handoff: " << diagnostic << '\n';
+        check(buildReport.freshness == ScriptBuildFreshness::Current && buildReport.bindings.size() == 2
+            && buildReport.requiresRegistration,
+            "inspect a fresh C# build handoff and report an unregistered explicit binding");
+        check(buildReport.bindings[1].diagnostic
+                == "Managed type is selected but not registered in the project asset index",
+            "explain which binding is missing from the asset registry");
+        auto registeredBuild = registry.registerScriptsFromBuild();
+        if (!registeredBuild) std::cerr << "C# handoff registration: " << registeredBuild.error().message << '\n';
+        check(registeredBuild && registeredBuild.value().size() == 2
+            && registeredBuild.value()[0].id == script.value().id
+            && registry.findScript(registeredBuild.value()[1].id)
+            && registry.inspectScriptBuild().freshness == ScriptBuildFreshness::Current
+            && !registry.inspectScriptBuild().requiresRegistration,
+            "explicitly register build bindings atomically while retaining stable script AssetIds");
+        if (registeredBuild && !registeredBuild.value().empty())
+        {
+            astro::scene::Scene approvalScene(9001, "Consent fixture Ω");
+            const auto actor = approvalScene.createEntity("Actor");
+            const auto behavior = actor ? approvalScene.addScriptBehavior(actor.value(),
+                registeredBuild.value()[0].id, registeredBuild.value()[0].managedTypeName) :
+                astro::core::Result<astro::scene::ComponentId>::failure(
+                    {astro::core::ErrorCode::InvalidState, "Could not create approval fixture entity"});
+            const auto snapshot = behavior ? astro::editor::CSharpPlayApproval::capture(
+                approvalScene, root / "Scenes" / "consent.astro-scene", registry) :
+                astro::core::Result<astro::editor::CSharpPlayApprovalSnapshot>::failure(
+                    {astro::core::ErrorCode::InvalidState, "Could not create approval fixture behavior"});
+            astro::editor::CSharpPlayApproval approval;
+            const auto granted = snapshot ? approval.approve(snapshot.value(), snapshot.value()) :
+                astro::core::Result<void>::failure(snapshot.error());
+            check(snapshot && snapshot.value().scripts.size() == 1
+                && snapshot.value().scripts[0].sourceSha256 == registeredBuild.value()[0].sourceSha256
+                && snapshot.value().assemblySha256 == buildReport.assemblySha256
+                && snapshot.value().runtimeConfigSha256 == buildReport.runtimeConfigSha256
+                && granted && approval.isApprovedFor(snapshot.value()),
+                "capture and approve the exact registered ScriptBehavior against real build hashes");
+        }
+        auto mismatchedBinding = registry.registerScript(utf8Path(u8"Scripts/Gameplay/Игрок.cs"),
+            "Игра.ИгрокСтарый", std::filesystem::path("Library/Scripts/GameScripts.dll"),
+            std::filesystem::path("Library/Scripts/GameScripts.runtimeconfig.json"));
+        const auto mismatchReport = registry.inspectScriptBuild();
+        check(mismatchedBinding && mismatchReport.freshness == ScriptBuildFreshness::Current
+            && !mismatchReport.bindings.empty() && !mismatchReport.bindings[0].registered
+            && mismatchReport.bindings[0].diagnostic
+                == "Registered managed type differs from the current build binding; register the current build",
+            "diagnose a registered managed type that disagrees with the latest build manifest");
+        const auto repairedBindings = registry.registerScriptsFromBuild();
+        const auto repairedReport = registry.inspectScriptBuild();
+        check(repairedBindings && repairedBindings.value().size() == 2
+            && repairedBindings.value()[0].id == script.value().id
+            && repairedReport.freshness == ScriptBuildFreshness::Current
+            && !repairedReport.requiresRegistration && repairedReport.bindings[0].diagnostic.empty(),
+            "explicitly synchronize a mismatched binding while preserving its AssetId");
+
+        auto changedSourceForRegistry = sourceBytes;
+        changedSourceForRegistry.push_back(' ');
+        writeBytes(scriptSource, changedSourceForRegistry);
+        const auto staleHashRegistration = registry.registerScript(utf8Path(u8"Scripts/Gameplay/Игрок.cs"),
+            "Игра.ИгрокОбновлённый", std::filesystem::path("Library/Scripts/GameScripts.dll"),
+            std::filesystem::path("Library/Scripts/GameScripts.runtimeconfig.json"));
+        writeBytes(scriptSource, sourceBytes);
+        const auto hashMismatchReport = registry.inspectScriptBuild();
+        check(staleHashRegistration && hashMismatchReport.freshness == ScriptBuildFreshness::Current
+            && !hashMismatchReport.bindings[0].registered
+            && hashMismatchReport.bindings[0].diagnostic
+                == "Registered source hash differs from the current build; register the current build",
+            "diagnose a registered source hash that differs from the successful build");
+        const auto hashRepair = registry.registerScriptsFromBuild();
+        check(hashRepair && hashRepair.value()[0].id == script.value().id,
+            "repair a stale source hash through the explicit build registration action");
+
+        writeBytes(scriptOutput / "OldGeneration.dll", {'M','Z'});
+        writeBytes(scriptOutput / "OldGeneration.runtimeconfig.json", {'{','}','\n'});
+        const auto oldOutputRegistration = registry.registerScript(utf8Path(u8"Scripts/Gameplay/Игрок.cs"),
+            "Игра.ИгрокОбновлённый", std::filesystem::path("Library/Scripts/OldGeneration.dll"),
+            std::filesystem::path("Library/Scripts/OldGeneration.runtimeconfig.json"));
+        const auto outputMismatchReport = registry.inspectScriptBuild();
+        check(oldOutputRegistration && outputMismatchReport.freshness == ScriptBuildFreshness::Current
+            && !outputMismatchReport.bindings[0].registered
+            && outputMismatchReport.bindings[0].diagnostic
+                == "Registered assembly output differs from the current build; register the current build",
+            "diagnose a registered assembly generation that differs from the successful build");
+        const auto outputRepair = registry.registerScriptsFromBuild();
+        check(outputRepair && outputRepair.value()[0].id == script.value().id
+            && !registry.inspectScriptBuild().requiresRegistration,
+            "repair output path drift through explicit registration without changing the script AssetId");
+
+        writeText(scriptOutput / "asset-bindings.state", buildStateText + " ");
+        check(registry.inspectScriptBuild().freshness == ScriptBuildFreshness::Stale,
+            "detect a handoff changed after the builder recorded its digest");
+        writeText(scriptOutput / "asset-bindings.state", buildStateText);
+        const auto syncedBuildReport = registry.inspectScriptBuild();
+        check(syncedBuildReport.freshness == ScriptBuildFreshness::Current,
+            "keep build freshness separate from AssetRegistry synchronization state");
+
+        const auto legacyRoot = root / "legacy-v1";
+        std::filesystem::create_directory(legacyRoot);
+        auto legacyRegistry = AssetRegistry::open(legacyRoot);
+        check(legacyRegistry.hasValue(), "create project fixture for v1 index migration");
+        const auto legacyIndex = legacyRoot / ".astro" / "assets.index";
+        const std::string legacyContents = "ASTRO_ASSETS 1\nNEXT 1\nEND\n";
+        writeBytes(legacyIndex, std::vector<unsigned char>(legacyContents.begin(), legacyContents.end()));
+        auto legacyOpened = AssetRegistry::open(legacyRoot);
+        check(legacyOpened && readBytes(legacyIndex) == std::vector<unsigned char>(legacyContents.begin(), legacyContents.end()),
+            "read an existing v1 asset index without rewriting it on open");
+        std::filesystem::create_directories(legacyRoot / "Scripts");
+        std::filesystem::create_directories(legacyRoot / "Library" / "Scripts");
+        writeBytes(legacyRoot / "Scripts" / "Legacy.cs", {'c','l','a','s','s',' ','L','e','g','a','c','y',' ','{','}','\n'});
+        writeBytes(legacyRoot / "Library" / "Scripts" / "Legacy.dll", {'M','Z'});
+        writeBytes(legacyRoot / "Library" / "Scripts" / "Legacy.runtimeconfig.json", {'{','}','\n'});
+        if (legacyOpened)
+        {
+            auto migrated = legacyOpened.value().registerScript("Scripts/Legacy.cs", "Legacy.Script",
+                "Library/Scripts/Legacy.dll", "Library/Scripts/Legacy.runtimeconfig.json");
+            const auto migratedBytes = readBytes(legacyIndex);
+            check(migrated && migrated.value().id.value == 1
+                && std::string(migratedBytes.begin(), migratedBytes.end()).starts_with("ASTRO_ASSETS 3\n")
+                && AssetRegistry::open(legacyRoot).value().resolveScript({1}),
+                "upgrade the shared index to v2 only on explicit script registration and resolve legacy project files");
+        }
         const auto indexPath = root / ".astro" / "assets.index";
         writeBytes(indexPath, {'B','A','D','\n'});
         check(!AssetRegistry::open(root), "reject corrupt index without silently replacing it");

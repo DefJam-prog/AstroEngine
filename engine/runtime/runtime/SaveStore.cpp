@@ -33,6 +33,8 @@ namespace
 constexpr std::size_t maxProfileIdBytes = 64;
 constexpr std::size_t maxGameVersionBytes = 64;
 constexpr std::size_t maxSavedProperties = 100000;
+constexpr std::size_t maxCustomKeyBytes = 128;
+constexpr std::size_t maxCustomStringBytes = 65536;
 
 core::Error saveError(const core::ErrorCode code, std::string message)
 {
@@ -45,6 +47,15 @@ bool isSafeToken(const std::string_view value)
     return std::all_of(value.begin(), value.end(), [](const unsigned char character) {
         return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z')
             || (character >= '0' && character <= '9') || character == '.' || character == '_' || character == '-';
+    });
+}
+
+bool isSafeCustomKey(const std::string_view value)
+{
+    if (value.empty() || value.size() > maxCustomKeyBytes) return false;
+    return std::all_of(value.begin(), value.end(), [](const unsigned char ch) {
+        return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+            || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-';
     });
 }
 
@@ -76,6 +87,7 @@ struct SaveDocument
     SaveSlotInfo info;
     std::uint32_t profileFingerprint = 0;
     std::vector<SaveRecord> records;
+    SaveCustomState customRecords;
 };
 
 std::uint32_t crc32(const std::string_view data)
@@ -107,6 +119,8 @@ std::uint32_t profileFingerprint(const SaveProfile& profile)
         for (const auto& property : properties)
             source << entity << ' ' << std::quoted(property) << '\n';
     }
+    for (const auto& [key, value] : profile.customFields())
+        source << "CUSTOM " << std::quoted(key) << ' ' << value.index() << '\n';
     return crc32(source.str());
 }
 
@@ -130,6 +144,18 @@ core::Result<std::string> encodeDocument(const SaveDocument& document)
             output << "D " << *number;
         else output << "B " << (std::get<bool>(record.value) ? 1 : 0);
         output << '\n';
+    }
+    if (document.formatVersion >= 2)
+    {
+        output << "CUSTOM_RECORDS " << document.customRecords.size() << '\n';
+        for (const auto& [key, value] : document.customRecords)
+        {
+            output << "CUSTOM " << std::quoted(key) << ' ';
+            if (const auto* text = std::get_if<std::string>(&value)) output << "S " << std::quoted(*text);
+            else if (const auto* number = std::get_if<double>(&value)) output << "D " << *number;
+            else output << "B " << (std::get<bool>(value) ? 1 : 0);
+            output << '\n';
+        }
     }
     output << "END\n";
     if (!output) return core::Result<std::string>::failure(saveError(core::ErrorCode::InternalError, "Could not serialize save document"));
@@ -162,7 +188,7 @@ core::Result<SaveDocument> parseDocument(const std::string_view bytes)
     std::string token, fingerprintText;
     if (!(input >> token >> document.formatVersion) || token != "ASTRO_SAVE")
         return core::Result<SaveDocument>::failure(saveError(core::ErrorCode::ParseError, "Save header is missing or malformed"));
-    if (document.formatVersion != 1)
+    if (document.formatVersion != 1 && document.formatVersion != 2)
         return core::Result<SaveDocument>::failure(saveError(core::ErrorCode::VersionMismatch, "Unsupported save format version"));
     if (!(input >> token >> document.info.slot >> document.info.scene >> std::quoted(document.info.profileId)
             >> document.info.profileVersion >> fingerprintText >> std::quoted(document.info.gameVersion)
@@ -215,11 +241,48 @@ core::Result<SaveDocument> parseDocument(const std::string_view bytes)
         else return core::Result<SaveDocument>::failure(saveError(core::ErrorCode::TypeMismatch, "Save value type does not match field"));
         document.records.push_back(std::move(record));
     }
+    document.info.propertyCount = count;
+    if (document.formatVersion >= 2)
+    {
+        std::size_t customCount = 0;
+        if (!(input >> token >> customCount) || token != "CUSTOM_RECORDS"
+            || customCount > maxSavedProperties - count)
+            return core::Result<SaveDocument>::failure(saveError(core::ErrorCode::ParseError, "Custom save record count is invalid"));
+        for (std::size_t index = 0; index < customCount; ++index)
+        {
+            std::string key, type;
+            if (!(input >> token >> std::quoted(key) >> type) || token != "CUSTOM"
+                || !isSafeCustomKey(key) || document.customRecords.contains(key))
+                return core::Result<SaveDocument>::failure(saveError(core::ErrorCode::ParseError, "Custom save record is invalid"));
+            if (type == "S")
+            {
+                std::string value;
+                if (!(input >> std::quoted(value)) || value.size() > maxCustomStringBytes)
+                    return core::Result<SaveDocument>::failure(saveError(core::ErrorCode::ParseError, "Custom string is malformed or too large"));
+                document.customRecords.emplace(std::move(key), std::move(value));
+            }
+            else if (type == "D")
+            {
+                double value = 0.0;
+                if (!(input >> value) || !std::isfinite(value))
+                    return core::Result<SaveDocument>::failure(saveError(core::ErrorCode::ParseError, "Custom number is invalid"));
+                document.customRecords.emplace(std::move(key), value);
+            }
+            else if (type == "B")
+            {
+                int value = -1;
+                if (!(input >> value) || (value != 0 && value != 1))
+                    return core::Result<SaveDocument>::failure(saveError(core::ErrorCode::ParseError, "Custom boolean is invalid"));
+                document.customRecords.emplace(std::move(key), value != 0);
+            }
+            else return core::Result<SaveDocument>::failure(saveError(core::ErrorCode::TypeMismatch, "Unknown custom save value type"));
+        }
+        document.info.propertyCount += customCount;
+    }
     if (!(input >> token) || token != "END")
         return core::Result<SaveDocument>::failure(saveError(core::ErrorCode::ParseError, "Save file terminator is missing"));
     input >> std::ws;
     if (!input.eof()) return core::Result<SaveDocument>::failure(saveError(core::ErrorCode::ParseError, "Unexpected data after save terminator"));
-    document.info.propertyCount = count;
     return core::Result<SaveDocument>::success(std::move(document));
 }
 
@@ -327,6 +390,16 @@ core::Result<void> validateExpected(const SaveDocument& document, const std::siz
             || std::find(selected->second.begin(), selected->second.end(), record.property) == selected->second.end())
             return core::Result<void>::failure(saveError(core::ErrorCode::ValidationError, "Save contains a field outside the selected profile"));
     }
+    if (document.customRecords.size() != profile.customFields().size())
+        return core::Result<void>::failure(saveError(core::ErrorCode::VersionMismatch, "Save custom fields do not match selected profile"));
+    for (const auto& [key, value] : document.customRecords)
+    {
+        const auto selected = profile.customFields().find(key);
+        if (selected == profile.customFields().end() || selected->second.index() != value.index())
+            return core::Result<void>::failure(saveError(core::ErrorCode::VersionMismatch, "Save custom field type or selection differs from profile"));
+    }
+    if (!profile.customFields().empty() && document.formatVersion < 2)
+        return core::Result<void>::failure(saveError(core::ErrorCode::VersionMismatch, "Save format does not contain selected custom fields"));
     return core::Result<void>::success();
 }
 
@@ -419,6 +492,26 @@ core::Result<void> SaveProfile::removeField(const scene::EntityId entity, const 
     return core::Result<void>::success();
 }
 
+core::Result<void> SaveProfile::addCustomField(std::string key, SaveCustomValue typeExample)
+{
+    if (!isSafeCustomKey(key))
+        return core::Result<void>::failure(saveError(core::ErrorCode::InvalidArgument, "Custom save field key is invalid"));
+    if (const auto* number = std::get_if<double>(&typeExample); number && !std::isfinite(*number))
+        return core::Result<void>::failure(saveError(core::ErrorCode::InvalidArgument, "Custom save numeric type example must be finite"));
+    if (const auto* text = std::get_if<std::string>(&typeExample); text && text->size() > maxCustomStringBytes)
+        return core::Result<void>::failure(saveError(core::ErrorCode::InvalidArgument, "Custom save string type example is too large"));
+    if (!customFields_.emplace(std::move(key), std::move(typeExample)).second)
+        return core::Result<void>::failure(saveError(core::ErrorCode::AlreadyExists, "Custom save field is already selected"));
+    return core::Result<void>::success();
+}
+
+core::Result<void> SaveProfile::removeCustomField(const std::string_view key)
+{
+    if (customFields_.erase(std::string(key)) == 0)
+        return core::Result<void>::failure(saveError(core::ErrorCode::NotFound, "Custom save field was not selected"));
+    return core::Result<void>::success();
+}
+
 core::Result<SaveStore> SaveStore::open(std::filesystem::path directory,
     const std::size_t slotCount, const std::size_t maximumFileBytes)
 {
@@ -434,6 +527,21 @@ core::Result<SaveStore> SaveStore::open(std::filesystem::path directory,
     return core::Result<SaveStore>::success(SaveStore(std::move(directory), slotCount, maximumFileBytes));
 }
 
+core::Result<SaveSlotInspection> SaveStore::inspectExistingSlot(const std::filesystem::path& directory,
+    const std::size_t slot, const std::size_t maximumFileBytes)
+{
+    constexpr std::size_t maxFileBytes = 16 * 1024 * 1024;
+    if (directory.empty() || slot >= 100 || maximumFileBytes == 0 || maximumFileBytes > maxFileBytes)
+        return core::Result<SaveSlotInspection>::failure(saveError(core::ErrorCode::InvalidArgument,
+            "Save inspection path, slot, or file size limit is invalid"));
+    std::error_code error;
+    if (!std::filesystem::is_directory(directory, error) || error)
+        return core::Result<SaveSlotInspection>::failure(saveError(core::ErrorCode::NotFound,
+            "Existing save directory was not found"));
+    const SaveStore inspector(directory, 100, maximumFileBytes);
+    return inspector.inspectDetailed(slot);
+}
+
 core::Result<std::filesystem::path> SaveStore::slotPath(const std::size_t slot) const
 {
     if (slot >= slotCount_) return core::Result<std::filesystem::path>::failure(saveError(core::ErrorCode::InvalidArgument, "Save slot is outside configured range"));
@@ -443,12 +551,30 @@ core::Result<std::filesystem::path> SaveStore::slotPath(const std::size_t slot) 
 core::Result<SaveWriteResult> SaveStore::save(const std::size_t slot, const scene::Scene& state,
     const SaveProfile& profile, const std::string_view gameVersion) const
 {
+    return save(slot, state, profile, gameVersion, SaveCustomState{});
+}
+
+core::Result<SaveWriteResult> SaveStore::save(const std::size_t slot, const scene::Scene& state,
+    const SaveProfile& profile, const std::string_view gameVersion, const SaveCustomState& customState) const
+{
     const auto targetResult = slotPath(slot);
     if (!targetResult) return core::Result<SaveWriteResult>::failure(targetResult.error());
     if (state.id() == 0 || state.id() == std::numeric_limits<scene::SceneId>::max()
         || profile.schemaVersion() == 0 || !isSafeToken(profile.id()) || gameVersion.empty()
         || gameVersion.size() > maxGameVersionBytes || !isSafeToken(gameVersion))
         return core::Result<SaveWriteResult>::failure(saveError(core::ErrorCode::InvalidArgument, "Save profile or game version is invalid"));
+    if (customState.size() != profile.customFields().size())
+        return core::Result<SaveWriteResult>::failure(saveError(core::ErrorCode::ValidationError, "Custom save state does not match selected profile fields"));
+    for (const auto& [key, value] : customState)
+    {
+        const auto selected = profile.customFields().find(key);
+        if (!isSafeCustomKey(key) || selected == profile.customFields().end() || selected->second.index() != value.index())
+            return core::Result<SaveWriteResult>::failure(saveError(core::ErrorCode::TypeMismatch, "Custom save state contains an unselected key or wrong value type"));
+        if (const auto* number = std::get_if<double>(&value); number && !std::isfinite(*number))
+            return core::Result<SaveWriteResult>::failure(saveError(core::ErrorCode::ValidationError, "Custom save number must be finite"));
+        if (const auto* text = std::get_if<std::string>(&value); text && text->size() > maxCustomStringBytes)
+            return core::Result<SaveWriteResult>::failure(saveError(core::ErrorCode::ValidationError, "Custom save string exceeds size limit"));
+    }
     std::vector<SaveRecord> records;
     std::set<scene::EntityId> missingEntities;
     std::set<scene::EntityId> missingComponents;
@@ -467,7 +593,7 @@ core::Result<SaveWriteResult> SaveStore::save(const std::size_t slot, const scen
             records.push_back({entity, property, std::move(value).value()});
         }
     }
-    if (records.size() > maxSavedProperties)
+    if (records.size() + customState.size() > maxSavedProperties)
         return core::Result<SaveWriteResult>::failure(saveError(core::ErrorCode::ValidationError, "Save profile selects too many fields"));
     std::sort(records.begin(), records.end(), [](const SaveRecord& lhs, const SaveRecord& rhs) {
         return std::tie(lhs.entity, lhs.property) < std::tie(rhs.entity, rhs.property);
@@ -476,11 +602,12 @@ core::Result<SaveWriteResult> SaveStore::save(const std::size_t slot, const scen
     const auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(now).count();
     if (timestamp <= 0) return core::Result<SaveWriteResult>::failure(saveError(core::ErrorCode::InternalError, "System clock returned an invalid save timestamp"));
     SaveDocument document;
-    document.formatVersion = 1;
+    document.formatVersion = customState.empty() ? 1U : 2U;
     document.info = {slot, state.id(), profile.id(), profile.schemaVersion(), std::string(gameVersion),
-        static_cast<std::uint64_t>(timestamp), records.size(), false};
+        static_cast<std::uint64_t>(timestamp), records.size() + customState.size(), false};
     document.profileFingerprint = profileFingerprint(profile);
     document.records = std::move(records);
+    document.customRecords = customState;
     auto encoded = encodeDocument(document);
     if (!encoded) return core::Result<SaveWriteResult>::failure(encoded.error());
     if (encoded.value().size() > maximumFileBytes_)
@@ -510,17 +637,25 @@ core::Result<SaveWriteResult> SaveStore::save(const std::size_t slot, const scen
 
 core::Result<SaveSlotInfo> SaveStore::inspect(const std::size_t slot) const
 {
+    auto detailed = inspectDetailed(slot);
+    if (!detailed) return core::Result<SaveSlotInfo>::failure(detailed.error());
+    return core::Result<SaveSlotInfo>::success(std::move(detailed).value().info);
+}
+
+core::Result<SaveSlotInspection> SaveStore::inspectDetailed(const std::size_t slot) const
+{
     const auto pathResult = slotPath(slot);
-    if (!pathResult) return core::Result<SaveSlotInfo>::failure(pathResult.error());
+    if (!pathResult) return core::Result<SaveSlotInspection>::failure(pathResult.error());
     const auto primary = pathResult.value();
     auto primaryBytes = readFile(primary, maximumFileBytes_);
     if (primaryBytes)
     {
         auto document = parseDocument(primaryBytes.value());
         if (document && document.value().info.slot == slot)
-            return core::Result<SaveSlotInfo>::success(document.value().info);
+            return core::Result<SaveSlotInspection>::success({document.value().info,
+                std::move(document).value().customRecords, primaryBytes.value().size()});
         if (!document && document.error().code == core::ErrorCode::VersionMismatch)
-            return core::Result<SaveSlotInfo>::failure(document.error());
+            return core::Result<SaveSlotInspection>::failure(document.error());
     }
     const auto backupPath = backupFilePath(primary);
     auto backupBytes = readFile(backupPath, maximumFileBytes_);
@@ -531,18 +666,32 @@ core::Result<SaveSlotInfo> SaveStore::inspect(const std::size_t slot) const
         {
             auto info = document.value().info;
             if (info.slot != slot)
-                return core::Result<SaveSlotInfo>::failure(saveError(core::ErrorCode::ValidationError, "Backup metadata slot does not match its file"));
+                return core::Result<SaveSlotInspection>::failure(saveError(core::ErrorCode::ValidationError,
+                    "Backup metadata slot does not match its file"));
             info.fromBackup = true;
-            return core::Result<SaveSlotInfo>::success(std::move(info));
+            return core::Result<SaveSlotInspection>::success({std::move(info),
+                std::move(document).value().customRecords, backupBytes.value().size()});
         }
     }
     if (!primaryBytes && !backupBytes)
-        return core::Result<SaveSlotInfo>::failure(saveError(core::ErrorCode::NotFound, "Save slot is empty"));
-    return core::Result<SaveSlotInfo>::failure(saveError(core::ErrorCode::ValidationError, "Neither save slot nor its backup is valid"));
+        return core::Result<SaveSlotInspection>::failure(saveError(core::ErrorCode::NotFound, "Save slot is empty"));
+    if (!primaryBytes && primaryBytes.error().code != core::ErrorCode::NotFound)
+        return core::Result<SaveSlotInspection>::failure(primaryBytes.error());
+    if (!backupBytes && backupBytes.error().code != core::ErrorCode::NotFound)
+        return core::Result<SaveSlotInspection>::failure(backupBytes.error());
+    return core::Result<SaveSlotInspection>::failure(saveError(core::ErrorCode::ValidationError,
+        "Neither save slot nor its backup is valid"));
 }
 
 core::Result<SaveLoadResult> SaveStore::load(const std::size_t slot, scene::Scene& state,
     const SaveProfile& profile, const std::string_view gameVersion) const
+{
+    SaveCustomState customState;
+    return load(slot, state, profile, gameVersion, customState);
+}
+
+core::Result<SaveLoadResult> SaveStore::load(const std::size_t slot, scene::Scene& state,
+    const SaveProfile& profile, const std::string_view gameVersion, SaveCustomState& customState) const
 {
     const auto pathResult = slotPath(slot);
     if (!pathResult) return core::Result<SaveLoadResult>::failure(pathResult.error());
@@ -586,7 +735,9 @@ core::Result<SaveLoadResult> SaveStore::load(const std::size_t slot, scene::Scen
     }
     result.missingEntities = missingEntities.size();
     result.missingComponents = missingComponents.size();
+    auto customCandidate = document.value().customRecords;
     state = std::move(candidate);
+    customState = std::move(customCandidate);
     return core::Result<SaveLoadResult>::success(std::move(result));
 }
 }

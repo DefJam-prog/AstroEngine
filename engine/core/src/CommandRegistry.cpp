@@ -1,5 +1,6 @@
 #include "astro/core/CommandRegistry.hpp"
 
+#include <algorithm>
 #include <exception>
 
 namespace astro::core
@@ -23,6 +24,21 @@ bool CommandRegistry::isValidId(const std::string& id) noexcept
         segmentStart = false;
     }
     return !segmentStart;
+}
+
+std::vector<RegisteredCommandSchema> CommandRegistry::commandCatalog() const
+{
+    std::vector<RegisteredCommandSchema> catalog;
+    catalog.reserve(commands_.size());
+    for (const auto& [id, command] : commands_)
+    {
+        (void)id;
+        catalog.push_back({command->schema(), command->isTransactional()});
+    }
+    std::sort(catalog.begin(), catalog.end(), [](const auto& left, const auto& right) {
+        return left.schema.id < right.schema.id;
+    });
+    return catalog;
 }
 
 Result<const CommandRegistry::ICommand*> CommandRegistry::find(const std::string& id, const std::uint32_t version,

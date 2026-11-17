@@ -20,10 +20,36 @@
 
 namespace astro::core
 {
+enum class CommandFieldType
+{
+    Utf8String,
+    UnsignedInteger,
+    Boolean,
+    AssetId,
+    StringOrUnsignedInteger
+};
+
+struct CommandFieldSchema
+{
+    std::string id;
+    CommandFieldType type = CommandFieldType::Utf8String;
+    bool required = true;
+    std::string description;
+};
+
 struct CommandSchema
 {
     std::string id;
     std::uint32_t version = 1;
+    std::string description;
+    std::vector<CommandFieldSchema> payloadFields;
+    std::string outputType = "void";
+};
+
+struct RegisteredCommandSchema
+{
+    CommandSchema schema;
+    bool transactional = false;
 };
 
 enum class CommandAuditAction
@@ -187,6 +213,7 @@ public:
 
     [[nodiscard]] std::vector<CommandAuditEntry> auditTrail() const { return audit_; }
     [[nodiscard]] std::size_t commandCount() const noexcept { return commands_.size(); }
+    [[nodiscard]] std::vector<RegisteredCommandSchema> commandCatalog() const;
     Result<void> undo()
     {
         const auto origin = history_.nextUndoOrigin();
@@ -215,6 +242,7 @@ private:
     public:
         virtual ~ICommand() = default;
         [[nodiscard]] virtual std::uint32_t version() const noexcept = 0;
+        [[nodiscard]] virtual const CommandSchema& schema() const noexcept = 0;
         [[nodiscard]] virtual std::type_index payloadType() const noexcept = 0;
         [[nodiscard]] virtual std::type_index outputType() const noexcept = 0;
         [[nodiscard]] virtual bool isTransactional() const noexcept = 0;
@@ -234,6 +262,7 @@ private:
               transactionalExecutor_(std::move(transactionalExecutor)) {}
 
         std::uint32_t version() const noexcept override { return schema_.version; }
+        const CommandSchema& schema() const noexcept override { return schema_; }
         std::type_index payloadType() const noexcept override { return typeid(Payload); }
         std::type_index outputType() const noexcept override { return typeid(Output); }
         bool isTransactional() const noexcept override { return static_cast<bool>(transactionalExecutor_); }

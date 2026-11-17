@@ -55,6 +55,17 @@ bool validName(const std::string_view name)
     return true;
 }
 
+bool validManagedTypeName(const std::string_view name)
+{
+    if (name.empty() || name.size() > 512 || !validUtf8(name)) return false;
+    for (const auto character : name)
+    {
+        const auto byte = static_cast<unsigned char>(character);
+        if (byte <= 0x20 || byte == 0x7F) return false;
+    }
+    return true;
+}
+
 bool validTransform(const Transform& value)
 {
     const auto finite = [](const Vec3& v) {
@@ -124,6 +135,31 @@ core::Result<Scene> restoreScene(const SceneId id, std::string name, std::vector
             if (!componentIds.emplace(sprite.id).second)
                 return core::Result<Scene>::failure({core::ErrorCode::AlreadyExists, "Scene contains a duplicate component ID"});
             maximumComponentId = std::max(maximumComponentId, sprite.id);
+        }
+        if (entity.meshRenderer)
+        {
+            const auto& mesh = *entity.meshRenderer;
+            if (mesh.id == 0 || mesh.id == std::numeric_limits<ComponentId>::max()
+                || mesh.schemaVersion != 1 || mesh.model.value == 0
+                || mesh.model.value == std::numeric_limits<std::uint64_t>::max())
+                return core::Result<Scene>::failure({core::ErrorCode::ValidationError,
+                    "MeshRenderer requires a valid component ID, schema, and model asset ID"});
+            if (!componentIds.emplace(mesh.id).second)
+                return core::Result<Scene>::failure({core::ErrorCode::AlreadyExists,
+                    "Scene contains a duplicate component ID"});
+            maximumComponentId = std::max(maximumComponentId, mesh.id);
+        }
+        for (const auto& script : entity.scriptBehaviors)
+        {
+            if (script.id == 0 || script.id == std::numeric_limits<ComponentId>::max()
+                || script.schemaVersion != 1 || script.scriptAsset.value == 0
+                || script.scriptAsset.value == std::numeric_limits<std::uint64_t>::max()
+                || !validManagedTypeName(script.managedTypeName))
+                return core::Result<Scene>::failure({core::ErrorCode::ValidationError,
+                    "ScriptBehavior requires a valid component ID, schema, script asset ID, and managed type name"});
+            if (!componentIds.emplace(script.id).second)
+                return core::Result<Scene>::failure({core::ErrorCode::AlreadyExists, "Scene contains a duplicate component ID"});
+            maximumComponentId = std::max(maximumComponentId, script.id);
         }
     }
     for (const auto& entity : entities)
@@ -243,6 +279,34 @@ const SpriteRendererComponent* Scene::spriteRenderer(const EntityId entityId) co
     return entity && entity->spriteRenderer ? &*entity->spriteRenderer : nullptr;
 }
 
+const MeshRendererComponent* Scene::meshRenderer(const EntityId entityId) const noexcept
+{
+    const auto* entity = find(entityId);
+    return entity && entity->meshRenderer ? &*entity->meshRenderer : nullptr;
+}
+
+std::span<const ScriptBehaviorComponent> Scene::scriptBehaviors(const EntityId entityId) const noexcept
+{
+    const auto* entity = find(entityId);
+    return entity ? std::span<const ScriptBehaviorComponent>(entity->scriptBehaviors) : std::span<const ScriptBehaviorComponent>{};
+}
+
+ScriptBehaviorComponent* Scene::findScriptBehavior(const ComponentId id) noexcept
+{
+    for (auto& entity : entities_)
+        for (auto& behavior : entity.scriptBehaviors)
+            if (behavior.id == id) return &behavior;
+    return nullptr;
+}
+
+const ScriptBehaviorComponent* Scene::findScriptBehavior(const ComponentId id) const noexcept
+{
+    for (const auto& entity : entities_)
+        for (const auto& behavior : entity.scriptBehaviors)
+            if (behavior.id == id) return &behavior;
+    return nullptr;
+}
+
 core::Result<void> Scene::setSpriteRenderer(const EntityId entityId, const assets::AssetId texture, const bool visible)
 {
     auto* entity = find(entityId);
@@ -267,6 +331,151 @@ core::Result<void> Scene::removeSpriteRenderer(const EntityId entityId)
     auto* entity = find(entityId);
     if (!entity) return core::Result<void>::failure({core::ErrorCode::NotFound, "Entity does not exist"});
     entity->spriteRenderer.reset();
+    return core::Result<void>::success();
+}
+
+core::Result<void> Scene::setMeshRenderer(const EntityId entityId, const assets::AssetId model,
+    const std::uint32_t meshIndex, const std::uint32_t primitiveIndex, const bool visible)
+{
+    auto* entity = find(entityId);
+    if (!entity) return core::Result<void>::failure({core::ErrorCode::NotFound, "Entity does not exist"});
+    if (model.value == 0 || model.value == std::numeric_limits<std::uint64_t>::max())
+        return core::Result<void>::failure({core::ErrorCode::ValidationError,
+            "MeshRenderer requires a valid non-zero model AssetId"});
+    if (entity->meshRenderer)
+    {
+        entity->meshRenderer->model = model;
+        entity->meshRenderer->meshIndex = meshIndex;
+        entity->meshRenderer->primitiveIndex = primitiveIndex;
+        entity->meshRenderer->visible = visible;
+        return core::Result<void>::success();
+    }
+    if (nextComponentId_ == 0 || nextComponentId_ == std::numeric_limits<ComponentId>::max())
+        return core::Result<void>::failure({core::ErrorCode::InvalidState, "Component ID space is exhausted"});
+    entity->meshRenderer = MeshRendererComponent{nextComponentId_++, 1, model, meshIndex, primitiveIndex, visible};
+    return core::Result<void>::success();
+}
+
+core::Result<void> Scene::restoreMeshRenderer(const EntityId entityId, const MeshRendererComponent& component)
+{
+    auto* owner = find(entityId);
+    if (!owner) return core::Result<void>::failure({core::ErrorCode::NotFound, "Entity does not exist"});
+    if (component.id == 0 || component.id == std::numeric_limits<ComponentId>::max()
+        || component.schemaVersion != 1 || component.model.value == 0
+        || component.model.value == std::numeric_limits<std::uint64_t>::max())
+        return core::Result<void>::failure({core::ErrorCode::ValidationError, "MeshRenderer restore record is invalid"});
+    const auto previous = owner->meshRenderer;
+    owner->meshRenderer.reset();
+    bool duplicate = false;
+    for (const auto& entity : entities_)
+    {
+        duplicate = duplicate || std::any_of(entity.components.begin(), entity.components.end(), [&](const auto& item) {
+            return item.id == component.id;
+        });
+        duplicate = duplicate || (entity.spriteRenderer && entity.spriteRenderer->id == component.id);
+        duplicate = duplicate || (entity.meshRenderer && entity.meshRenderer->id == component.id);
+        duplicate = duplicate || std::any_of(entity.scriptBehaviors.begin(), entity.scriptBehaviors.end(), [&](const auto& item) {
+            return item.id == component.id;
+        });
+    }
+    if (duplicate)
+    {
+        owner->meshRenderer = previous;
+        return core::Result<void>::failure({core::ErrorCode::AlreadyExists,
+            "MeshRenderer component ID already exists in the scene"});
+    }
+    owner->meshRenderer = component;
+    nextComponentId_ = std::max(nextComponentId_, component.id + 1);
+    return core::Result<void>::success();
+}
+
+core::Result<void> Scene::removeMeshRenderer(const EntityId entityId)
+{
+    auto* entity = find(entityId);
+    if (!entity) return core::Result<void>::failure({core::ErrorCode::NotFound, "Entity does not exist"});
+    entity->meshRenderer.reset();
+    return core::Result<void>::success();
+}
+
+core::Result<ComponentId> Scene::addScriptBehavior(const EntityId entityId, const assets::AssetId scriptAsset,
+    std::string managedTypeName, const bool enabled)
+{
+    auto* entity = find(entityId);
+    if (!entity)
+        return core::Result<ComponentId>::failure({core::ErrorCode::NotFound, "Entity does not exist"});
+    if (scriptAsset.value == 0 || scriptAsset.value == std::numeric_limits<std::uint64_t>::max()
+        || !validManagedTypeName(managedTypeName))
+        return core::Result<ComponentId>::failure({core::ErrorCode::ValidationError,
+            "ScriptBehavior requires a stable script asset ID and a valid managed type name"});
+    if (nextComponentId_ == 0 || nextComponentId_ == std::numeric_limits<ComponentId>::max())
+        return core::Result<ComponentId>::failure({core::ErrorCode::InvalidState, "Component ID space is exhausted"});
+    const auto componentId = nextComponentId_++;
+    entity->scriptBehaviors.push_back({componentId, 1, scriptAsset, std::move(managedTypeName), enabled});
+    return core::Result<ComponentId>::success(componentId);
+}
+
+core::Result<void> Scene::restoreScriptBehavior(const EntityId entityId,
+    const ScriptBehaviorComponent& component, const std::size_t insertionIndex)
+{
+    auto* entity = find(entityId);
+    if (!entity)
+        return core::Result<void>::failure({core::ErrorCode::NotFound, "Entity does not exist"});
+    if (component.id == 0 || component.id == std::numeric_limits<ComponentId>::max()
+        || component.schemaVersion != 1 || component.scriptAsset.value == 0
+        || component.scriptAsset.value == std::numeric_limits<std::uint64_t>::max()
+        || !validManagedTypeName(component.managedTypeName))
+        return core::Result<void>::failure({core::ErrorCode::ValidationError,
+            "ScriptBehavior restore record is invalid"});
+    for (const auto& owner : entities_)
+    {
+        if (std::any_of(owner.components.begin(), owner.components.end(), [&](const auto& existing) {
+                return existing.id == component.id;
+            }) || (owner.spriteRenderer && owner.spriteRenderer->id == component.id)
+            || (owner.meshRenderer && owner.meshRenderer->id == component.id)
+            || std::any_of(owner.scriptBehaviors.begin(), owner.scriptBehaviors.end(), [&](const auto& existing) {
+                return existing.id == component.id;
+            }))
+            return core::Result<void>::failure({core::ErrorCode::AlreadyExists,
+                "Component ID is already in use"});
+    }
+    if (insertionIndex > entity->scriptBehaviors.size())
+        return core::Result<void>::failure({core::ErrorCode::InvalidArgument,
+            "ScriptBehavior insertion index is outside the component list"});
+    entity->scriptBehaviors.insert(entity->scriptBehaviors.begin()
+        + static_cast<std::ptrdiff_t>(insertionIndex), component);
+    nextComponentId_ = std::max(nextComponentId_, component.id + 1);
+    return core::Result<void>::success();
+}
+
+core::Result<void> Scene::updateScriptBehavior(const EntityId entityId, const ComponentId componentId,
+    const assets::AssetId scriptAsset, std::string managedTypeName, const bool enabled)
+{
+    auto* entity = find(entityId);
+    if (!entity)
+        return core::Result<void>::failure({core::ErrorCode::NotFound, "Entity does not exist"});
+    auto component = std::find_if(entity->scriptBehaviors.begin(), entity->scriptBehaviors.end(),
+        [componentId](const auto& behavior) { return behavior.id == componentId; });
+    if (component == entity->scriptBehaviors.end())
+        return core::Result<void>::failure({core::ErrorCode::NotFound, "ScriptBehavior component does not exist on the entity"});
+    if (scriptAsset.value == 0 || scriptAsset.value == std::numeric_limits<std::uint64_t>::max()
+        || !validManagedTypeName(managedTypeName))
+        return core::Result<void>::failure({core::ErrorCode::ValidationError,
+            "ScriptBehavior requires a stable script asset ID and a valid managed type name"});
+    component->scriptAsset = scriptAsset;
+    component->managedTypeName = std::move(managedTypeName);
+    component->enabled = enabled;
+    return core::Result<void>::success();
+}
+
+core::Result<void> Scene::removeScriptBehavior(const EntityId entityId, const ComponentId componentId)
+{
+    auto* entity = find(entityId);
+    if (!entity)
+        return core::Result<void>::failure({core::ErrorCode::NotFound, "Entity does not exist"});
+    const auto before = entity->scriptBehaviors.size();
+    std::erase_if(entity->scriptBehaviors, [componentId](const auto& behavior) { return behavior.id == componentId; });
+    if (before == entity->scriptBehaviors.size())
+        return core::Result<void>::failure({core::ErrorCode::NotFound, "ScriptBehavior component does not exist on the entity"});
     return core::Result<void>::success();
 }
 

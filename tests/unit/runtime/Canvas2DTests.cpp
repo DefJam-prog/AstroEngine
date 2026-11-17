@@ -22,6 +22,13 @@ int main()
     CHECK(canvas.rectangles().size() == 2);
     CHECK(canvas.addSprite({{42}, {2.0, 3.0}, {0.5, 0.25}, 30.0, {}, 5, true, false}));
     CHECK(canvas.sprites().size() == 1 && canvas.sprites().front().asset.value == 42);
+    Sprite affineSprite;
+    affineSprite.asset = {43};
+    affineSprite.hasWorldCorners = true;
+    affineSprite.worldCorners = {{{-1.0, 1.0}, {1.0, 1.0}, {0.8, -1.0}, {-1.2, -1.0}}};
+    CHECK(canvas.addSprite(affineSprite));
+    affineSprite.worldCorners[2].x = std::numeric_limits<double>::quiet_NaN();
+    CHECK(!canvas.addSprite(affineSprite));
     CHECK(!canvas.addSprite({{}, {}, {1.0, 1.0}, 0.0, {}, 0}));
     CHECK(!canvas.addSprite({{42}, {}, {1.0, 1.0}, std::numeric_limits<double>::infinity(), {}, 0}));
     const auto centered = project(canvas.rectangles().front(), {{0.0, 0.0}, 50.0, 1.0}, {200, 100});
@@ -40,11 +47,13 @@ int main()
     CHECK(!project(canvas.rectangles().front(), {{0.0, 0.0}, 0.0, 1.0}, {200, 100}));
     CHECK(!project(canvas.rectangles().front(), {{0.0, 0.0}, 50.0, 64.1}, {200, 100}));
     CHECK(!project(canvas.rectangles().front(), {{0.0, 0.0}, 50.0, 1.0}, {0, 100}));
+    const auto projectedPoint = projectPoint({2.0, -1.0}, {{1.0, 1.0}, 50.0, 2.0}, {200, 100});
+    CHECK((projectedPoint && projectedPoint.value() == Vec2{200.0, 250.0}));
     for (std::size_t index = canvas.rectangles().size(); index < Canvas2D::maximumRectangles; ++index)
         CHECK(canvas.addRectangle({{0.0, 0.0}, {1.0, 1.0}, {}, 0}));
     CHECK(canvas.rectangles().size() == Canvas2D::maximumRectangles);
     CHECK(!canvas.addRectangle({{0.0, 0.0}, {1.0, 1.0}, {}, 0}));
-    for (std::size_t index = 1; index < Canvas2D::maximumSprites; ++index)
+    for (std::size_t index = canvas.sprites().size(); index < Canvas2D::maximumSprites; ++index)
         CHECK(canvas.addSprite({{static_cast<std::uint64_t>(index)}, {}, {1.0, 1.0}, 0.0, {}, 0}));
     CHECK(canvas.sprites().size() == Canvas2D::maximumSprites);
     CHECK(!canvas.addSprite({{Canvas2D::maximumSprites + 1}, {}, {1.0, 1.0}, 0.0, {}, 0}));

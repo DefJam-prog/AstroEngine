@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <limits>
+#include <locale>
+#include <sstream>
 
 namespace astro::runtime
 {
@@ -44,6 +46,18 @@ core::Result<PuzzleGame> PuzzleGame::create(const std::size_t width, const std::
     if (tileKinds < 3 || tileKinds > 32 || levelTarget == 0)
         return core::Result<PuzzleGame>::failure(puzzleError(core::ErrorCode::InvalidArgument, "Puzzle requires 3..32 tile kinds and a positive level target"));
     return core::Result<PuzzleGame>::success(PuzzleGame(width, height, tileKinds, levelTarget, seed));
+}
+
+core::Result<PuzzleGame> PuzzleGame::create(const PuzzleLevelDefinition& definition)
+{
+    const auto valid = validatePuzzleLevel(definition);
+    if (!valid) return core::Result<PuzzleGame>::failure(valid.error());
+    auto created = create(definition.width, definition.height, definition.seed,
+        definition.tileKinds, definition.targetScore);
+    if (!created) return created;
+    auto game = std::move(created).value();
+    game.tiles_ = definition.initialTiles;
+    return core::Result<PuzzleGame>::success(std::move(game));
 }
 
 std::uint8_t PuzzleGame::tileAt(const GridPosition position) const
@@ -138,5 +152,45 @@ core::Result<PuzzleMoveResult> PuzzleGame::swap(const GridPosition first, const 
         move.levelCompleted = true;
     }
     return core::Result<PuzzleMoveResult>::success(move);
+}
+
+PuzzleSnapshot PuzzleGame::snapshot() const
+{
+    std::ostringstream randomState;
+    randomState.imbue(std::locale::classic());
+    randomState << random_;
+    return {width_, height_, tileKinds_, levelTarget_, score_, level_, tiles_, randomState.str()};
+}
+
+core::Result<PuzzleGame> PuzzleGame::restore(const PuzzleSnapshot& saved)
+{
+    if (saved.width < 3 || saved.height < 3 || saved.width > 64 || saved.height > 64
+        || saved.tileKinds < 3 || saved.tileKinds > 32 || saved.levelTarget == 0 || saved.level == 0
+        || saved.tiles.size() != saved.width * saved.height || saved.randomState.empty())
+        return core::Result<PuzzleGame>::failure(puzzleError(core::ErrorCode::ValidationError,
+            "Puzzle snapshot metadata is invalid"));
+    if (std::any_of(saved.tiles.begin(), saved.tiles.end(), [&](const std::uint8_t tile) {
+            return tile >= saved.tileKinds;
+        }))
+        return core::Result<PuzzleGame>::failure(puzzleError(core::ErrorCode::ValidationError,
+            "Puzzle snapshot contains an invalid tile value"));
+    std::istringstream randomState(saved.randomState);
+    randomState.imbue(std::locale::classic());
+    std::mt19937 generator;
+    if (!(randomState >> generator))
+        return core::Result<PuzzleGame>::failure(puzzleError(core::ErrorCode::ParseError,
+            "Puzzle random state is malformed"));
+    randomState >> std::ws;
+    if (!randomState.eof())
+        return core::Result<PuzzleGame>::failure(puzzleError(core::ErrorCode::ParseError,
+            "Puzzle random state has trailing data"));
+    auto created = create(saved.width, saved.height, 1, saved.tileKinds, saved.levelTarget);
+    if (!created) return created;
+    auto game = std::move(created).value();
+    game.tiles_ = saved.tiles;
+    game.score_ = saved.score;
+    game.level_ = saved.level;
+    game.random_ = generator;
+    return core::Result<PuzzleGame>::success(std::move(game));
 }
 }

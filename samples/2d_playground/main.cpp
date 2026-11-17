@@ -7,8 +7,10 @@
 #include "astro/runtime/SDLImageTextureCache.hpp"
 #include "astro/runtime/SDLInputAdapter.hpp"
 #include "astro/scene/Scene.hpp"
+#include "astro/scene/SceneFile.hpp"
 #include <SDL3/SDL.h>
 
+#include <algorithm>
 #include <chrono>
 #include <array>
 #include <cmath>
@@ -17,7 +19,9 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -36,6 +40,7 @@ struct SceneSetup
     scene::EntityId player = 0;
     std::filesystem::path sampleProject;
     std::optional<assets::AssetRegistry> assets;
+    bool temporaryProject = false;
 
     SceneSetup()
     {
@@ -45,6 +50,7 @@ struct SceneSetup
         std::error_code error;
         if (!std::filesystem::create_directory(sampleProject, error) || error)
             throw std::runtime_error("Cannot create a unique temporary sample project: " + error.message());
+        temporaryProject = true;
         try
         {
             auto opened = assets::AssetRegistry::open(sampleProject);
@@ -54,14 +60,25 @@ struct SceneSetup
             writeSampleImage(pngPath);
             auto imported = assets->importImage("sample_sprite.png");
             if (!imported) throw std::runtime_error(imported.error().message);
-        const auto created = authoring.createEntity("Player");
-        if (!created) throw std::runtime_error(created.error().message);
-        player = created.value();
+            const auto group = authoring.createEntity("Sprite Group");
+            if (!group) throw std::runtime_error(group.error().message);
+            auto groupTransform = authoring.transform(group.value())->value;
+            groupTransform.rotationDegrees.z = 15.0;
+            groupTransform.scale = {1.5, 1.5, 1.0};
+            if (!authoring.setTransform(group.value(), groupTransform)) throw std::runtime_error("Cannot set sample group Transform");
+            const auto created = authoring.createEntity("Player", group.value());
+            if (!created) throw std::runtime_error(created.error().message);
+            player = created.value();
             auto transform = authoring.transform(player)->value;
             transform.scale = {2.0, 2.0, 1.0};
             if (!authoring.setTransform(player, transform)) throw std::runtime_error("Cannot set sample sprite Transform");
             if (!authoring.setSpriteRenderer(player, imported.value().id))
                 throw std::runtime_error("Cannot attach sample SpriteRenderer");
+            std::filesystem::create_directories(sampleProject / "Scenes", error);
+            if (error) throw std::runtime_error("Cannot create temporary sample Scenes directory: " + error.message());
+            const auto saved = scene::saveSceneFile(sampleProject / "Scenes" / "Preview.scene", authoring);
+            if (!saved) throw std::runtime_error(saved.error().message);
+            openProject(sampleProject, "Scenes/Preview.scene", true);
         }
         catch (...)
         {
@@ -70,10 +87,59 @@ struct SceneSetup
         }
     }
 
+    SceneSetup(const std::filesystem::path& project, const std::filesystem::path& sceneFile)
+    {
+        openProject(project, sceneFile, false);
+    }
+
     ~SceneSetup()
     {
         std::error_code error;
-        std::filesystem::remove_all(sampleProject, error);
+        if (temporaryProject && !sampleProject.empty()) std::filesystem::remove_all(sampleProject, error);
+    }
+
+    void openProject(const std::filesystem::path& project, const std::filesystem::path& sceneFile,
+        const bool controlNamedPlayer)
+    {
+        std::error_code error;
+        const auto root = std::filesystem::canonical(project, error);
+        if (error || !std::filesystem::is_directory(root, error))
+            throw std::runtime_error("Project root must be an existing directory");
+        const auto requireDirectory = [&](const std::filesystem::path& path) {
+            const auto status = std::filesystem::symlink_status(path, error);
+            if (error || std::filesystem::is_symlink(status) || !std::filesystem::is_directory(status))
+                throw std::runtime_error("Project preview requires existing non-symlink Assets, Library/Assets, and .astro directories");
+        };
+        requireDirectory(root / "Assets");
+        requireDirectory(root / "Library" / "Assets");
+        requireDirectory(root / ".astro");
+        const auto indexPath = root / ".astro" / "assets.index";
+        const auto indexStatus = std::filesystem::symlink_status(indexPath, error);
+        if (error || std::filesystem::is_symlink(indexStatus) || !std::filesystem::is_regular_file(indexStatus))
+            throw std::runtime_error("Project preview requires an existing regular .astro/assets.index");
+        if (sceneFile.empty() || sceneFile.is_absolute())
+            throw std::runtime_error("Scene file must be a non-empty relative path inside the project");
+        const auto normalizedScene = sceneFile.lexically_normal();
+        for (const auto& part : normalizedScene)
+            if (part == "..") throw std::runtime_error("Scene file path cannot traverse outside the project");
+        const auto scenePath = std::filesystem::canonical(root / normalizedScene, error);
+        if (error || !std::filesystem::is_regular_file(scenePath, error))
+            throw std::runtime_error("Scene path must identify an existing project file");
+        const auto relative = scenePath.lexically_relative(root);
+        if (relative.empty() || relative.is_absolute() || *relative.begin() == "..")
+            throw std::runtime_error("Scene file resolves outside the project root");
+        auto registry = assets::AssetRegistry::open(root);
+        if (!registry) throw std::runtime_error(registry.error().message);
+        auto loaded = scene::loadSceneFile(scenePath);
+        if (!loaded) throw std::runtime_error(loaded.error().message);
+
+        sampleProject = root;
+        assets.emplace(std::move(registry).value());
+        authoring = std::move(loaded).value();
+        player = 0;
+        if (controlNamedPlayer)
+            for (const auto& entity : authoring.entities())
+                if (entity.name == "Player") { player = entity.id; break; }
     }
 
     static void writeSampleImage(const std::filesystem::path& path)
@@ -147,9 +213,10 @@ void bindControls(runtime::InputMapping& input)
 }
 
 core::Result<void> makeFrame(const scene::Scene& scene, const assets::AssetRegistry& assetRegistry,
-    render2d::Canvas2D& canvas)
+    render2d::Canvas2D& canvas, const bool demoGeometry)
 {
     canvas.clear();
+    if (!demoGeometry) return render2d::appendSceneSprites(scene, assetRegistry, canvas, {100.0, 10});
     auto add = [&](const render2d::Vec2 center, const render2d::Vec2 size,
         const render2d::Color color, const std::int32_t layer) {
         return canvas.addRectangle({center, size, color, layer});
@@ -165,7 +232,8 @@ core::Result<void> makeFrame(const scene::Scene& scene, const assets::AssetRegis
     return render2d::appendSceneSprites(scene, assetRegistry, canvas, {100.0, 10});
 }
 
-int run(const bool smoke)
+int run(const bool smoke, const std::optional<std::filesystem::path>& project,
+    const std::optional<std::filesystem::path>& sceneFile)
 {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) throw std::runtime_error(std::string("SDL_Init failed: ") + SDL_GetError());
     struct SdlLifetime { ~SdlLifetime() { SDL_Quit(); } } sdlLifetime;
@@ -175,14 +243,20 @@ int run(const bool smoke)
     SdlRenderer renderer(SDL_CreateRenderer(window.get(), smoke ? "software" : nullptr), SDL_DestroyRenderer);
     if (!renderer) throw std::runtime_error(std::string("SDL_CreateRenderer failed: ") + SDL_GetError());
 
-    SceneSetup setup;
+    auto setup = project
+        ? std::make_unique<SceneSetup>(*project, *sceneFile)
+        : std::make_unique<SceneSetup>();
     runtime::InputMapping input;
     bindControls(input);
     runtime::SDLInputAdapter inputAdapter(input);
     runtime::RuntimeSession play;
     const auto start = [&]() {
-        return play.play(setup.authoring, [&input, player = setup.player](scene::Scene& runtimeScene, const double dt) {
-            auto transform = runtimeScene.transform(player)->value;
+        return play.play(setup->authoring, [&input, player = setup->player](scene::Scene& runtimeScene, const double dt) {
+            if (player == 0) return core::Result<void>::success();
+            const auto* currentTransform = runtimeScene.transform(player);
+            if (!currentTransform)
+                return core::Result<void>::failure({core::ErrorCode::NotFound, "Selected Play sprite Transform disappeared"});
+            auto transform = currentTransform->value;
             constexpr double speed = 4.0;
             transform.position.x += static_cast<double>(input.state("move_x").value) * speed * dt;
             transform.position.y += static_cast<double>(input.state("move_y").value) * speed * dt;
@@ -192,20 +266,42 @@ int run(const bool smoke)
     const auto started = start();
     if (!started) throw std::runtime_error(started.error().message);
     runtime::SDLCanvas2DRenderer draw(renderer.get());
-    runtime::SDLImageTextureCache textureCache(renderer.get(), *setup.assets);
+    runtime::SDLImageTextureCache textureCache(renderer.get(), *setup->assets);
     render2d::Canvas2D canvas;
-    const render2d::Camera2D camera{{0.0, 0.0}, 48.0, 1.0};
+    const render2d::Camera2D demoCamera{{0.0, 0.0}, 48.0, 1.0};
     bool running = true;
     std::size_t frames = 0;
 
     const auto drawFrame = [&]() {
         const auto* state = play.runtimeScene();
         if (!state) throw std::runtime_error("Play session has no runtime Scene");
-        const auto prepared = makeFrame(*state, *setup.assets, canvas);
+        const auto prepared = makeFrame(*state, *setup->assets, canvas, !project.has_value());
         if (!prepared) throw std::runtime_error(prepared.error().message);
         int width = 0, height = 0;
         if (!SDL_GetCurrentRenderOutputSize(renderer.get(), &width, &height))
             throw std::runtime_error(std::string("SDL_GetCurrentRenderOutputSize failed: ") + SDL_GetError());
+        auto camera = demoCamera;
+        if (project && !canvas.sprites().empty() && width > 0 && height > 0)
+        {
+            double minimumX = std::numeric_limits<double>::infinity();
+            double minimumY = std::numeric_limits<double>::infinity();
+            double maximumX = -std::numeric_limits<double>::infinity();
+            double maximumY = -std::numeric_limits<double>::infinity();
+            for (const auto& sprite : canvas.sprites())
+                for (const auto corner : sprite.worldCorners)
+                {
+                    minimumX = std::min(minimumX, corner.x);
+                    minimumY = std::min(minimumY, corner.y);
+                    maximumX = std::max(maximumX, corner.x);
+                    maximumY = std::max(maximumY, corner.y);
+                }
+            camera.center = {(minimumX + maximumX) * 0.5, (minimumY + maximumY) * 0.5};
+            const auto worldWidth = std::max(maximumX - minimumX, 1e-9);
+            const auto worldHeight = std::max(maximumY - minimumY, 1e-9);
+            camera.pixelsPerUnit = std::min(static_cast<double>(width) / worldWidth,
+                static_cast<double>(height) / worldHeight) * 0.85;
+            camera.pixelsPerUnit = std::clamp(camera.pixelsPerUnit, 1e-8, 10000.0);
+        }
         std::optional<core::Error> textureError;
         const runtime::SDLTextureResolver resolveTexture = [&textureCache, &textureError](const assets::AssetId id) {
             auto resolved = textureCache.texture(id);
@@ -225,27 +321,39 @@ int run(const bool smoke)
         if (!pressed) throw std::runtime_error(pressed.error().message);
         const auto tick = play.tick(1.0 / 60.0);
         if (!tick || tick.value().fixedStepCount != 1) throw std::runtime_error("Fixed Play tick did not run exactly once");
-        const auto* runtimeTransform = play.runtimeScene()->transform(setup.player);
-        if (!runtimeTransform || runtimeTransform->value.position.x <= 0.0
-            || setup.authoring.transform(setup.player)->value.position.x != 0.0)
-            throw std::runtime_error("Play movement failed or changed the authoring Scene");
+        if (setup->player != 0)
+        {
+            const auto* runtimeTransform = play.runtimeScene()->transform(setup->player);
+            if (!runtimeTransform || runtimeTransform->value.position.x <= 0.0
+                || setup->authoring.transform(setup->player)->value.position.x != 0.0)
+                throw std::runtime_error("Play movement failed or changed the authoring Scene");
+        }
         if (!play.pause()) throw std::runtime_error("Play pause failed");
-        const auto beforePausedTick = play.runtimeScene()->transform(setup.player)->value.position.x;
+        const auto beforePausedTick = setup->player == 0 ? 0.0
+            : play.runtimeScene()->transform(setup->player)->value.position.x;
         const auto pausedTick = play.tick(1.0 / 60.0);
-        if (!pausedTick || pausedTick.value().fixedStepCount != 0
-            || play.runtimeScene()->transform(setup.player)->value.position.x != beforePausedTick)
+        const auto afterPausedTick = setup->player == 0 ? 0.0
+            : play.runtimeScene()->transform(setup->player)->value.position.x;
+        if (!pausedTick || pausedTick.value().fixedStepCount != 0 || afterPausedTick != beforePausedTick)
             throw std::runtime_error("Paused Play tick advanced the simulation");
-        const auto pausedX = play.runtimeScene()->transform(setup.player)->value.position.x;
-        if (!play.stepOnce() || play.runtimeScene()->transform(setup.player)->value.position.x <= pausedX)
+        const auto pausedX = setup->player == 0 ? 0.0
+            : play.runtimeScene()->transform(setup->player)->value.position.x;
+        if (!play.stepOnce())
             throw std::runtime_error("Single-step Play did not advance the runtime Scene");
+        if (setup->player != 0
+            && play.runtimeScene()->transform(setup->player)->value.position.x <= pausedX)
+            throw std::runtime_error("Single-step Play did not advance the selected Player");
         drawFrame();
         SdlSurface pixels(SDL_RenderReadPixels(renderer.get(), nullptr), SDL_DestroySurface);
         if (!pixels) throw std::runtime_error(std::string("SDL_RenderReadPixels failed: ") + SDL_GetError());
         const int sampleX = pixels->w / 2 + 2;
         const int sampleY = pixels->h / 2;
         std::uint8_t red = 0, green = 0, blue = 0, alpha = 0;
-        if (!SDL_ReadSurfacePixel(pixels.get(), sampleX, sampleY, &red, &green, &blue, &alpha)
-            || red < 200 || green < 140 || blue > 120 || alpha < 240)
+        const bool read = SDL_ReadSurfacePixel(pixels.get(), sampleX, sampleY, &red, &green, &blue, &alpha);
+        const bool expectedSample = setup->player == 0
+            ? (read && red > 150 && green > 70 && blue < 100 && alpha > 240)
+            : (read && red > 200 && green > 140 && blue < 120 && alpha > 240);
+        if (!expectedSample)
             throw std::runtime_error("2D render smoke did not find the player color at the projected center");
         return 0;
     }
@@ -293,10 +401,34 @@ int run(const bool smoke)
 }
 }
 
-int main(const int argc, char** argv)
+int wmain(const int argc, wchar_t** argv)
 {
-    if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--smoke")) return 2;
-    try { return run(argc == 2); }
+    bool smoke = false;
+    std::optional<std::filesystem::path> project;
+    std::optional<std::filesystem::path> sceneFile;
+    for (int index = 1; index < argc; ++index)
+    {
+        const std::wstring_view argument(argv[index]);
+        if (argument == L"--smoke") smoke = true;
+        else if (argument == L"--project" && index + 1 < argc)
+        {
+            if (project) return 2;
+            project = std::filesystem::path(argv[++index]);
+        }
+        else if (argument == L"--scene" && index + 1 < argc)
+        {
+            if (sceneFile) return 2;
+            sceneFile = std::filesystem::path(argv[++index]);
+        }
+        else if (argument == L"--help")
+        {
+            std::wcout << L"Usage: astro_2d_playground [--project <directory> --scene <relative-scene-file>] [--smoke]\n";
+            return 0;
+        }
+        else return 2;
+    }
+    if (project.has_value() != sceneFile.has_value()) return 2;
+    try { return run(smoke, project, sceneFile); }
     catch (const std::exception& error)
     {
         std::cerr << "[2d-play:error] " << error.what() << '\n';

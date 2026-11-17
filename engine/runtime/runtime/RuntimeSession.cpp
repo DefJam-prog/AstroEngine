@@ -8,6 +8,13 @@ namespace astro::runtime
 core::Result<void> RuntimeSession::play(const scene::Scene& authoringScene, FixedStep fixedStep,
     core::TimeConfiguration timing)
 {
+    return playWithLifecycle(authoringScene, {}, std::move(fixedStep), {}, timing);
+}
+
+core::Result<void> RuntimeSession::playWithLifecycle(const scene::Scene& authoringScene,
+    RuntimeLifecycle onCreate, FixedStep fixedStep, RuntimeLifecycle onDestroy,
+    core::TimeConfiguration timing)
+{
     if (state_ != RuntimeState::Stopped)
         return core::Result<void>::failure({core::ErrorCode::InvalidState, "Runtime session must be stopped before Play"});
     if (!fixedStep)
@@ -16,8 +23,41 @@ core::Result<void> RuntimeSession::play(const scene::Scene& authoringScene, Fixe
     const auto configured = freshTime.configure(timing);
     if (!configured) return configured;
 
-    runtimeScene_ = std::make_unique<scene::Scene>(authoringScene);
+    auto candidate = std::make_unique<scene::Scene>(authoringScene);
+    if (onCreate)
+    {
+        core::Result<void> created = core::Result<void>::failure(
+            {core::ErrorCode::InternalError, "Runtime OnCreate did not complete"});
+        try { created = onCreate(*candidate); }
+        catch (const std::exception& exception)
+        {
+            created = core::Result<void>::failure({core::ErrorCode::InternalError,
+                std::string("Runtime OnCreate threw an exception: ") + exception.what()});
+        }
+        catch (...)
+        {
+            created = core::Result<void>::failure({core::ErrorCode::InternalError,
+                "Runtime OnCreate threw an unknown exception"});
+        }
+        if (!created)
+        {
+            if (onDestroy)
+            {
+                try
+                {
+                    const auto cleanup = onDestroy(*candidate);
+                    if (!cleanup) created = core::Result<void>::failure({created.error().code,
+                        created.error().message + "; startup cleanup failed: " + cleanup.error().message});
+                }
+                catch (...) { /* Preserve the original startup error; the candidate is discarded. */ }
+            }
+            return created;
+        }
+    }
+
+    runtimeScene_ = std::move(candidate);
     fixedStep_ = std::move(fixedStep);
+    onDestroy_ = std::move(onDestroy);
     time_ = std::move(freshTime);
     state_ = RuntimeState::Playing;
     return core::Result<void>::success();
@@ -92,9 +132,32 @@ core::Result<core::FrameTiming> RuntimeSession::stepOnce()
 
 void RuntimeSession::stop() noexcept
 {
+    try { (void)stopChecked(); }
+    catch (...) { /* Preserve the noexcept legacy Stop API. */ }
+}
+
+core::Result<void> RuntimeSession::stopChecked()
+{
+    core::Result<void> stopped = core::Result<void>::success();
+    if (runtimeScene_ && onDestroy_)
+    {
+        try { stopped = onDestroy_(*runtimeScene_); }
+        catch (const std::exception& exception)
+        {
+            stopped = core::Result<void>::failure({core::ErrorCode::InternalError,
+                std::string("Runtime OnDestroy threw an exception: ") + exception.what()});
+        }
+        catch (...)
+        {
+            stopped = core::Result<void>::failure({core::ErrorCode::InternalError,
+                "Runtime OnDestroy threw an unknown exception"});
+        }
+    }
     fixedStep_ = {};
+    onDestroy_ = {};
     runtimeScene_.reset();
     time_ = core::TimeService{};
     state_ = RuntimeState::Stopped;
+    return stopped;
 }
 }

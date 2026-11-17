@@ -1,6 +1,7 @@
 #include "astro/runtime/SDLCanvas2DRenderer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -44,6 +45,37 @@ core::Result<void> SDLCanvas2DRenderer::render(const render2d::Canvas2D& canvas,
     {
         const auto rectangle = command.rectangle;
         const auto sprite = command.sprite;
+        if (sprite && sprite->hasWorldCorners)
+        {
+            if (!resolveTexture)
+                return core::Result<void>::failure({core::ErrorCode::InvalidState,
+                    "Canvas contains sprites but no texture resolver was provided"});
+            auto* texture = resolveTexture(sprite->asset);
+            if (!texture)
+                return core::Result<void>::failure({core::ErrorCode::NotFound,
+                    "SDL texture resolver could not resolve a Sprite asset ID"});
+            constexpr double coordinateLimit = 10000000.0;
+            constexpr std::array<SDL_FPoint, 4> texcoords{{{0.0f, 0.0f}, {1.0f, 0.0f},
+                {1.0f, 1.0f}, {0.0f, 1.0f}}};
+            std::array<SDL_Vertex, 4> vertices{};
+            for (std::size_t index = 0; index < vertices.size(); ++index)
+            {
+                const auto screen = render2d::projectPoint(sprite->worldCorners[index], camera, viewport);
+                if (!screen) return core::Result<void>::failure(screen.error());
+                if (std::abs(screen.value().x) > coordinateLimit || std::abs(screen.value().y) > coordinateLimit)
+                    return core::Result<void>::failure({core::ErrorCode::ValidationError,
+                        "Projected sprite vertex is too large for SDL coordinates"});
+                vertices[index] = {{static_cast<float>(screen.value().x), static_cast<float>(screen.value().y)},
+                    {sprite->tint.r / 255.0f, sprite->tint.g / 255.0f,
+                        sprite->tint.b / 255.0f, sprite->tint.a / 255.0f}, texcoords[index]};
+            }
+            constexpr std::array<int, 6> indices{0, 1, 2, 0, 2, 3};
+            if (!SDL_RenderGeometry(renderer_, texture, vertices.data(), static_cast<int>(vertices.size()),
+                indices.data(), static_cast<int>(indices.size())))
+                return core::Result<void>::failure({core::ErrorCode::IoError,
+                    std::string("SDL could not draw an affine sprite: ") + SDL_GetError()});
+            continue;
+        }
         const render2d::Rect geometry = rectangle
             ? *rectangle
             : render2d::Rect{sprite->center, sprite->size, sprite->tint, sprite->layer};

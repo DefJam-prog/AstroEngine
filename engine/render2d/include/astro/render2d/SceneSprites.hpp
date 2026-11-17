@@ -11,8 +11,9 @@ struct SceneSpriteOptions final
     std::int32_t layer = 0;
 };
 
-// Adds visible SpriteRenderer components from root entities to a canvas. Asset
-// dimensions come from the project's AssetRegistry; no file decoding occurs here.
+// Adds visible SpriteRenderer components to a canvas after composing each
+// entity's XY affine transform through its parent chain. Asset dimensions come
+// from AssetRegistry; no image decoding occurs here.
 [[nodiscard]] core::Result<void> appendSceneSprites(const scene::Scene& scene,
     const assets::AssetRegistry& assets, Canvas2D& canvas,
     SceneSpriteOptions options = {});

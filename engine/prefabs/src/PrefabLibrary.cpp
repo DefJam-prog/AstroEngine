@@ -476,6 +476,12 @@ core::Result<PrefabAsset> capturePrefab(const scene::Scene& source, const scene:
         const auto* entity = source.find(entityId);
         const auto* transform = source.transform(entityId);
         if (!entity || !transform) return resultFailure<PrefabAsset>(core::ErrorCode::InvalidState, "Prefab source is incomplete");
+        if (!entity->scriptBehaviors.empty())
+            return resultFailure<PrefabAsset>(core::ErrorCode::ValidationError,
+                "Prefab capture does not preserve ScriptBehavior components yet");
+        if (entity->meshRenderer)
+            return resultFailure<PrefabAsset>(core::ErrorCode::ValidationError,
+                "Prefab capture does not preserve MeshRenderer components yet");
         PrefabNode node;
         node.localId = localIds.at(entityId);
         node.parentLocalId = entityId == root ? 0 : localIds.at(*entity->parent);

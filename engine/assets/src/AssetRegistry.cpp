@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cctype>
 #include <cstring>
 #include <fstream>
@@ -32,6 +33,12 @@ constexpr std::uint64_t MaxImageBytes = 256ull * 1024ull * 1024ull;
 constexpr std::uint64_t MaxIndexBytes = 16ull * 1024ull * 1024ull;
 constexpr std::size_t MaxAssetEntries = 100000;
 constexpr std::size_t MaxAssetPathBytes = 4096;
+constexpr std::size_t MaxScriptSourceBytes = 16ull * 1024ull * 1024ull;
+constexpr std::size_t MaxModelSourceBytes = 8ull * 1024ull * 1024ull;
+constexpr std::size_t MaxManagedTypeNameBytes = 512;
+constexpr std::size_t MaxScriptBuildStateBytes = 4ull * 1024ull * 1024ull;
+constexpr std::size_t MaxScriptBuildSources = 4096;
+constexpr std::uint64_t MaxScriptBuildOutputBytes = 512ull * 1024ull * 1024ull;
 constexpr std::uint64_t MaxPixels = 268435456ull;
 constexpr std::uint32_t MaxDimension = 65535;
 
@@ -43,6 +50,26 @@ core::Result<AssetRegistry> assetError(const core::ErrorCode code, std::string m
 core::Result<AssetReference> referenceError(const core::ErrorCode code, std::string message)
 {
     return core::Result<AssetReference>::failure({code, std::move(message)});
+}
+
+core::Result<ScriptAssetReference> scriptReferenceError(const core::ErrorCode code, std::string message)
+{
+    return core::Result<ScriptAssetReference>::failure({code, std::move(message)});
+}
+
+core::Result<ModelAssetReference> modelReferenceError(const core::ErrorCode code, std::string message)
+{
+    return core::Result<ModelAssetReference>::failure({code, std::move(message)});
+}
+
+core::Result<ResolvedScriptAsset> resolvedScriptError(const core::ErrorCode code, std::string message)
+{
+    return core::Result<ResolvedScriptAsset>::failure({code, std::move(message)});
+}
+
+core::Result<ResolvedModelAsset> resolvedModelError(const core::ErrorCode code, std::string message)
+{
+    return core::Result<ResolvedModelAsset>::failure({code, std::move(message)});
 }
 
 bool hasExtra(std::istringstream& input)
@@ -93,6 +120,108 @@ bool validRelative(const std::filesystem::path& path)
     for (const auto& part : path)
         if (part == ".." || part == ".") return false;
     return true;
+}
+
+bool isWithin(const std::filesystem::path& candidate, const std::filesystem::path& base);
+
+bool validManagedTypeName(const std::string_view name)
+{
+    if (name.empty() || name.size() > MaxManagedTypeNameBytes || !validUtf8(name)) return false;
+    for (const auto character : name)
+    {
+        const auto byte = static_cast<unsigned char>(character);
+        if (byte <= 0x20 || byte == 0x7F) return false;
+    }
+    return true;
+}
+
+bool hasPathPrefix(const std::filesystem::path& path, const std::filesystem::path& prefix)
+{
+    auto pathPart = path.begin();
+    for (auto prefixPart = prefix.begin(); prefixPart != prefix.end(); ++prefixPart, ++pathPart)
+        if (pathPart == path.end() || *pathPart != *prefixPart) return false;
+    return true;
+}
+
+core::Result<std::filesystem::path> resolveProjectFile(const std::filesystem::path& projectRoot,
+    const std::filesystem::path& relativePath, const std::filesystem::path& requiredRoot,
+    const std::string_view extension, const std::string_view description)
+{
+    const auto filename = utf8(relativePath.filename());
+    if (!validRelative(relativePath) || relativePath != relativePath.lexically_normal()
+        || !hasPathPrefix(relativePath, requiredRoot) || !filename.ends_with(extension))
+        return core::Result<std::filesystem::path>::failure({core::ErrorCode::ValidationError,
+            std::string(description) + " path must stay inside " + utf8(requiredRoot)
+                + " and use the required file extension"});
+
+    std::error_code error;
+    const auto root = std::filesystem::canonical(projectRoot / requiredRoot, error);
+    if (error || !std::filesystem::is_directory(root, error) || error)
+        return core::Result<std::filesystem::path>::failure({core::ErrorCode::NotFound,
+            std::string(description) + " directory is missing"});
+    const auto unresolved = projectRoot / relativePath;
+    const auto status = std::filesystem::symlink_status(unresolved, error);
+    if (error)
+        return core::Result<std::filesystem::path>::failure({core::ErrorCode::NotFound,
+            std::string(description) + " file is missing: " + error.message()});
+    if (std::filesystem::is_symlink(status))
+        return core::Result<std::filesystem::path>::failure({core::ErrorCode::ValidationError,
+            std::string(description) + " file must not be a symbolic link"});
+    const auto candidate = std::filesystem::canonical(unresolved, error);
+    if (error || !isWithin(candidate, root))
+        return core::Result<std::filesystem::path>::failure({core::ErrorCode::ValidationError,
+            std::string(description) + " file resolves outside its project directory"});
+    if (!std::filesystem::is_regular_file(candidate, error) || error)
+        return core::Result<std::filesystem::path>::failure({core::ErrorCode::NotFound,
+            std::string(description) + " file is missing or is not a regular file"});
+    return core::Result<std::filesystem::path>::success(candidate);
+}
+
+core::Result<std::vector<unsigned char>> readScriptSource(const std::filesystem::path& path)
+{
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error)
+        return core::Result<std::vector<unsigned char>>::failure({core::ErrorCode::IoError,
+            "Cannot inspect C# source: " + error.message()});
+    if (size == 0 || size > MaxScriptSourceBytes)
+        return core::Result<std::vector<unsigned char>>::failure({core::ErrorCode::ValidationError,
+            "C# source must contain 1 byte through 16 MiB"});
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return core::Result<std::vector<unsigned char>>::failure({core::ErrorCode::IoError,
+            "Cannot open C# source"});
+    std::vector<unsigned char> bytes(static_cast<std::size_t>(size));
+    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        return core::Result<std::vector<unsigned char>>::failure({core::ErrorCode::IoError,
+            "C# source changed or could not be read completely"});
+    if (!validUtf8(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size())))
+        return core::Result<std::vector<unsigned char>>::failure({core::ErrorCode::ValidationError,
+            "C# source is not valid UTF-8"});
+    return core::Result<std::vector<unsigned char>>::success(std::move(bytes));
+}
+
+core::Result<std::vector<unsigned char>> readModelSource(const std::filesystem::path& path)
+{
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error)
+        return core::Result<std::vector<unsigned char>>::failure({core::ErrorCode::IoError,
+            "Cannot inspect model source: " + error.message()});
+    if (size == 0 || size > MaxModelSourceBytes)
+        return core::Result<std::vector<unsigned char>>::failure({core::ErrorCode::ValidationError,
+            "Model source must contain 1 byte through 8 MiB"});
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return core::Result<std::vector<unsigned char>>::failure({core::ErrorCode::IoError,
+            "Cannot open model source"});
+    std::vector<unsigned char> bytes(static_cast<std::size_t>(size));
+    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        return core::Result<std::vector<unsigned char>>::failure({core::ErrorCode::IoError,
+            "Model source changed or could not be read completely"});
+    return core::Result<std::vector<unsigned char>>::success(std::move(bytes));
 }
 
 bool isWithin(const std::filesystem::path& candidate, const std::filesystem::path& base)
@@ -491,6 +620,371 @@ bool validHash(const std::string& hash)
         return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
     });
 }
+
+struct ScriptBuildBindingRecord
+{
+    std::string sourceRelativePath;
+    std::string managedTypeName;
+};
+
+struct ScriptBuildStateData
+{
+    std::string fingerprint;
+    std::string manifestSha256;
+    std::string sdkVersion;
+    std::string targetFramework;
+    std::string assemblyName;
+    std::string assemblyRelativePath;
+    std::string assemblySha256;
+    std::string runtimeConfigRelativePath;
+    std::string runtimeConfigSha256;
+    std::map<std::string, std::string> sources;
+    std::vector<ScriptBuildBindingRecord> bindings;
+};
+
+core::Result<ScriptBuildStateData> scriptBuildStateError(const core::ErrorCode code, std::string message)
+{
+    return core::Result<ScriptBuildStateData>::failure({code, std::move(message)});
+}
+
+bool parseTagLine(const std::string& line, const std::string_view expected, std::string& value)
+{
+    std::istringstream input(line);
+    std::string tag;
+    return static_cast<bool>(input >> tag >> std::quoted(value)) && tag == expected && !hasExtra(input);
+}
+
+bool parseHashLine(const std::string& line, const std::string_view expected, std::string& value)
+{
+    std::istringstream input(line);
+    std::string tag;
+    return static_cast<bool>(input >> tag >> value) && tag == expected && !hasExtra(input) && validHash(value);
+}
+
+bool parseCountLine(const std::string& line, const std::string_view expected, std::size_t& value)
+{
+    std::istringstream input(line);
+    std::string tag;
+    return static_cast<bool>(input >> tag >> value) && tag == expected && !hasExtra(input);
+}
+
+bool scriptSourcePath(const std::string& text, std::filesystem::path& path)
+{
+    if (text.empty() || text.size() > MaxAssetPathBytes || text.find('\\') != std::string::npos || !validUtf8(text))
+        return false;
+    auto extension = utf8(fromUtf8(text).extension());
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](const unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (extension != ".cs") return false;
+    path = fromUtf8(text);
+    return validRelative(path) && path == path.lexically_normal()
+        && hasPathPrefix(path, std::filesystem::path("Scripts")) && utf8(path) == text;
+}
+
+core::Result<ScriptBuildStateData> readScriptBuildState(const std::filesystem::path& projectRoot)
+{
+    const auto path = projectRoot / "Library" / "Scripts" / "asset-bindings.state";
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error == std::errc::no_such_file_or_directory)
+        return scriptBuildStateError(core::ErrorCode::NotFound, "No C# build handoff state exists");
+    if (error) return scriptBuildStateError(core::ErrorCode::IoError, "Cannot inspect C# build handoff state: " + error.message());
+    if (std::filesystem::is_symlink(status) || !std::filesystem::is_regular_file(status))
+        return scriptBuildStateError(core::ErrorCode::ValidationError, "C# build handoff state must be a regular file");
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || size == 0 || size > MaxScriptBuildStateBytes)
+        return scriptBuildStateError(core::ErrorCode::ValidationError, "C# build handoff state is empty or exceeds 4 MiB");
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return scriptBuildStateError(core::ErrorCode::IoError, "Cannot open C# build handoff state");
+    std::string contents(static_cast<std::size_t>(size), '\0');
+    file.read(contents.data(), static_cast<std::streamsize>(contents.size()));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        return scriptBuildStateError(core::ErrorCode::IoError, "C# build handoff state changed while being read");
+    if (!validUtf8(contents))
+        return scriptBuildStateError(core::ErrorCode::ValidationError, "C# build handoff state is not valid UTF-8");
+
+    std::istringstream input(contents);
+    std::string line;
+    auto nextLine = [&]() {
+        if (!std::getline(input, line)) return false;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        return true;
+    };
+    int version = 0;
+    {
+        std::string magic, extra;
+        std::istringstream header;
+        if (!nextLine()) return scriptBuildStateError(core::ErrorCode::ParseError, "C# build state header is missing");
+        header.str(line);
+        if (!(header >> magic >> version) || magic != "ASTRO_CSHARP_PROJECT_BUILD" || version != 1 || hasExtra(header))
+            return scriptBuildStateError(core::ErrorCode::ParseError, "C# build state header is invalid or unsupported");
+    }
+    ScriptBuildStateData state;
+    const auto readHash = [&](const std::string_view tag, std::string& target) {
+        return nextLine() && parseHashLine(line, tag, target);
+    };
+    const auto readTag = [&](const std::string_view tag, std::string& target) {
+        return nextLine() && parseTagLine(line, tag, target);
+    };
+    if (!readHash("FINGERPRINT", state.fingerprint) || !readHash("MANIFEST_SHA256", state.manifestSha256)
+        || !readTag("SDK_VERSION", state.sdkVersion) || !readTag("TARGET_FRAMEWORK", state.targetFramework)
+        || !readTag("ASSEMBLY_NAME", state.assemblyName) || !readTag("ASSEMBLY_PATH", state.assemblyRelativePath)
+        || !readHash("ASSEMBLY_SHA256", state.assemblySha256)
+        || !readTag("RUNTIME_CONFIG_PATH", state.runtimeConfigRelativePath)
+        || !readHash("RUNTIME_CONFIG_SHA256", state.runtimeConfigSha256))
+        return scriptBuildStateError(core::ErrorCode::ParseError, "C# build state metadata is malformed");
+    if (!state.sdkVersion.starts_with("10.0.") || state.targetFramework != "net10.0"
+        || state.assemblyName.empty() || state.assemblyName.size() > 100
+        || !std::all_of(state.assemblyName.begin(), state.assemblyName.end(), [](const unsigned char c) {
+            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                || c == '_' || c == '.' || c == '-';
+        }))
+        return scriptBuildStateError(core::ErrorCode::ValidationError, "C# build state SDK/framework/assembly metadata is invalid");
+
+    std::size_t sourceCount = 0;
+    if (!nextLine() || !parseCountLine(line, "SOURCE_COUNT", sourceCount)
+        || sourceCount == 0 || sourceCount > MaxScriptBuildSources)
+        return scriptBuildStateError(core::ErrorCode::ParseError, "C# build state source count is invalid");
+    for (std::size_t i = 0; i < sourceCount; ++i)
+    {
+        if (!nextLine()) return scriptBuildStateError(core::ErrorCode::ParseError, "C# build state source list is truncated");
+        std::istringstream record(line);
+        std::string tag, relative, hash, extra;
+        std::filesystem::path parsedPath;
+        if (!(record >> tag >> std::quoted(relative) >> hash) || tag != "SOURCE" || (record >> extra)
+            || !scriptSourcePath(relative, parsedPath) || !validHash(hash)
+            || !state.sources.emplace(relative, hash).second)
+            return scriptBuildStateError(core::ErrorCode::ValidationError, "C# build state contains an invalid or duplicate source record");
+    }
+
+    std::size_t bindingCount = 0;
+    if (!nextLine() || !parseCountLine(line, "BINDING_COUNT", bindingCount) || bindingCount > MaxScriptBuildSources)
+        return scriptBuildStateError(core::ErrorCode::ParseError, "C# build state binding count is invalid");
+    std::set<std::string> boundSources;
+    for (std::size_t i = 0; i < bindingCount; ++i)
+    {
+        if (!nextLine()) return scriptBuildStateError(core::ErrorCode::ParseError, "C# build state binding list is truncated");
+        std::istringstream record(line);
+        std::string tag, source, type, extra;
+        std::filesystem::path parsedPath;
+        if (!(record >> tag >> std::quoted(source) >> std::quoted(type)) || tag != "BINDING" || (record >> extra)
+            || !scriptSourcePath(source, parsedPath) || !validManagedTypeName(type)
+            || !state.sources.contains(source) || !boundSources.insert(source).second)
+            return scriptBuildStateError(core::ErrorCode::ValidationError, "C# build state contains an invalid, duplicate or unselected binding");
+        state.bindings.push_back({std::move(source), std::move(type)});
+    }
+    if (!nextLine() || line != "END")
+        return scriptBuildStateError(core::ErrorCode::ParseError, "C# build state terminator is missing");
+    while (nextLine())
+        if (line.find_first_not_of(" \t\r") != std::string::npos)
+            return scriptBuildStateError(core::ErrorCode::ParseError, "Unexpected data after C# build state terminator");
+    if (input.bad()) return scriptBuildStateError(core::ErrorCode::IoError, "Error while reading C# build handoff state");
+    return core::Result<ScriptBuildStateData>::success(std::move(state));
+}
+
+core::Result<std::vector<unsigned char>> readBoundedFile(const std::filesystem::path& path,
+    const std::uint64_t maximumBytes, const std::string_view description)
+{
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error || std::filesystem::is_symlink(status) || !std::filesystem::is_regular_file(status))
+        return core::Result<std::vector<unsigned char>>::failure({core::ErrorCode::ValidationError,
+            std::string(description) + " must be a regular file without symbolic links"});
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || size == 0 || size > maximumBytes)
+        return core::Result<std::vector<unsigned char>>::failure({core::ErrorCode::InvalidState,
+            std::string(description) + " is missing, empty or exceeds its size limit"});
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return core::Result<std::vector<unsigned char>>::failure({core::ErrorCode::IoError,
+        "Cannot open " + std::string(description)});
+    std::vector<unsigned char> bytes(static_cast<std::size_t>(size));
+    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        return core::Result<std::vector<unsigned char>>::failure({core::ErrorCode::IoError,
+            std::string(description) + " changed while being read"});
+    return core::Result<std::vector<unsigned char>>::success(std::move(bytes));
+}
+
+bool readJsonStringField(const std::string& json, const std::string_view field, std::string& value)
+{
+    const auto marker = "\"" + std::string(field) + "\"";
+    const auto start = json.find(marker);
+    if (start == std::string::npos || json.find(marker, start + marker.size()) != std::string::npos) return false;
+    auto position = start + marker.size();
+    const auto skipSpace = [&]() {
+        while (position < json.size() && (json[position] == ' ' || json[position] == '\t'
+            || json[position] == '\r' || json[position] == '\n')) ++position;
+    };
+    skipSpace();
+    if (position >= json.size() || json[position++] != ':') return false;
+    skipSpace();
+    if (position >= json.size() || json[position++] != '"') return false;
+    value.clear();
+    while (position < json.size())
+    {
+        const auto character = json[position++];
+        if (character == '"') return true;
+        if (character == '\\' || static_cast<unsigned char>(character) < 0x20) return false;
+        value.push_back(character);
+    }
+    return false;
+}
+
+bool hasJsonIntegerField(const std::string& json, const std::string_view field, const int expected)
+{
+    const auto marker = "\"" + std::string(field) + "\"";
+    const auto start = json.find(marker);
+    if (start == std::string::npos || json.find(marker, start + marker.size()) != std::string::npos) return false;
+    auto position = start + marker.size();
+    const auto skipSpace = [&]() {
+        while (position < json.size() && (json[position] == ' ' || json[position] == '\t'
+            || json[position] == '\r' || json[position] == '\n')) ++position;
+    };
+    skipSpace();
+    if (position >= json.size() || json[position++] != ':') return false;
+    skipSpace();
+    int value = -1;
+    const auto parsed = std::from_chars(json.data() + position, json.data() + json.size(), value);
+    if (parsed.ec != std::errc{} || value != expected) return false;
+    position = static_cast<std::size_t>(parsed.ptr - json.data());
+    skipSpace();
+    return position < json.size() && (json[position] == ',' || json[position] == '}');
+}
+
+core::Result<std::map<std::string, std::string>> enumerateScriptSources(const std::filesystem::path& projectRoot)
+{
+    const auto scriptsRoot = projectRoot / "Scripts";
+    std::error_code error;
+    if (!std::filesystem::is_directory(scriptsRoot, error) || error)
+        return core::Result<std::map<std::string, std::string>>::failure({core::ErrorCode::NotFound,
+            "Project Scripts directory is missing"});
+    std::map<std::string, std::string> sources;
+    std::uint64_t totalBytes = 0;
+    std::filesystem::recursive_directory_iterator iterator(scriptsRoot, error), end;
+    if (error) return core::Result<std::map<std::string, std::string>>::failure({core::ErrorCode::IoError,
+        "Cannot scan project Scripts directory: " + error.message()});
+    for (; iterator != end; iterator.increment(error))
+    {
+        if (error) return core::Result<std::map<std::string, std::string>>::failure({core::ErrorCode::IoError,
+            "Cannot scan project Scripts directory: " + error.message()});
+        const auto entryStatus = iterator->symlink_status(error);
+        if (error || std::filesystem::is_symlink(entryStatus))
+            return core::Result<std::map<std::string, std::string>>::failure({core::ErrorCode::ValidationError,
+                "Symbolic links are not allowed under project Scripts"});
+        if (std::filesystem::is_directory(entryStatus)) continue;
+        if (!std::filesystem::is_regular_file(entryStatus))
+            return core::Result<std::map<std::string, std::string>>::failure({core::ErrorCode::ValidationError,
+                "Project Scripts contains a non-regular file"});
+        auto extension = utf8(iterator->path().extension());
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](const unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (extension != ".cs") continue;
+        if (sources.size() >= MaxScriptBuildSources)
+            return core::Result<std::map<std::string, std::string>>::failure({core::ErrorCode::ValidationError,
+                "Project Scripts contains more than 4096 C# source files"});
+        const auto relative = utf8(iterator->path().lexically_relative(projectRoot));
+        auto bytes = readScriptSource(iterator->path());
+        if (!bytes) return core::Result<std::map<std::string, std::string>>::failure(bytes.error());
+        totalBytes += bytes.value().size();
+        if (totalBytes > 536870912ull)
+            return core::Result<std::map<std::string, std::string>>::failure({core::ErrorCode::ValidationError,
+                "Project C# sources exceed 512 MiB total"});
+        if (!sources.emplace(relative, sha256Hex(bytes.value())).second)
+            return core::Result<std::map<std::string, std::string>>::failure({core::ErrorCode::ValidationError,
+                "Project contains duplicate C# source paths"});
+    }
+    if (sources.empty()) return core::Result<std::map<std::string, std::string>>::failure({core::ErrorCode::InvalidState,
+        "Project contains no C# source files"});
+    return core::Result<std::map<std::string, std::string>>::success(std::move(sources));
+}
+
+core::Result<void> validateScriptBuildState(const std::filesystem::path& projectRoot,
+    const ScriptBuildStateData& state)
+{
+    for (const auto& directory : {projectRoot / ".astro", projectRoot / "Scripts",
+        projectRoot / "Library", projectRoot / "Library" / "Scripts"})
+    {
+        std::error_code directoryError;
+        const auto directoryStatus = std::filesystem::symlink_status(directory, directoryError);
+        if (directoryError || std::filesystem::is_symlink(directoryStatus)
+            || !std::filesystem::is_directory(directoryStatus))
+            return core::Result<void>::failure({core::ErrorCode::ValidationError,
+                "C# project build directories must be regular directories without symbolic links"});
+    }
+    const auto manifestPath = projectRoot / ".astro" / "csharp-build.json";
+    std::error_code manifestError;
+    const auto manifestStatus = std::filesystem::symlink_status(manifestPath, manifestError);
+    if (manifestError || std::filesystem::is_symlink(manifestStatus)
+        || !std::filesystem::is_regular_file(manifestStatus))
+        return core::Result<void>::failure({core::ErrorCode::ValidationError,
+            "C# build manifest must be a regular project file without symbolic links"});
+    auto manifestBytes = readBoundedFile(manifestPath, 65536,
+        "C# build manifest");
+    if (!manifestBytes) return core::Result<void>::failure(manifestBytes.error());
+    if (sha256Hex(manifestBytes.value()) != state.manifestSha256)
+        return core::Result<void>::failure({core::ErrorCode::InvalidState,
+            "C# build manifest changed after the last successful build"});
+    const auto buildStatePath = projectRoot / "Library" / "Scripts" / "build-state.json";
+    auto buildStateBytes = readBoundedFile(buildStatePath, 65536, "C# build-state record");
+    if (!buildStateBytes)
+        return core::Result<void>::failure({core::ErrorCode::InvalidState,
+            "C# build-state record is missing or invalid"});
+    const std::string buildStateText(buildStateBytes.value().begin(), buildStateBytes.value().end());
+    std::string handoffPath, handoffHash;
+    if (!validUtf8(buildStateText) || !hasJsonIntegerField(buildStateText, "schemaVersion", 2)
+        || !readJsonStringField(buildStateText, "assetStatePath", handoffPath)
+        || !readJsonStringField(buildStateText, "assetStateSha256", handoffHash)
+        || handoffPath != "Library/Scripts/asset-bindings.state" || !validHash(handoffHash))
+        return core::Result<void>::failure({core::ErrorCode::ValidationError,
+            "C# build-state record does not contain a valid versioned build handoff reference"});
+    const auto handoffBytes = readBoundedFile(projectRoot / handoffPath, MaxScriptBuildStateBytes,
+        "C# build handoff state");
+    if (!handoffBytes || sha256Hex(handoffBytes.value()) != handoffHash)
+        return core::Result<void>::failure({core::ErrorCode::InvalidState,
+            "C# build handoff state is missing or its build-state hash does not match"});
+    auto sources = enumerateScriptSources(projectRoot);
+    if (!sources) return core::Result<void>::failure(sources.error());
+    if (sources.value() != state.sources)
+    {
+        std::string detail = "C# sources were added, removed or changed after the last successful build";
+        for (const auto& [path, hash] : sources.value())
+            if (!state.sources.contains(path)) detail += "; unrecorded: " + path;
+            else if (state.sources.at(path) != hash) detail += "; changed: " + path;
+        for (const auto& [path, hash] : state.sources)
+            if (!sources.value().contains(path)) detail += "; missing: " + path;
+        return core::Result<void>::failure({core::ErrorCode::InvalidState, std::move(detail)});
+    }
+
+    const auto assemblyRelative = fromUtf8(state.assemblyRelativePath);
+    const auto runtimeConfigRelative = fromUtf8(state.runtimeConfigRelativePath);
+    auto assembly = resolveProjectFile(projectRoot, assemblyRelative,
+        std::filesystem::path("Library") / "Scripts", ".dll", "Managed assembly");
+    if (!assembly) return core::Result<void>::failure({core::ErrorCode::InvalidState, assembly.error().message});
+    auto runtimeConfig = resolveProjectFile(projectRoot, runtimeConfigRelative,
+        std::filesystem::path("Library") / "Scripts", ".runtimeconfig.json", "Managed runtimeconfig");
+    if (!runtimeConfig) return core::Result<void>::failure({core::ErrorCode::InvalidState, runtimeConfig.error().message});
+    if (utf8(assembly.value().filename()) != state.assemblyName + ".dll"
+        || utf8(runtimeConfig.value().filename()) != state.assemblyName + ".runtimeconfig.json")
+        return core::Result<void>::failure({core::ErrorCode::ValidationError,
+            "C# build outputs do not match the selected assembly name"});
+    auto assemblyBytes = readBoundedFile(assembly.value(), MaxScriptBuildOutputBytes, "Managed assembly");
+    if (!assemblyBytes || sha256Hex(assemblyBytes.value()) != state.assemblySha256)
+        return core::Result<void>::failure({core::ErrorCode::InvalidState,
+            "Managed assembly is missing or its hash changed after build"});
+    auto runtimeConfigBytes = readBoundedFile(runtimeConfig.value(), 1024 * 1024, "Managed runtimeconfig");
+    if (!runtimeConfigBytes || sha256Hex(runtimeConfigBytes.value()) != state.runtimeConfigSha256)
+        return core::Result<void>::failure({core::ErrorCode::InvalidState,
+            "Managed runtimeconfig is missing or its hash changed after build"});
+    for (const auto& binding : state.bindings)
+    {
+        if (!state.sources.contains(binding.sourceRelativePath) || !validManagedTypeName(binding.managedTypeName))
+            return core::Result<void>::failure({core::ErrorCode::ValidationError,
+                "C# build contains a binding to an unknown source or invalid managed type name"});
+    }
+    return core::Result<void>::success();
+}
 }
 
 std::string_view imageFormatName(const ImageFormat format) noexcept
@@ -537,7 +1031,7 @@ core::Result<AssetRegistry> AssetRegistry::open(const std::filesystem::path& pro
     AssetRegistry registry(root, canonicalAssets, canonicalCache, canonicalMetadata / "assets.index");
     if (!std::filesystem::exists(registry.indexPath_, error))
     {
-        const auto saved = registry.saveIndex({}, 1);
+        const auto saved = registry.saveIndex({}, {}, {}, 1);
         if (!saved) return assetError(saved.error().code, saved.error().message);
         return core::Result<AssetRegistry>::success(std::move(registry));
     }
@@ -557,8 +1051,16 @@ core::Result<AssetRegistry> AssetRegistry::open(const std::filesystem::path& pro
         if (!line.empty() && line.back() == '\r') line.pop_back();
         return true;
     };
-    if (!input || !nextLine() || line != "ASTRO_ASSETS 1")
+    std::istringstream header;
+    int indexVersion = 0;
+    if (!input || !nextLine())
         return assetError(core::ErrorCode::ParseError, "Invalid asset index header or version");
+    header.str(line);
+    header.imbue(std::locale::classic());
+    std::string magic;
+    if (!(header >> magic >> indexVersion) || hasExtra(header) || magic != "ASTRO_ASSETS"
+        || indexVersion < 1 || indexVersion > 3)
+        return assetError(core::ErrorCode::VersionMismatch, "Unsupported asset index format version");
     if (!nextLine()) return assetError(core::ErrorCode::ParseError, "Asset index counter is missing");
     std::istringstream counterLine(line); counterLine.imbue(std::locale::classic());
     std::string marker;
@@ -566,34 +1068,109 @@ core::Result<AssetRegistry> AssetRegistry::open(const std::filesystem::path& pro
         return assetError(core::ErrorCode::ParseError, "Invalid asset ID counter");
     std::uint64_t maximumId = 0;
     std::set<std::string> registeredPaths;
+    std::set<std::string> registeredScriptPaths;
+    std::set<std::string> registeredModelPaths;
+    std::set<std::string> registeredScriptTypes;
+    std::set<std::uint64_t> registeredIds;
     bool ended = false;
     while (nextLine())
     {
         if (line == "END") { ended = true; break; }
         std::istringstream record(line); record.imbue(std::locale::classic());
-        std::string format, relativeText, hash;
-        AssetReference reference;
-        if (!(record >> marker >> reference.id.value >> std::quoted(relativeText) >> format
-            >> reference.width >> reference.height >> reference.sourceSize >> hash) || marker != "ASSET" || hasExtra(record))
+        if (!(record >> marker) || marker.empty())
             return assetError(core::ErrorCode::ParseError, "Invalid asset index entry");
-        if ((format != "PNG" && format != "JPEG") || !validHash(hash) || !validUtf8(relativeText)
-            || relativeText.size() > MaxAssetPathBytes
-            || !validDimensions(reference.width, reference.height) || reference.sourceSize == 0 || reference.sourceSize > MaxImageBytes)
-            return assetError(core::ErrorCode::ValidationError, "Asset index contains invalid metadata");
-        reference.format = format == "PNG" ? ImageFormat::Png : ImageFormat::Jpeg;
-        reference.sourceRelativePath = relativeText;
-        reference.sha256 = std::move(hash);
-        const auto sourcePath = fromUtf8(reference.sourceRelativePath);
-        if (reference.id.value == 0 || reference.sourceRelativePath.find('\0') != std::string::npos
-            || !validRelative(sourcePath) || sourcePath != sourcePath.lexically_normal())
-            return assetError(core::ErrorCode::ValidationError, "Asset index contains an invalid ID or source path");
-        if (registry.entries_.size() >= MaxAssetEntries)
-            return assetError(core::ErrorCode::ValidationError, "Asset index has a forbidden path or exceeds the 100000-entry limit");
-        if (!registeredPaths.emplace(reference.sourceRelativePath).second)
-            return assetError(core::ErrorCode::AlreadyExists, "Asset index contains a duplicate source path");
-        maximumId = std::max(maximumId, reference.id.value);
-        if (!registry.entries_.emplace(reference.id, std::move(reference)).second)
-            return assetError(core::ErrorCode::AlreadyExists, "Asset index contains a duplicate ID");
+        if (marker == "ASSET")
+        {
+            std::string format, relativeText, hash;
+            AssetReference reference;
+            if (!(record >> reference.id.value >> std::quoted(relativeText) >> format
+                >> reference.width >> reference.height >> reference.sourceSize >> hash) || hasExtra(record))
+                return assetError(core::ErrorCode::ParseError, "Invalid image asset index entry");
+            if ((format != "PNG" && format != "JPEG") || !validHash(hash) || !validUtf8(relativeText)
+                || relativeText.size() > MaxAssetPathBytes
+                || !validDimensions(reference.width, reference.height) || reference.sourceSize == 0 || reference.sourceSize > MaxImageBytes)
+                return assetError(core::ErrorCode::ValidationError, "Asset index contains invalid image metadata");
+            reference.format = format == "PNG" ? ImageFormat::Png : ImageFormat::Jpeg;
+            reference.sourceRelativePath = relativeText;
+            reference.sha256 = std::move(hash);
+            const auto sourcePath = fromUtf8(reference.sourceRelativePath);
+            if (reference.id.value == 0 || reference.sourceRelativePath.find('\0') != std::string::npos
+                || !validRelative(sourcePath) || sourcePath != sourcePath.lexically_normal())
+                return assetError(core::ErrorCode::ValidationError, "Asset index contains an invalid ID or source path");
+            if (!registeredPaths.emplace(reference.sourceRelativePath).second)
+                return assetError(core::ErrorCode::AlreadyExists, "Asset index contains a duplicate source path");
+            if (!registeredIds.emplace(reference.id.value).second)
+                return assetError(core::ErrorCode::AlreadyExists, "Asset index contains a duplicate asset ID");
+            maximumId = std::max(maximumId, reference.id.value);
+            registry.entries_.emplace(reference.id, std::move(reference));
+        }
+        else if (marker == "SCRIPT" && indexVersion >= 2)
+        {
+            ScriptAssetReference reference;
+            if (!(record >> reference.id.value >> std::quoted(reference.sourceRelativePath)
+                >> std::quoted(reference.managedTypeName) >> std::quoted(reference.assemblyRelativePath)
+                >> std::quoted(reference.runtimeConfigRelativePath) >> reference.sourceSha256) || hasExtra(record))
+                return assetError(core::ErrorCode::ParseError, "Invalid script asset index entry");
+            const auto sourcePath = fromUtf8(reference.sourceRelativePath);
+            const auto assemblyPath = fromUtf8(reference.assemblyRelativePath);
+            const auto runtimeConfigPath = fromUtf8(reference.runtimeConfigRelativePath);
+            if (reference.id.value == 0 || reference.id.value == std::numeric_limits<std::uint64_t>::max()
+                || !validUtf8(reference.sourceRelativePath)
+                || !validUtf8(reference.managedTypeName) || !validUtf8(reference.assemblyRelativePath)
+                || !validUtf8(reference.runtimeConfigRelativePath) || reference.sourceRelativePath.find('\0') != std::string::npos
+                || reference.assemblyRelativePath.find('\0') != std::string::npos
+                || reference.runtimeConfigRelativePath.find('\0') != std::string::npos
+                || reference.sourceRelativePath.size() > MaxAssetPathBytes
+                || reference.assemblyRelativePath.size() > MaxAssetPathBytes
+                || reference.runtimeConfigRelativePath.size() > MaxAssetPathBytes
+                || !validManagedTypeName(reference.managedTypeName) || !validHash(reference.sourceSha256)
+                || !validRelative(sourcePath) || sourcePath != sourcePath.lexically_normal()
+                || !hasPathPrefix(sourcePath, std::filesystem::path("Scripts")) || utf8(sourcePath.extension()) != ".cs"
+                || !validRelative(assemblyPath) || assemblyPath != assemblyPath.lexically_normal()
+                || !hasPathPrefix(assemblyPath, std::filesystem::path("Library") / "Scripts")
+                || utf8(assemblyPath.extension()) != ".dll"
+                || !validRelative(runtimeConfigPath) || runtimeConfigPath != runtimeConfigPath.lexically_normal()
+                || !hasPathPrefix(runtimeConfigPath, std::filesystem::path("Library") / "Scripts")
+                || !utf8(runtimeConfigPath.filename()).ends_with(".runtimeconfig.json"))
+                return assetError(core::ErrorCode::ValidationError, "Asset index contains invalid script metadata");
+            if (!registeredScriptPaths.emplace(reference.sourceRelativePath).second)
+                return assetError(core::ErrorCode::AlreadyExists, "Asset index contains a duplicate script source path");
+            const auto typeKey = reference.assemblyRelativePath + "\n" + reference.managedTypeName;
+            if (!registeredScriptTypes.emplace(typeKey).second)
+                return assetError(core::ErrorCode::AlreadyExists, "Asset index contains a duplicate managed type mapping");
+            if (!registeredIds.emplace(reference.id.value).second)
+                return assetError(core::ErrorCode::AlreadyExists, "Asset index contains a duplicate asset ID");
+            maximumId = std::max(maximumId, reference.id.value);
+            registry.scriptEntries_.emplace(reference.id, std::move(reference));
+        }
+        else if (marker == "MODEL" && indexVersion >= 3)
+        {
+            ModelAssetReference reference;
+            if (!(record >> reference.id.value >> std::quoted(reference.sourceRelativePath)
+                >> reference.sourceSize >> reference.sourceSha256 >> reference.importContentHash) || hasExtra(record))
+                return assetError(core::ErrorCode::ParseError, "Invalid model asset index entry");
+            const auto sourcePath = fromUtf8(reference.sourceRelativePath);
+            const auto extension = utf8(sourcePath.extension());
+            if (reference.id.value == 0 || !validUtf8(reference.sourceRelativePath)
+                || reference.sourceRelativePath.find('\0') != std::string::npos
+                || reference.sourceRelativePath.size() > MaxAssetPathBytes
+                || !validHash(reference.sourceSha256) || !validHash(reference.importContentHash)
+                || reference.sourceSize == 0 || reference.sourceSize > MaxModelSourceBytes
+                || !validRelative(sourcePath) || sourcePath != sourcePath.lexically_normal()
+                || (extension != ".gltf" && extension != ".glb"))
+                return assetError(core::ErrorCode::ValidationError, "Asset index contains invalid model metadata");
+            if (!registeredModelPaths.emplace(reference.sourceRelativePath).second
+                || !registeredPaths.emplace(reference.sourceRelativePath).second)
+                return assetError(core::ErrorCode::AlreadyExists, "Asset index contains a duplicate model source path");
+            if (!registeredIds.emplace(reference.id.value).second)
+                return assetError(core::ErrorCode::AlreadyExists, "Asset index contains a duplicate asset ID");
+            maximumId = std::max(maximumId, reference.id.value);
+            registry.modelEntries_.emplace(reference.id, std::move(reference));
+        }
+        else
+            return assetError(core::ErrorCode::ValidationError, "Unknown or unsupported asset index record: " + marker);
+        if (registry.entries_.size() + registry.scriptEntries_.size() + registry.modelEntries_.size() > MaxAssetEntries)
+            return assetError(core::ErrorCode::ValidationError, "Asset index exceeds 100000 total entries");
     }
     if (!ended || input.bad()) return assetError(core::ErrorCode::ParseError, "Asset index terminator is missing or unreadable");
     while (nextLine())
@@ -604,12 +1181,14 @@ core::Result<AssetRegistry> AssetRegistry::open(const std::filesystem::path& pro
     return core::Result<AssetRegistry>::success(std::move(registry));
 }
 
-core::Result<void> AssetRegistry::saveIndex(const std::map<AssetId, AssetReference>& entries, const std::uint64_t nextId) const
+core::Result<void> AssetRegistry::saveIndex(const std::map<AssetId, AssetReference>& entries,
+    const std::map<AssetId, ScriptAssetReference>& scripts,
+    const std::map<AssetId, ModelAssetReference>& models, const std::uint64_t nextId) const
 {
-    if (entries.size() > MaxAssetEntries)
-        return core::Result<void>::failure({core::ErrorCode::ValidationError, "Asset index exceeds 100000 entries"});
+    if (entries.size() + scripts.size() + models.size() > MaxAssetEntries)
+        return core::Result<void>::failure({core::ErrorCode::ValidationError, "Asset index exceeds 100000 total entries"});
     std::ostringstream output; output.imbue(std::locale::classic());
-    output << "ASTRO_ASSETS 1\nNEXT " << nextId << '\n';
+    output << "ASTRO_ASSETS 3\nNEXT " << nextId << '\n';
     for (const auto& [id, reference] : entries)
     {
         if (reference.sourceRelativePath.size() > MaxAssetPathBytes)
@@ -617,6 +1196,36 @@ core::Result<void> AssetRegistry::saveIndex(const std::map<AssetId, AssetReferen
         output << "ASSET " << id.value << ' ' << std::quoted(reference.sourceRelativePath) << ' '
                << imageFormatName(reference.format) << ' ' << reference.width << ' ' << reference.height << ' '
                << reference.sourceSize << ' ' << reference.sha256 << '\n';
+        if (output.tellp() > static_cast<std::streamoff>(MaxIndexBytes))
+            return core::Result<void>::failure({core::ErrorCode::ValidationError, "Asset index exceeds 16 MiB"});
+    }
+    for (const auto& [id, script] : scripts)
+    {
+        if (script.sourceRelativePath.size() > MaxAssetPathBytes || script.managedTypeName.size() > MaxManagedTypeNameBytes
+            || script.assemblyRelativePath.size() > MaxAssetPathBytes
+            || script.runtimeConfigRelativePath.size() > MaxAssetPathBytes || !validHash(script.sourceSha256))
+            return core::Result<void>::failure({core::ErrorCode::ValidationError, "Script asset metadata exceeds its bounds"});
+        output << "SCRIPT " << id.value << ' ' << std::quoted(script.sourceRelativePath) << ' '
+               << std::quoted(script.managedTypeName) << ' ' << std::quoted(script.assemblyRelativePath) << ' '
+               << std::quoted(script.runtimeConfigRelativePath) << ' ' << script.sourceSha256 << '\n';
+        if (output.tellp() > static_cast<std::streamoff>(MaxIndexBytes))
+            return core::Result<void>::failure({core::ErrorCode::ValidationError, "Asset index exceeds 16 MiB"});
+    }
+    for (const auto& [id, model] : models)
+    {
+        const auto modelPath = fromUtf8(model.sourceRelativePath);
+        const auto extension = utf8(modelPath.extension());
+        if (id.value == 0 || id.value == std::numeric_limits<std::uint64_t>::max()
+            || !validUtf8(model.sourceRelativePath) || model.sourceRelativePath.find('\0') != std::string::npos
+            || !validRelative(modelPath) || modelPath != modelPath.lexically_normal()
+            || (extension != ".gltf" && extension != ".glb")
+            || model.sourceRelativePath.size() > MaxAssetPathBytes || model.sourceSize == 0
+            || model.sourceSize > MaxModelSourceBytes || !validHash(model.sourceSha256)
+            || !validHash(model.importContentHash))
+            return core::Result<void>::failure({core::ErrorCode::ValidationError,
+                "Model asset metadata is invalid or exceeds its bounds"});
+        output << "MODEL " << id.value << ' ' << std::quoted(model.sourceRelativePath) << ' '
+               << model.sourceSize << ' ' << model.sourceSha256 << ' ' << model.importContentHash << '\n';
         if (output.tellp() > static_cast<std::streamoff>(MaxIndexBytes))
             return core::Result<void>::failure({core::ErrorCode::ValidationError, "Asset index exceeds 16 MiB"});
     }
@@ -633,10 +1242,312 @@ const AssetReference* AssetRegistry::find(const AssetId id) const noexcept
     return found == entries_.end() ? nullptr : &found->second;
 }
 
+const ScriptAssetReference* AssetRegistry::findScript(const AssetId id) const noexcept
+{
+    const auto found = scriptEntries_.find(id);
+    return found == scriptEntries_.end() ? nullptr : &found->second;
+}
+
+const ModelAssetReference* AssetRegistry::findModel(const AssetId id) const noexcept
+{
+    const auto found = modelEntries_.find(id);
+    return found == modelEntries_.end() ? nullptr : &found->second;
+}
+
+core::Result<ResolvedModelAsset> AssetRegistry::resolveModel(const AssetId id) const
+{
+    const auto* reference = findModel(id);
+    if (!reference)
+        return resolvedModelError(core::ErrorCode::NotFound, "Model AssetId is not registered");
+    const auto relative = fromUtf8(reference->sourceRelativePath);
+    const auto extension = utf8(relative.extension());
+    if ((extension != ".gltf" && extension != ".glb") || !validRelative(relative)
+        || relative != relative.lexically_normal())
+        return resolvedModelError(core::ErrorCode::ValidationError, "Registered model path is invalid");
+    auto source = resolveSource(assetsRoot_, relative);
+    if (!source) return resolvedModelError(source.error().code, source.error().message);
+    auto bytes = readModelSource(source.value());
+    if (!bytes) return resolvedModelError(bytes.error().code, bytes.error().message);
+    if (bytes.value().size() != reference->sourceSize || sha256Hex(bytes.value()) != reference->sourceSha256)
+        return resolvedModelError(core::ErrorCode::InvalidState,
+            "Model source changed after registration; import and register it again");
+    return core::Result<ResolvedModelAsset>::success({id, source.value(), reference->importContentHash});
+}
+
+core::Result<ResolvedScriptAsset> AssetRegistry::resolveScript(const AssetId id) const
+{
+    const auto* reference = findScript(id);
+    if (!reference)
+        return resolvedScriptError(core::ErrorCode::NotFound, "Script AssetId is not registered");
+    const auto sourceRelative = fromUtf8(reference->sourceRelativePath);
+    const auto assemblyRelative = fromUtf8(reference->assemblyRelativePath);
+    const auto runtimeConfigRelative = fromUtf8(reference->runtimeConfigRelativePath);
+    auto source = resolveProjectFile(projectRoot_, sourceRelative, "Scripts", ".cs", "C# source");
+    if (!source) return resolvedScriptError(source.error().code, source.error().message);
+    auto assembly = resolveProjectFile(projectRoot_, assemblyRelative,
+        std::filesystem::path("Library") / "Scripts", ".dll", "Managed assembly");
+    if (!assembly) return resolvedScriptError(assembly.error().code, assembly.error().message);
+    auto runtimeConfig = resolveProjectFile(projectRoot_, runtimeConfigRelative,
+        std::filesystem::path("Library") / "Scripts", ".runtimeconfig.json", "Managed runtimeconfig");
+    if (!runtimeConfig) return resolvedScriptError(runtimeConfig.error().code, runtimeConfig.error().message);
+    auto sourceBytes = readScriptSource(source.value());
+    if (!sourceBytes) return resolvedScriptError(sourceBytes.error().code, sourceBytes.error().message);
+    if (sha256Hex(sourceBytes.value()) != reference->sourceSha256)
+        return resolvedScriptError(core::ErrorCode::InvalidState,
+            "C# source changed after the script asset was registered; rebuild and register it again");
+    return core::Result<ResolvedScriptAsset>::success({id, source.value(), assembly.value(),
+        runtimeConfig.value(), reference->managedTypeName});
+}
+
+core::Result<ScriptAssetReference> AssetRegistry::registerScript(
+    const std::filesystem::path& sourceRelativePath, std::string managedTypeName,
+    const std::filesystem::path& assemblyRelativePath,
+    const std::filesystem::path& runtimeConfigRelativePath)
+{
+    auto sourceText = utf8(sourceRelativePath);
+    auto assemblyText = utf8(assemblyRelativePath);
+    auto runtimeConfigText = utf8(runtimeConfigRelativePath);
+    if (!validUtf8(sourceText) || !validUtf8(assemblyText) || !validUtf8(runtimeConfigText)
+        || sourceText.find('\0') != std::string::npos || assemblyText.find('\0') != std::string::npos
+        || runtimeConfigText.find('\0') != std::string::npos
+        || sourceText.size() > MaxAssetPathBytes || assemblyText.size() > MaxAssetPathBytes
+        || runtimeConfigText.size() > MaxAssetPathBytes || !validManagedTypeName(managedTypeName))
+        return scriptReferenceError(core::ErrorCode::ValidationError,
+            "Script asset paths or managed type name are invalid or exceed their bounds");
+
+    auto source = resolveProjectFile(projectRoot_, sourceRelativePath, "Scripts", ".cs", "C# source");
+    if (!source) return scriptReferenceError(source.error().code, source.error().message);
+    auto assembly = resolveProjectFile(projectRoot_, assemblyRelativePath,
+        std::filesystem::path("Library") / "Scripts", ".dll", "Managed assembly");
+    if (!assembly) return scriptReferenceError(assembly.error().code, assembly.error().message);
+    auto runtimeConfig = resolveProjectFile(projectRoot_, runtimeConfigRelativePath,
+        std::filesystem::path("Library") / "Scripts", ".runtimeconfig.json", "Managed runtimeconfig");
+    if (!runtimeConfig) return scriptReferenceError(runtimeConfig.error().code, runtimeConfig.error().message);
+    sourceText = utf8(source.value().lexically_relative(projectRoot_));
+    assemblyText = utf8(assembly.value().lexically_relative(projectRoot_));
+    runtimeConfigText = utf8(runtimeConfig.value().lexically_relative(projectRoot_));
+    if (sourceText.size() > MaxAssetPathBytes || assemblyText.size() > MaxAssetPathBytes
+        || runtimeConfigText.size() > MaxAssetPathBytes)
+        return scriptReferenceError(core::ErrorCode::ValidationError,
+            "Canonical script asset paths exceed the 4096 UTF-8 byte limit");
+    auto sourceBytes = readScriptSource(source.value());
+    if (!sourceBytes) return scriptReferenceError(sourceBytes.error().code, sourceBytes.error().message);
+
+    const auto sourceHash = sha256Hex(sourceBytes.value());
+    auto updatedScripts = scriptEntries_;
+    auto existing = std::find_if(updatedScripts.begin(), updatedScripts.end(), [&](const auto& item) {
+        return item.second.sourceRelativePath == sourceText;
+    });
+    for (const auto& [registeredId, registered] : updatedScripts)
+        if (registered.assemblyRelativePath == assemblyText && registered.managedTypeName == managedTypeName
+            && (existing == updatedScripts.end() || registeredId != existing->first))
+            return scriptReferenceError(core::ErrorCode::AlreadyExists,
+                "This managed type is already registered in the selected assembly");
+
+    ScriptAssetReference reference;
+    if (existing != updatedScripts.end())
+    {
+        reference = existing->second;
+        reference.managedTypeName = std::move(managedTypeName);
+        reference.assemblyRelativePath = assemblyText;
+        reference.runtimeConfigRelativePath = runtimeConfigText;
+        reference.sourceSha256 = sourceHash;
+        existing->second = reference;
+    }
+    else
+    {
+        if (entries_.size() + scriptEntries_.size() + modelEntries_.size() >= MaxAssetEntries)
+            return scriptReferenceError(core::ErrorCode::ValidationError, "Asset index exceeds 100000 total entries");
+        if (nextId_ == 0 || nextId_ == std::numeric_limits<std::uint64_t>::max())
+            return scriptReferenceError(core::ErrorCode::InvalidState, "Asset ID space is exhausted");
+        reference = {{nextId_}, sourceText, std::move(managedTypeName), assemblyText, runtimeConfigText, sourceHash};
+        updatedScripts.emplace(reference.id, reference);
+    }
+
+    const auto newNextId = existing == updatedScripts.end() ? nextId_ + 1 : nextId_;
+    const auto saved = saveIndex(entries_, updatedScripts, modelEntries_, newNextId);
+    if (!saved) return scriptReferenceError(saved.error().code, saved.error().message);
+    scriptEntries_ = std::move(updatedScripts);
+    nextId_ = newNextId;
+    return core::Result<ScriptAssetReference>::success(std::move(reference));
+}
+
+ScriptBuildReport AssetRegistry::inspectScriptBuild() const
+{
+    ScriptBuildReport report;
+    auto state = readScriptBuildState(projectRoot_);
+    if (!state)
+    {
+        if (state.error().code == core::ErrorCode::NotFound)
+        {
+            report.freshness = ScriptBuildFreshness::Missing;
+            report.diagnostics.push_back(state.error().message);
+        }
+        else
+        {
+            report.freshness = ScriptBuildFreshness::Invalid;
+            report.diagnostics.push_back(state.error().message);
+        }
+        return report;
+    }
+    report.fingerprint = state.value().fingerprint;
+    report.sdkVersion = state.value().sdkVersion;
+    report.assemblyRelativePath = state.value().assemblyRelativePath;
+    report.assemblySha256 = state.value().assemblySha256;
+    report.runtimeConfigRelativePath = state.value().runtimeConfigRelativePath;
+    report.runtimeConfigSha256 = state.value().runtimeConfigSha256;
+    const auto validated = validateScriptBuildState(projectRoot_, state.value());
+    if (!validated)
+    {
+        report.freshness = validated.error().code == core::ErrorCode::InvalidState
+            || validated.error().code == core::ErrorCode::IoError
+            ? ScriptBuildFreshness::Stale : ScriptBuildFreshness::Invalid;
+        report.diagnostics.push_back(validated.error().message);
+        return report;
+    }
+
+    report.freshness = ScriptBuildFreshness::Current;
+    std::set<std::string> boundSources;
+    for (const auto& binding : state.value().bindings)
+    {
+        boundSources.insert(binding.sourceRelativePath);
+        ScriptBuildBindingStatus item;
+        item.sourceRelativePath = binding.sourceRelativePath;
+        item.sourceSha256 = state.value().sources.at(binding.sourceRelativePath);
+        item.managedTypeName = binding.managedTypeName;
+        const auto source = state.value().sources.find(binding.sourceRelativePath);
+        const auto existing = std::find_if(scriptEntries_.begin(), scriptEntries_.end(), [&](const auto& entry) {
+            return entry.second.sourceRelativePath == binding.sourceRelativePath;
+        });
+        if (existing != scriptEntries_.end())
+        {
+            item.assetId = existing->first;
+            if (existing->second.managedTypeName != binding.managedTypeName)
+                item.diagnostic = "Registered managed type differs from the current build binding; register the current build";
+            else if (existing->second.sourceSha256 != source->second)
+                item.diagnostic = "Registered source hash differs from the current build; register the current build";
+            else if (existing->second.assemblyRelativePath != state.value().assemblyRelativePath
+                || existing->second.runtimeConfigRelativePath != state.value().runtimeConfigRelativePath)
+                item.diagnostic = "Registered assembly output differs from the current build; register the current build";
+            else
+                item.registered = true;
+        }
+        if (!item.registered)
+        {
+            report.requiresRegistration = true;
+            if (existing == scriptEntries_.end())
+                item.diagnostic = "Managed type is selected but not registered in the project asset index";
+        }
+        report.bindings.push_back(std::move(item));
+    }
+    for (const auto& [source, hash] : state.value().sources)
+        if (!boundSources.contains(source))
+            report.diagnostics.push_back("No managed type is selected for C# source: " + source);
+    for (const auto& [id, reference] : scriptEntries_)
+        if (!boundSources.contains(reference.sourceRelativePath))
+            report.diagnostics.push_back("Registered Script AssetId " + std::to_string(id.value)
+                + " is not selected by the current C# build manifest: " + reference.sourceRelativePath);
+    if (state.value().bindings.empty())
+        report.diagnostics.push_back("No managed type bindings are configured in the C# build manifest");
+    return report;
+}
+
+core::Result<std::vector<ScriptAssetReference>> AssetRegistry::registerScriptsFromBuild()
+{
+    const auto state = readScriptBuildState(projectRoot_);
+    if (!state)
+        return core::Result<std::vector<ScriptAssetReference>>::failure(state.error());
+    const auto validated = validateScriptBuildState(projectRoot_, state.value());
+    if (!validated)
+        return core::Result<std::vector<ScriptAssetReference>>::failure(validated.error());
+    if (state.value().bindings.empty())
+        return core::Result<std::vector<ScriptAssetReference>>::success({});
+
+    std::error_code error;
+    const auto canonicalProject = std::filesystem::canonical(projectRoot_, error);
+    if (error)
+        return core::Result<std::vector<ScriptAssetReference>>::failure({core::ErrorCode::IoError,
+            "Cannot resolve project root while registering C# build: " + error.message()});
+    auto assembly = resolveProjectFile(canonicalProject, fromUtf8(state.value().assemblyRelativePath),
+        std::filesystem::path("Library") / "Scripts", ".dll", "Managed assembly");
+    if (!assembly) return core::Result<std::vector<ScriptAssetReference>>::failure(assembly.error());
+    auto runtimeConfig = resolveProjectFile(canonicalProject, fromUtf8(state.value().runtimeConfigRelativePath),
+        std::filesystem::path("Library") / "Scripts", ".runtimeconfig.json", "Managed runtimeconfig");
+    if (!runtimeConfig) return core::Result<std::vector<ScriptAssetReference>>::failure(runtimeConfig.error());
+    const auto assemblyText = utf8(assembly.value().lexically_relative(canonicalProject));
+    const auto runtimeConfigText = utf8(runtimeConfig.value().lexically_relative(canonicalProject));
+    if (assemblyText.size() > MaxAssetPathBytes || runtimeConfigText.size() > MaxAssetPathBytes)
+        return core::Result<std::vector<ScriptAssetReference>>::failure({core::ErrorCode::ValidationError,
+            "C# build output paths exceed the 4096 UTF-8 byte limit"});
+
+    auto updatedScripts = scriptEntries_;
+    auto nextId = nextId_;
+    std::vector<ScriptAssetReference> registered;
+    registered.reserve(state.value().bindings.size());
+    for (const auto& binding : state.value().bindings)
+    {
+        const auto sourcePath = fromUtf8(binding.sourceRelativePath);
+        auto source = resolveProjectFile(canonicalProject, sourcePath, "Scripts", ".cs", "C# source");
+        if (!source) return core::Result<std::vector<ScriptAssetReference>>::failure(source.error());
+        const auto sourceText = utf8(source.value().lexically_relative(canonicalProject));
+        if (sourceText.size() > MaxAssetPathBytes || !validManagedTypeName(binding.managedTypeName))
+            return core::Result<std::vector<ScriptAssetReference>>::failure({core::ErrorCode::ValidationError,
+                "C# build binding source or managed type name is invalid"});
+        const auto expectedSource = state.value().sources.find(binding.sourceRelativePath);
+        if (expectedSource == state.value().sources.end())
+            return core::Result<std::vector<ScriptAssetReference>>::failure({core::ErrorCode::ValidationError,
+                "C# build binding references a source missing from its build snapshot"});
+        const auto existing = std::find_if(updatedScripts.begin(), updatedScripts.end(), [&](const auto& entry) {
+            return entry.second.sourceRelativePath == sourceText;
+        });
+        ScriptAssetReference reference;
+        if (existing != updatedScripts.end())
+        {
+            reference = existing->second;
+            reference.managedTypeName = binding.managedTypeName;
+            reference.assemblyRelativePath = assemblyText;
+            reference.runtimeConfigRelativePath = runtimeConfigText;
+            reference.sourceSha256 = expectedSource->second;
+            existing->second = reference;
+        }
+        else
+        {
+            if (entries_.size() + updatedScripts.size() + modelEntries_.size() >= MaxAssetEntries)
+                return core::Result<std::vector<ScriptAssetReference>>::failure({core::ErrorCode::ValidationError,
+                    "Asset index exceeds 100000 total entries"});
+            if (nextId == 0 || nextId == std::numeric_limits<std::uint64_t>::max())
+                return core::Result<std::vector<ScriptAssetReference>>::failure({core::ErrorCode::InvalidState,
+                    "Asset ID space is exhausted"});
+            reference = {{nextId++}, sourceText, binding.managedTypeName, assemblyText,
+                runtimeConfigText, expectedSource->second};
+            updatedScripts.emplace(reference.id, reference);
+        }
+        registered.push_back(std::move(reference));
+    }
+    std::set<std::pair<std::string, std::string>> registeredTypes;
+    for (const auto& [id, reference] : updatedScripts)
+    {
+        static_cast<void>(id);
+        if (!registeredTypes.emplace(reference.assemblyRelativePath, reference.managedTypeName).second)
+            return core::Result<std::vector<ScriptAssetReference>>::failure({core::ErrorCode::AlreadyExists,
+                "Multiple script sources select the same managed type in one assembly"});
+    }
+    const auto saved = saveIndex(entries_, updatedScripts, modelEntries_, nextId);
+    if (!saved) return core::Result<std::vector<ScriptAssetReference>>::failure(saved.error());
+    scriptEntries_ = std::move(updatedScripts);
+    nextId_ = nextId;
+    return core::Result<std::vector<ScriptAssetReference>>::success(std::move(registered));
+}
+
 std::vector<AssetId> AssetRegistry::missingAssets() const
 {
     std::vector<AssetId> missing;
     for (const auto& [id, reference] : entries_)
+    {
+        auto source = resolveSource(assetsRoot_, fromUtf8(reference.sourceRelativePath));
+        if (!source) missing.push_back(id);
+    }
+    for (const auto& [id, reference] : modelEntries_)
     {
         auto source = resolveSource(assetsRoot_, fromUtf8(reference.sourceRelativePath));
         if (!source) missing.push_back(id);
@@ -657,6 +1568,64 @@ std::filesystem::path AssetRegistry::cachedPath(const AssetId id) const
     const auto bytes = readBytes(canonical);
     if (!bytes || bytes.value().size() != reference->sourceSize || sha256Hex(bytes.value()) != reference->sha256) return {};
     return canonical;
+}
+
+core::Result<ModelAssetReference> AssetRegistry::registerModel(
+    const std::filesystem::path& sourceRelativePath, std::string importContentHash)
+{
+    if (!validHash(importContentHash))
+        return modelReferenceError(core::ErrorCode::ValidationError,
+            "Imported model content hash must be a lowercase SHA-256 value");
+    const auto extension = utf8(sourceRelativePath.extension());
+    if (extension != ".gltf" && extension != ".glb")
+        return modelReferenceError(core::ErrorCode::ValidationError,
+            "Model source extension must be .gltf or .glb");
+    auto resolved = resolveSource(assetsRoot_, sourceRelativePath);
+    if (!resolved) return modelReferenceError(resolved.error().code, resolved.error().message);
+    auto relative = resolved.value().lexically_relative(assetsRoot_).lexically_normal();
+    const auto relativeText = utf8(relative);
+    if (!validUtf8(relativeText) || relativeText.find('\0') != std::string::npos
+        || relativeText.size() > MaxAssetPathBytes || !validRelative(relative))
+        return modelReferenceError(core::ErrorCode::ValidationError,
+            "Model source path is invalid or exceeds 4096 UTF-8 bytes");
+    if (std::any_of(entries_.begin(), entries_.end(), [&](const auto& entry) {
+        return entry.second.sourceRelativePath == relativeText;
+    }))
+        return modelReferenceError(core::ErrorCode::AlreadyExists,
+            "This source path is already registered as an image asset");
+    auto bytes = readModelSource(resolved.value());
+    if (!bytes) return modelReferenceError(bytes.error().code, bytes.error().message);
+
+    auto updated = modelEntries_;
+    auto existing = std::find_if(updated.begin(), updated.end(), [&](const auto& item) {
+        return item.second.sourceRelativePath == relativeText;
+    });
+    ModelAssetReference reference;
+    if (existing != updated.end())
+    {
+        reference = existing->second;
+        reference.sourceSize = static_cast<std::uint64_t>(bytes.value().size());
+        reference.sourceSha256 = sha256Hex(bytes.value());
+        reference.importContentHash = std::move(importContentHash);
+        existing->second = reference;
+    }
+    else
+    {
+        if (entries_.size() + scriptEntries_.size() + modelEntries_.size() >= MaxAssetEntries)
+            return modelReferenceError(core::ErrorCode::ValidationError,
+                "Asset index exceeds 100000 total entries");
+        if (nextId_ == 0 || nextId_ == std::numeric_limits<std::uint64_t>::max())
+            return modelReferenceError(core::ErrorCode::InvalidState, "Asset ID space is exhausted");
+        reference = {{nextId_}, relativeText, static_cast<std::uint64_t>(bytes.value().size()),
+            sha256Hex(bytes.value()), std::move(importContentHash)};
+        updated.emplace(reference.id, reference);
+    }
+    const auto newNextId = existing == updated.end() ? nextId_ + 1 : nextId_;
+    const auto saved = saveIndex(entries_, scriptEntries_, updated, newNextId);
+    if (!saved) return modelReferenceError(saved.error().code, saved.error().message);
+    modelEntries_ = std::move(updated);
+    nextId_ = newNextId;
+    return core::Result<ModelAssetReference>::success(std::move(reference));
 }
 
 core::Result<AssetReference> AssetRegistry::importImage(const std::filesystem::path& sourceRelativePath)
@@ -692,7 +1661,7 @@ core::Result<AssetReference> AssetRegistry::importImage(const std::filesystem::p
     if (!cached) return referenceError(cached.error().code, cached.error().message);
     auto updated = entries_;
     updated.emplace(reference.id, reference);
-    const auto indexSaved = saveIndex(updated, nextId_ + 1);
+    const auto indexSaved = saveIndex(updated, scriptEntries_, modelEntries_, nextId_ + 1);
     if (!indexSaved) return referenceError(indexSaved.error().code, indexSaved.error().message);
     entries_ = std::move(updated);
     ++nextId_;
@@ -720,7 +1689,7 @@ core::Result<AssetReference> AssetRegistry::reimport(const AssetId id)
     if (!cached) return referenceError(cached.error().code, cached.error().message);
     auto updated = entries_;
     updated[id] = updatedReference;
-    const auto indexSaved = saveIndex(updated, nextId_);
+    const auto indexSaved = saveIndex(updated, scriptEntries_, modelEntries_, nextId_);
     if (!indexSaved) return referenceError(indexSaved.error().code, indexSaved.error().message);
     entries_ = std::move(updated);
     return core::Result<AssetReference>::success(std::move(updatedReference));

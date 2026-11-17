@@ -81,6 +81,21 @@ commands.redo();
 
 В 01.5 добавлены in-memory транзакции и Undo/Redo. Scene Model-команды `entity.set_property` и `entity.set_sprite_renderer` транзакционные; нет внешнего/неизменяемого audit, `dry-run diff`, сохранения истории и гарантированного восстановления при сбое самого rollback. Подробности: [отчёт 01.4](reports/01.4.md), [01.5](reports/01.5.md), [02.3](reports/02.3.md), [03.3](reports/03.3.md).
 
+## Локальный AI Editor API (09.1)
+
+`astro::core::AIEditorApi` (`astro/core/AIEditorApi.hpp`) — библиотечный фасад текущего процесса над `CommandRegistry`. `version()` возвращает API 1.0; `commandCatalog()` отдаёт зарегистрированные схемы в стабильном лексикографическом порядке; typed `validate` и `execute` делегируют в тот же registry. `RegisteredCommandSchema` включает ID, версию, человекочитаемое описание, описание полей payload, тип результата и признак транзакционности. Каталог отражает только команды, зарегистрированные конкретной конфигурацией Editor.
+
+```cpp
+astro::core::AIEditorApi aiApi(commands);
+for (const auto& command : aiApi.commandCatalog())
+    std::cout << command.schema.id << " v" << command.schema.version << '\\n';
+auto preview = aiApi.validate("entity.set_property", 1, payload);
+auto applied = aiApi.execute<astro::scene::SetScenePropertyPayload, void>(
+    "entity.set_property", 1, payload);
+```
+
+Пока фасад принимает C++ payload конкретного типа. Он не сериализует JSON, не принимает произвольные текстовые команды и не проверяет разрешения/подтверждение; in-process клиент считается доверенным. Каталог — описание реально зарегистрированных команд, а не обещание их универсальной исполнимости из внешнего адаптера. Новые операции должны добавить фактический command registration, метаданные и тесты вместе с соответствующей подсистемой.
+
 ## Команда Scene Model 02.3
 
 Регистрируйте модель сцены через `astro::scene::registerSceneCommands(registry, scene)`. Она добавляет `entity.set_property` версии 1. Пример payload:
@@ -96,6 +111,8 @@ auto applied = commands.execute<astro::scene::SetScenePropertyPayload, void>(
 `validate` проверяет схему и не меняет сцену; `execute` проверяет повторно и применяет изменение. Payload содержит `std::variant<std::string, EntityId>`, однако текущая схема разрешает изменять только `name`. Значение имени обязано быть валидным UTF-8, непустым (кроме пробелов), не содержать NUL и занимать не более 240 байт. `id` доступен только для чтения.
 
 В 02.4 команда `entity.set_property` Name стала транзакционной: предыдущая строка восстанавливается через Undo, повторное применение — через Redo. В 03.3 добавлена `entity.set_sprite_renderer` v1 с payload `{entity, AssetId, visible}`; новая компонента удаляется Undo, Redo возвращает прежнее значение. Она проверяет entity и ненулевой AssetId, но наличие AssetId в проектном Registry отдельно диагностируется редактором. Это покрыто integration-тестами. Нет внешнего/неизменяемого audit, `dry-run diff`, сохранения истории и гарантированного восстановления при сбое rollback. Подробности: [отчёт 02.4](reports/02.4.md), [03.3](reports/03.3.md).
+
+В 04.14 добавлены транзакционные Scene-команды `script_behavior.add` (`entity`, `script_asset`, `managed_type`; создаёт disabled component), `script_behavior.set_enabled` (`entity`, `component`, `enabled`) и `script_behavior.remove` (`entity`, `component`). Они доступны через тот же `CommandRegistry` и `AIEditorApi` catalog. Undo/Redo добавления/удаления восстанавливают ComponentId и порядок binding-ов. Scene-команды проверяют entity, стабильный AssetId и managed type, но не зависят от project Registry; Editor Inspector предлагает только bindings актуальной зарегистрированной сборки и повторно проверяет её перед Add/Enable. Runtime Play consent gate остаётся обязательным и fail-closed. См. [04.14 report](reports/04.14-scriptbehavior-editor-authoring.md).
 
 ## Prefab-команды (03.4)
 

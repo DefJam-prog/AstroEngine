@@ -1,4 +1,5 @@
 #include "astro/render2d/SceneSprites.hpp"
+#include "astro/scene/SceneFile.hpp"
 
 #include <array>
 #include <chrono>
@@ -9,6 +10,7 @@
 #include <iostream>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace
@@ -71,10 +73,51 @@ std::vector<std::uint8_t> png2x3()
     addChunk(png, {'I','E','N','D'}, {});
     return png;
 }
+
+void writeProjectFixture(const std::filesystem::path& root)
+{
+    std::error_code error;
+    if (!std::filesystem::create_directory(root, error) || error)
+        throw std::runtime_error("Fixture project directory already exists or cannot be created");
+    auto registryResult = astro::assets::AssetRegistry::open(root);
+    if (!registryResult) throw std::runtime_error(registryResult.error().message);
+    auto registry = std::move(registryResult).value();
+    const auto source = root / "Assets" / "sprite.png";
+    const auto bytes = png2x3();
+    std::ofstream output(source, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    output.close();
+    auto imported = registry.importImage("sprite.png");
+    if (!imported) throw std::runtime_error(imported.error().message);
+    astro::scene::Scene preview(77, "Project Preview");
+    const auto parent = preview.createEntity("Preview Parent");
+    if (!parent) throw std::runtime_error(parent.error().message);
+    auto parentTransform = preview.transform(parent.value())->value;
+    parentTransform.position = {0.0, 0.0, 0.0};
+    parentTransform.scale = {1.5, 1.5, 1.0};
+    if (!preview.setTransform(parent.value(), parentTransform)) throw std::runtime_error("Cannot set fixture parent transform");
+    const auto sprite = preview.createEntity("Preview Sprite", parent.value());
+    if (!sprite) throw std::runtime_error(sprite.error().message);
+    auto spriteTransform = preview.transform(sprite.value())->value;
+    spriteTransform.scale = {10.0, 10.0, 1.0};
+    if (!preview.setTransform(sprite.value(), spriteTransform)
+        || !preview.setSpriteRenderer(sprite.value(), imported.value().id))
+        throw std::runtime_error("Cannot configure fixture sprite");
+    std::filesystem::create_directories(root / "Scenes", error);
+    if (error) throw std::runtime_error("Cannot create fixture Scenes directory");
+    const auto saved = astro::scene::saveSceneFile(root / "Scenes" / "Preview.scene", preview);
+    if (!saved) throw std::runtime_error(saved.error().message);
+}
 }
 
-int main()
+int main(const int argc, char** argv)
 {
+    if (argc == 3 && std::string_view(argv[1]) == "--write-fixture")
+    {
+        try { writeProjectFixture(std::filesystem::path(argv[2])); return EXIT_SUCCESS; }
+        catch (const std::exception& exception) { std::cerr << "FAIL: fixture: " << exception.what() << '\n'; return EXIT_FAILURE; }
+    }
+    if (argc != 1) return EXIT_FAILURE;
     using namespace astro;
     const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto root = std::filesystem::temp_directory_path() / ("Astro Scene Sprite Tests " + std::to_string(unique));
@@ -88,7 +131,8 @@ int main()
     {
         auto registryResult = assets::AssetRegistry::open(root);
         CHECK(registryResult);
-        if (!registryResult) throw std::runtime_error("AssetRegistry open failed");
+        if (!registryResult)
+            throw std::runtime_error("AssetRegistry open failed: " + registryResult.error().message);
         auto registry = std::move(registryResult).value();
         const auto source = root / "Assets" / "sprite.png";
         const auto bytes = png2x3();
@@ -100,14 +144,21 @@ int main()
         if (!imported) throw std::runtime_error("PNG import failed");
 
         scene::Scene sourceScene(9, "Sprite Scene");
-        const auto visible = sourceScene.createEntity("Visible Sprite");
+        const auto parent = sourceScene.createEntity("Sprite Parent");
+        if (!parent) throw std::runtime_error("Cannot create fixture parent");
+        const auto visible = sourceScene.createEntity("Visible Sprite", parent.value());
         const auto hidden = sourceScene.createEntity("Hidden Sprite");
-        CHECK(visible && hidden);
-        if (!visible || !hidden) throw std::runtime_error("Cannot create fixture entities");
+        CHECK(parent && visible && hidden);
+        if (!parent || !visible || !hidden) throw std::runtime_error("Cannot create fixture entities");
+        auto parentTransform = sourceScene.transform(parent.value())->value;
+        parentTransform.position = {1.0, 2.0, 0.0};
+        parentTransform.rotationDegrees.z = 90.0;
+        parentTransform.scale = {-2.0, 1.0, 1.0};
+        CHECK(sourceScene.setTransform(parent.value(), parentTransform));
         auto transform = sourceScene.transform(visible.value())->value;
-        transform.position = {2.0, -1.5, 7.0};
-        transform.rotationDegrees.z = 30.0;
-        transform.scale = {-2.0, 3.0, 1.0};
+        transform.position = {1.0, 0.0, 0.0};
+        transform.rotationDegrees.z = 45.0;
+        transform.scale = {1.0, 1.0, 1.0};
         CHECK(sourceScene.setTransform(visible.value(), transform));
         CHECK(sourceScene.setSpriteRenderer(visible.value(), imported.value().id, true));
         CHECK(sourceScene.setSpriteRenderer(hidden.value(), imported.value().id, false));
@@ -119,10 +170,11 @@ int main()
         {
             const auto& sprite = canvas.sprites().front();
             CHECK(sprite.asset == imported.value().id);
-            CHECK((sprite.center == render2d::Vec2{2.0, -1.5}));
-            CHECK(std::abs(sprite.size.x - 0.2) < 1e-12);
-            CHECK(std::abs(sprite.size.y - 0.45) < 1e-12);
-            CHECK(sprite.rotationDegrees == 30.0 && sprite.flipX && !sprite.flipY && sprite.layer == 4);
+            CHECK(std::abs(sprite.center.x - 1.0) < 1e-12 && std::abs(sprite.center.y) < 1e-12);
+            CHECK(sprite.hasWorldCorners);
+            CHECK(std::abs(sprite.worldCorners[0].x - 0.9823223304703363) < 1e-12);
+            CHECK(std::abs(sprite.worldCorners[0].y - 0.1767766952966369) < 1e-12);
+            CHECK(sprite.flipX && sprite.layer == 4);
         }
 
         render2d::Canvas2D invalidPpu;
@@ -136,12 +188,24 @@ int main()
         render2d::Canvas2D missingCanvas;
         CHECK(!render2d::appendSceneSprites(missingScene, registry, missingCanvas));
         CHECK(missingCanvas.sprites().empty());
-        scene::Scene childScene(11, "Child sprite");
-        const auto parent = childScene.createEntity("Parent");
-        const auto child = childScene.createEntity("Child", parent.value());
+        scene::Scene childScene(11, "Nested sprite");
+        const auto nestedParent = childScene.createEntity("Parent");
+        if (!nestedParent) throw std::runtime_error("Cannot create hierarchy fixture parent");
+        const auto child = childScene.createEntity("Child", nestedParent.value());
         CHECK(child && childScene.setSpriteRenderer(child.value(), imported.value().id));
+        auto nestedParentTransform = childScene.transform(nestedParent.value())->value;
+        nestedParentTransform.position = {2.0, 3.0, 0.0};
+        nestedParentTransform.rotationDegrees.z = 90.0;
+        CHECK(childScene.setTransform(nestedParent.value(), nestedParentTransform));
+        auto nestedTransform = childScene.transform(child.value())->value;
+        nestedTransform.position = {1.0, 0.0, 0.0};
+        CHECK(childScene.setTransform(child.value(), nestedTransform));
         render2d::Canvas2D childCanvas;
-        CHECK(!render2d::appendSceneSprites(childScene, registry, childCanvas));
+        CHECK(render2d::appendSceneSprites(childScene, registry, childCanvas));
+        CHECK(childCanvas.sprites().size() == 1);
+        CHECK(std::abs(childCanvas.sprites().front().center.x - 2.0) < 1e-12
+            && std::abs(childCanvas.sprites().front().center.y - 4.0) < 1e-12);
+        CHECK(childCanvas.sprites().front().hasWorldCorners);
         CHECK(std::filesystem::exists(source));
     }
     catch (const std::exception& exception) { std::cerr << "FAIL: " << exception.what() << '\n'; ++failures; }

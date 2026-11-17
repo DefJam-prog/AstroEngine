@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <stdexcept>
@@ -222,6 +223,68 @@ int main()
         "slot inspection also reports the unsupported primary version instead of hiding it with backup metadata");
     check(scene.transform(player)->value == beforeUnsupportedVersion,
         "unsupported version with available backup leaves Scene unchanged");
+
+    auto customDirectory = directory / "custom fields";
+    auto customOpened = SaveStore::open(customDirectory, 1);
+    check(customOpened, "open isolated custom-field store");
+    if (!customOpened) return EXIT_FAILURE;
+    auto customStore = std::move(customOpened).value();
+    auto customProfileResult = SaveProfile::create("puzzle-custom", 1);
+    check(customProfileResult, "create custom-field SaveProfile");
+    if (!customProfileResult) return EXIT_FAILURE;
+    auto customProfile = std::move(customProfileResult).value();
+    check(customProfile.addCustomField("puzzle.level", 0.0), "select numeric puzzle level field");
+    check(customProfile.addCustomField("puzzle.unlocked", false), "select boolean puzzle unlocked field");
+    check(customProfile.addCustomField("puzzle.note", std::string{}), "select string puzzle note field");
+    check(!customProfile.addCustomField("../secret", 0.0), "reject path-like custom field key");
+    check(!customProfile.addCustomField("puzzle.level", 1.0), "reject duplicate custom field key");
+    check(!customProfile.addCustomField("puzzle.nan", std::numeric_limits<double>::quiet_NaN()),
+        "reject non-finite custom field type example");
+
+    SaveCustomState customState{
+        {"puzzle.level", 4.0}, {"puzzle.unlocked", true}, {"puzzle.note", std::string("level Ω complete")}
+    };
+    check(!customStore.save(0, scene, customProfile, "1.2.0"),
+        "legacy save overload rejects a profile that requires custom state");
+    auto missingCustom = customState;
+    missingCustom.erase("puzzle.note");
+    check(!customStore.save(0, scene, customProfile, "1.2.0", missingCustom),
+        "reject custom state missing an explicitly selected key");
+    auto wrongTypeCustom = customState;
+    wrongTypeCustom["puzzle.level"] = std::string("four");
+    check(!customStore.save(0, scene, customProfile, "1.2.0", wrongTypeCustom),
+        "reject custom state with a value type different from profile");
+    auto extraCustom = customState;
+    extraCustom["unselected"] = true;
+    check(!customStore.save(0, scene, customProfile, "1.2.0", extraCustom),
+        "reject custom state containing an unselected key");
+    auto nonFiniteCustom = customState;
+    nonFiniteCustom["puzzle.level"] = std::numeric_limits<double>::infinity();
+    check(!customStore.save(0, scene, customProfile, "1.2.0", nonFiniteCustom),
+        "reject non-finite custom state numbers");
+
+    auto customSaved = customStore.save(0, scene, customProfile, "1.2.0", customState);
+    check(customSaved && customSaved.value().slotInfo.propertyCount == 3,
+        "save exactly the selected custom fields in format v2");
+    check(readText(customDirectory / "slot-0.astro-save").starts_with("ASTRO_SAVE 2\n"),
+        "custom field records use the versioned v2 file format");
+    check(customStore.inspect(0) && customStore.inspect(0).value().propertyCount == 3,
+        "inspect custom-field slot count");
+    SaveCustomState restoredCustom{{"existing", false}};
+    auto restored = customStore.load(0, scene, customProfile, "1.2.0", restoredCustom);
+    check(restored && restored.value().appliedProperties == 0,
+        "load custom-only record set without changing Scene fields");
+    check(restoredCustom == customState, "round-trip selected typed custom fields including UTF-8 string");
+    auto changedCustomProfileResult = SaveProfile::create("puzzle-custom", 1);
+    check(changedCustomProfileResult && changedCustomProfileResult.value().addCustomField("puzzle.level", 0.0),
+        "create profile with changed custom selection");
+    const auto customBeforeMismatch = restoredCustom;
+    const auto customMismatch = customStore.load(0, scene, changedCustomProfileResult.value(), "1.2.0", restoredCustom);
+    check(!customMismatch && customMismatch.error().code == core::ErrorCode::VersionMismatch,
+        "reject load after custom-field selection changes without schema bump");
+    check(restoredCustom == customBeforeMismatch, "incompatible custom load leaves caller data untouched");
+    check(scene.transform(player)->value == beforeUnsupportedVersion,
+        "incompatible custom load leaves Scene untouched");
 
 #ifdef _WIN32
     const auto lockedPath = directory / "slot-1.astro-save";

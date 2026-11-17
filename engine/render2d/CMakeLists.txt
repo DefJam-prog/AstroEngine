@@ -9,7 +9,7 @@ else()
     target_compile_options(astro_runtime_render2d PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-if(ASTRO_BUILD_2D_PLAYGROUND OR BUILD_TESTING OR ASTRO_BUILD_RENDER2D)
+if(ASTRO_BUILD_2D_PLAYGROUND OR BUILD_TESTING OR ASTRO_BUILD_RENDER2D OR ASTRO_BUILD_EDITOR)
     add_library(astro_scene_render2d SceneSprites.cpp)
     target_include_directories(astro_scene_render2d PUBLIC include)
     target_link_libraries(astro_scene_render2d PUBLIC astro_runtime_render2d astro_scene)

@@ -54,6 +54,21 @@ int main()
         "round-trip nested reference and local hierarchy");
 
     scene::Scene document(1, "Prefab Scene");
+    scene::Scene scriptScene(2, "Script Prefab Boundary");
+    auto scriptedEntity = scriptScene.createEntity("Scripted source");
+    auto scriptBinding = scriptedEntity
+        ? scriptScene.addScriptBehavior(scriptedEntity.value(), {501}, "Game.PlayerController")
+        : core::Result<scene::ComponentId>::failure({core::ErrorCode::InternalError, "script fixture entity missing"});
+    check(scriptBinding.hasValue(), "create ScriptBehavior prefab boundary fixture");
+    check(scriptedEntity && !prefabs::capturePrefab(scriptScene, scriptedEntity.value(), 501, "Scripted Prefab"),
+        "reject prefab capture instead of silently dropping ScriptBehavior");
+    scene::Scene meshScene(3, "Mesh Prefab Boundary");
+    auto meshEntity = meshScene.createEntity("Mesh source");
+    check(meshEntity && meshScene.setMeshRenderer(meshEntity.value(), {502}),
+        "create MeshRenderer prefab boundary fixture");
+    check(meshEntity && !prefabs::capturePrefab(meshScene, meshEntity.value(), 502, "Mesh Prefab"),
+        "reject prefab capture instead of silently dropping MeshRenderer");
+
     auto externalParent = document.createEntity("Container");
     auto instance = prefabs::instantiatePrefab(library, document, 10, externalParent.value());
     check(instance.hasValue(), "instantiate parent prefab with nested prefab");
@@ -87,7 +102,7 @@ int main()
         "update nested prefab content in existing instance");
 
     const auto sceneFile = root / "instance.astro-scene";
-    check(scene::saveSceneFile(sceneFile, document).hasValue(), "save Scene v4 instance metadata");
+    check(scene::saveSceneFile(sceneFile, document).hasValue(), "save Scene v5 instance metadata");
     auto loadedScene = scene::loadSceneFile(sceneFile);
     check(loadedScene && loadedScene.value().prefabInstance(originalRoot)
         && loadedScene.value().prefabInstance(originalRoot)->overrides.size() == 1,

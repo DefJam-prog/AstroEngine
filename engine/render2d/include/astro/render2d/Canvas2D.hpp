@@ -2,6 +2,8 @@
 
 #include "astro/core/Result.hpp"
 #include "astro/assets/AssetRegistry.hpp"
+
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -42,6 +44,8 @@ struct Sprite final
     std::int32_t layer = 0;
     bool flipX = false;
     bool flipY = false;
+    std::array<Vec2, 4> worldCorners{};
+    bool hasWorldCorners = false;
 };
 
 struct Camera2D final
@@ -84,5 +88,7 @@ private:
 
 // Maps a world-space rectangle into a top-left-origin pixel viewport.
 [[nodiscard]] core::Result<ScreenRect> project(const Rect& rectangle,
+    const Camera2D& camera, Viewport viewport);
+[[nodiscard]] core::Result<Vec2> projectPoint(Vec2 point,
     const Camera2D& camera, Viewport viewport);
 }

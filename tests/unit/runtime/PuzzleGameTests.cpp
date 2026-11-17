@@ -21,11 +21,45 @@ int main()
     check(!PuzzleGame::create(65, 64, 1), "bound board cell allocation");
     check(!PuzzleGame::create(4, 4, 1, 2), "require at least three tile kinds");
 
+    PuzzleLevelDefinition authored{"unit-board", "Тестовый уровень", 3, 3, 3, 77, 100,
+        {0, 1, 2, 2, 0, 1, 1, 2, 0}};
+    auto authoredGame = PuzzleGame::create(authored);
+    check(authoredGame && authoredGame.value().tiles() == authored.initialTiles,
+        "create gameplay state from an authored initial board");
+    auto invalidLevel = authored;
+    invalidLevel.initialTiles[0] = 3;
+    check(!PuzzleGame::create(invalidLevel), "reject authored tiles outside the configured palette");
+
     auto first = PuzzleGame::create(8, 8, 9123, 5, 10);
     auto same = PuzzleGame::create(8, 8, 9123, 5, 10);
     check(first && same && first.value().tiles() == same.value().tiles(), "seed produces a stable initial board");
     if (!first || !same) return EXIT_FAILURE;
     for (const auto tile : first.value().tiles()) check(tile < 5, "board tile is in configured palette");
+    auto restored = PuzzleGame::restore(first.value().snapshot());
+    check(restored && restored.value().tiles() == first.value().tiles(), "restore snapshot reproduces board");
+    if (restored)
+    {
+        bool comparedAcceptedMove = false;
+        for (std::size_t row = 0; row < 8 && !comparedAcceptedMove; ++row)
+            for (std::size_t column = 0; column < 8 && !comparedAcceptedMove; ++column)
+                for (const GridPosition offset : {GridPosition{1, 0}, GridPosition{0, 1}})
+                {
+                    const GridPosition next{column + offset.column, row + offset.row};
+                    if (next.column >= 8 || next.row >= 8) continue;
+                    auto original = first.value();
+                    auto resumed = restored.value();
+                    const auto a = original.swap({column, row}, next);
+                    const auto b = resumed.swap({column, row}, next);
+                    check(a && b && a.value().accepted == b.value().accepted
+                        && a.value().pointsAwarded == b.value().pointsAwarded
+                        && original.tiles() == resumed.tiles(), "snapshot retains deterministic future refill state");
+                    if (a && a.value().accepted) comparedAcceptedMove = true;
+                }
+        check(comparedAcceptedMove, "find an accepted move to compare restored refill state");
+    }
+    auto invalidSnapshot = first.value().snapshot();
+    invalidSnapshot.tiles.clear();
+    check(!PuzzleGame::restore(invalidSnapshot), "reject malformed puzzle snapshot");
     check(first.value().tileAt({99, 99}) == UINT8_MAX, "out-of-range tile query returns invalid sentinel");
 
     auto unchanged = first.value().tiles();

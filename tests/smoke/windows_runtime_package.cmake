@@ -30,11 +30,17 @@ endif()
 file(ARCHIVE_EXTRACT INPUT "${package_archive}" DESTINATION "${extract_dir}")
 
 set(runtime_app "${extract_dir}/astro_game_ui_demo.exe")
+set(campaign_launcher "${extract_dir}/launch_puzzle_campaign.cmd")
+set(campaign_root "${extract_dir}/game-data/puzzle-campaign")
 foreach(required IN ITEMS
         "${runtime_app}"
+        "${campaign_launcher}"
         "${extract_dir}/README-runtime.txt"
         "${extract_dir}/licenses/SDL3-LICENSE.txt"
-        "${extract_dir}/licenses/Dear-ImGui-LICENSE.txt")
+        "${extract_dir}/licenses/Dear-ImGui-LICENSE.txt"
+        "${campaign_root}/Puzzle/Campaigns/starter.astro-puzzle-campaign"
+        "${campaign_root}/Puzzle/Levels/intro.astro-puzzle-level"
+        "${campaign_root}/Puzzle/Levels/finale.astro-puzzle-level")
     if(NOT EXISTS "${required}")
         message(FATAL_ERROR "Packaged runtime is missing: ${required}")
     endif()
@@ -51,4 +57,18 @@ if(NOT app_result EQUAL 0)
     message(FATAL_ERROR "Packaged runtime clean-start smoke failed (${app_result})\n${app_stdout}\n${app_stderr}")
 endif()
 
-message(STATUS "Packaged runtime launched successfully from extracted ZIP: ${package_archive}")
+execute_process(
+    COMMAND "${runtime_app}" --project-root "${campaign_root}" --campaign starter --smoke
+    WORKING_DIRECTORY "${extract_dir}"
+    RESULT_VARIABLE campaign_result
+    OUTPUT_VARIABLE campaign_stdout
+    ERROR_VARIABLE campaign_stderr
+    TIMEOUT 30)
+if(NOT campaign_result EQUAL 0)
+    message(FATAL_ERROR "Packaged bundled campaign smoke failed (${campaign_result})\n${campaign_stdout}\n${campaign_stderr}")
+endif()
+if(NOT campaign_stdout MATCHES "save=restore-pending end=save-restore")
+    message(FATAL_ERROR "Packaged bundled campaign did not complete save/restore smoke\n${campaign_stdout}\n${campaign_stderr}")
+endif()
+
+message(STATUS "Packaged runtime and bundled campaign launched successfully from extracted ZIP: ${package_archive}")

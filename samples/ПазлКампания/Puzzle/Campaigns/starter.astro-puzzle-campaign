@@ -1,0 +1,12 @@
+ASTRO_PUZZLE_CAMPAIGN 1
+ID "starter"
+NAME "Starter Campaign"
+START "intro"
+LEVELS 2
+LEVEL 0 "intro"
+LEVEL 1 "finale"
+TRANSITIONS 3
+TRANSITION "intro" SCORE_AT_LEAST 30 "finale"
+TRANSITION "intro" DEFAULT "finale"
+TRANSITION "finale" DEFAULT END
+END

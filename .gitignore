@@ -12,6 +12,13 @@
 /cmake-build-*/
 /build/
 CMakeUserPresets.json
+**/build/
+**/Build/
+**/bin/
+**/obj/
+**/target/
+**/Library/
+**/CMakeFiles/
 
 # Generated files and caches
 *.log

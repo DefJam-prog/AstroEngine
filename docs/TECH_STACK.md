@@ -47,3 +47,15 @@
 - Windows-пути, Unicode, UTF-8 и чистую сборку; условия работы без сети, включая предварительную доступность зависимостей.
 
 Результаты подтверждаются командами, окружением и наблюдаемыми результатами. До этих проверок совместимость, лицензии и сборка считаются непроверенными. Прототип 00.3 начинается только по отдельному указанию пользователя.
+
+## Оценка кандидатов для 3D (07.1 assessment)
+
+В 07.1 проведена только предварительная оценка; зависимости не загружались, не добавлялись в CMake и не утверждаются окончательно.
+
+| Назначение | Кандидат и наблюдение | Статус |
+| --- | --- | --- |
+| Render backend | Уже выбранный предварительный bgfx документирует D3D11/D3D12, Metal, OpenGL, OpenGL ES, Vulkan и другие backend; лицензия BSD-2-Clause. В проекте фактически подтверждены Windows/MSVC/D3D11 и 2D draw path. | Оставить как адаптер-кандидат для 3D spike; upstream platform list не заменяет сборку/визуальный тест AstroEngine на этих платформах. |
+| glTF/GLB parser | cgltf — C99 single-header parser; просмотренный upstream header сообщает версию 1.15 и MIT. Он не загружает внешние buffers автоматически; их чтение остаётся обязанностью вызывающей стороны. | Кандидат только для optional importer target после path/size/URI security tests. Не vendored и версия не закреплена. |
+| 3D physics | Jolt заявляет MIT, C++17, отсутствие внешних библиотек кроме STL, MSVC 2022+/Clang 16+/GCC 12+ и platform support для Windows, Linux, macOS, Android и iOS. | Наиболее подходящий кандидат для отдельного physics adapter; не добавлен и не проверен в нашем CMake/CI. Box2D является 2D-кандидатом и не закрывает 3D physics. |
+
+Следующая проверяемая последовательность: (1) нейтральный contract для camera pose/projection и mesh buffers без backend handles; (2) optional bgfx 3D triangle/cube scene с visual smoke и frame-time baseline; (3) ограниченный cgltf importer для `.gltf`/`.glb` с project-root URI loading в производный cache; (4) отдельно optional Jolt adapter. Существующий Scene/Transform/serialization не менять до тестов conventions/migration. Сначала не добавлять освещение, PBR, skinning, extensions или universal importer. Численные performance budgets должен утвердить пользователь отдельно.

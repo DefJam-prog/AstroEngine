@@ -55,6 +55,10 @@ CI workflow в 00.2 не добавлен: реализован локальны
 
 Optional `astro_runtime_animation` (scalar track and timeline playback model) is enabled by `-DASTRO_BUILD_ANIMATION_RUNTIME=ON`; it has no SDL/bgfx/ImGui dependency. `ASTRO_BUILD_PUZZLE_RUNTIME=ON` also builds/links this target to preserve the earlier puzzle target's animation dependency. The editor and test configurations enable it automatically.
 
+`astro_runtime_puzzle_save` is a separate optional adapter with no GUI or graphics dependency. Build it for a game by enabling both `-DASTRO_BUILD_PUZZLE_RUNTIME=ON` and `-DASTRO_BUILD_SAVE_RUNTIME=ON`; `BUILD_TESTING=ON` enables it and its integration test automatically. The Windows Editor's `Play Puzzle` mode requires `-DASTRO_BUILD_PUZZLE_RUNTIME=ON` when tests are disabled; when Editor is also enabled, its SaveStore adapter is linked automatically. Per-project preview settings are stored in `.astro/puzzle-save.settings`; progress slots use the user-writable SDL preference root plus the project's configured relative subdirectory. The rules-only Puzzle module stays independent of the file-backed SaveStore.
+
+The Puzzle runtime target also contains the standalone level-definition/file API (`PuzzleLevelDefinition`, `PuzzleLevelFile`) with no additional library dependency. Editor's **Puzzle Level Authoring** panel is available in the `Play Puzzle` Game View; its project catalog supports listing, opening, duplication, and confirmed ID rename. New IDs refuse collisions. Authored-level Save/Load uses the selected level identity and stores each level's manual slots below its project-specific SDL user-data directory. Format, GUI bounds and limitations are documented in [PUZZLE_LEVELS.md](PUZZLE_LEVELS.md) and [FILE_FORMATS.md](FILE_FORMATS.md#puzzle-level-v1-0618); results: [06.18](reports/06.18-puzzle-level-authoring.md), [06.19](reports/06.19-level-scoped-progress.md), and [06.20](reports/06.20-puzzle-level-catalog.md).
+
 В этой среде CMake/CTest/Ninja и MSVC доступны через Visual Studio 2022 Developer Command Prompt x64. Фактические результаты текущей сборки и CTest приведены в [отчёте 01.5](reports/01.5.md); поддержку macOS/Android/iOS не проверяли.
 
 ## Упаковка Windows runtime (этап 05.6)
@@ -66,7 +70,7 @@ cmake -S . -B build/runtime-package -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_
 cmake --build build/runtime-package --target package --parallel 4
 ```
 
-Готовый ZIP: `build/runtime-package/AstroEngine-Stage05.6-Windows-x64.zip`. Распакуйте архив и запустите `astro_game_ui_demo.exe`. Внутри лежат краткое описание и лицензии SDL3/Dear ImGui. Пакет содержит только статически слинкованный demo executable и эти тексты; editor, build tools и исходниковые тестовые ресурсы не включаются. CMake не загружает зависимости.
+Готовый ZIP: `build/runtime-package/AstroEngine-Stage05.6-Windows-x64.zip`. Распакуйте архив и запустите `astro_game_ui_demo.exe` для seeded Puzzle demo или `launch_puzzle_campaign.cmd` для авторской двухуровневой кампании. Launcher ищет executable и данные через `%~dp0`, поэтому его можно запустить из любого текущего рабочего каталога. Данные примера находятся в `game-data/puzzle-campaign`; README и лицензии SDL3/Dear ImGui включены. Editor, build tools и тестовые ресурсы не включаются. Для другой кампании передайте `--project-root` и `--campaign` напрямую executable. Пользовательские слоты хранятся отдельно в SDL per-user data directory. CMake не загружает зависимости.
 
 Чтобы проверить собранный пакет из чистого каталога, сконфигурируйте отдельную Debug-конфигурацию с `-DBUILD_TESTING=ON` и теми же двумя `ASTRO_BUILD_*` флагами, соберите её, затем выполните:
 
@@ -74,9 +78,9 @@ cmake --build build/runtime-package --target package --parallel 4
 ctest --test-dir build/runtime-package-tests -R runtime.windows.package.clean_start --output-on-failure --no-tests=error
 ```
 
-CTest создаёт ZIP, распаковывает его в новый уникальный подкаталог, проверяет executable/README/license files и запускает `astro_game_ui_demo.exe --smoke` из каталога распаковки. Проектная лицензия не выбрана; наличие upstream license files не задаёт лицензию AstroEngine.
+CTest создаёт ZIP, распаковывает его в новый уникальный подкаталог, проверяет executable, launcher, README, лицензии и все три файла кампании, запускает `astro_game_ui_demo.exe --smoke`, затем запускает executable против bundled campaign и проверяет smoke сохранения/восстановления. Отдельная ручная проверка запускает `launch_puzzle_campaign.cmd --smoke` из другого рабочего каталога. Проектная лицензия не выбрана; наличие upstream license files не задаёт лицензию AstroEngine.
 
-Архив пока содержит Game UI demo, а не законченную игру: в нём нет видимой доски puzzle, уровней и подключённого к UI SaveProfile/checkpoint прогресса. Перед выпуском продукта нужно выполнить оставшуюся игровую интеграцию и отдельно оценить лицензионную политику всего приложения.
+Архив содержит игровой UI прототип, один пример кампании и ручные слоты campaign progress, а не законченную игру. Произвольный проект не экспортируется, autosave, миграции профиля и checkpoint gameplay integration не реализованы. Перед выпуском продукта нужно завершить оставшуюся игровую интеграцию и отдельно оценить лицензионную политику всего приложения. Проверенные содержимое и ограничения: [отчёт 05.10](reports/05.10-self-contained-campaign-package.md).
 
 ## Проверка редактора и файловых сцен (02.4)
 
@@ -94,3 +98,18 @@ ctest --test-dir build/stack-spike --output-on-failure
 Подэтап 03.3 проверен тем же Windows x64/MSVC Debug preset. CTest может отсутствовать в PATH даже в Developer shell; в данной установке используйте `& 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\ctest.exe' --test-dir build/stack-spike --output-on-failure`. Логи: `build/03.3-build.log`, `build/03.3-ctest.log`. Editor использует встроенный Windows Imaging Component (WIC), внешняя библиотека не добавляется.
 
 Подэтап 03.4 добавляет `astro_prefabs`, который собирается штатной CMake-конфигурацией без внешних зависимостей. Windows x64/MSVC Debug сборка и полный CTest 13/13 прошли; логи `build/03.4-build.log`, `build/03.4-ctest.log`. Отдельно: `ctest --test-dir build/stack-spike -R '^prefab\.' --output-on-failure`.
+
+## Project C# scripts (04.9)
+
+PowerShell 7 and an already available local SDK pinned by the project are required. Create `.astro/csharp-build.json` as described in [CSHARP_SCRIPTING_API.md](CSHARP_SCRIPTING_API.md), then run from the repository root:
+
+```powershell
+pwsh -NoProfile -File tools/csharp/build-project.ps1 `
+  -ProjectRoot "C:\path\to\game-project" `
+  -DotnetRoot "C:\path\to\dotnet-sdk"
+pwsh -NoProfile -File tools/csharp/build-project.ps1 `
+  -ProjectRoot "C:\path\to\game-project" `
+  -DotnetRoot "C:\path\to\dotnet-sdk" -Check
+```
+
+Exit codes: 0 = successful/current, 1 = restore/compiler failure, 2 = invalid configuration/tool path, 3 = stale or missing successful output in check mode. Restore has no package sources. The build does not auto-register an AssetId, execute scripts, or sandbox C#.

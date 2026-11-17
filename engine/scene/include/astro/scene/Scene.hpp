@@ -53,6 +53,29 @@ struct SpriteRendererComponent
     bool visible = true;
 };
 
+// Persistent reference to one imported primitive. Rendering is provided by a
+// separate optional module; this component only stores stable authoring data.
+struct MeshRendererComponent
+{
+    ComponentId id = 0;
+    std::uint32_t schemaVersion = 1;
+    assets::AssetId model{};
+    std::uint32_t meshIndex = 0;
+    std::uint32_t primitiveIndex = 0;
+    bool visible = true;
+};
+
+// Persistent authoring reference to a managed script type. Runtime execution is
+// provided by an optional scripting module, not by Scene serialization itself.
+struct ScriptBehaviorComponent
+{
+    ComponentId id = 0;
+    std::uint32_t schemaVersion = 1;
+    assets::AssetId scriptAsset{};
+    std::string managedTypeName;
+    bool enabled = true;
+};
+
 struct PrefabSpriteValue
 {
     assets::AssetId texture{};
@@ -106,6 +129,8 @@ struct Entity
     std::optional<EntityId> parent;
     std::vector<TransformComponent> components;
     std::optional<SpriteRendererComponent> spriteRenderer;
+    std::optional<MeshRendererComponent> meshRenderer;
+    std::vector<ScriptBehaviorComponent> scriptBehaviors;
 };
 
 // Scene and component IDs are stable across save/load. Entity IDs are unique in
@@ -125,8 +150,23 @@ public:
     [[nodiscard]] const TransformComponent* findTransform(ComponentId id) const noexcept;
     [[nodiscard]] const TransformComponent* transform(EntityId entity) const noexcept;
     [[nodiscard]] const SpriteRendererComponent* spriteRenderer(EntityId entity) const noexcept;
+    [[nodiscard]] const MeshRendererComponent* meshRenderer(EntityId entity) const noexcept;
+    [[nodiscard]] std::span<const ScriptBehaviorComponent> scriptBehaviors(EntityId entity) const noexcept;
+    [[nodiscard]] ScriptBehaviorComponent* findScriptBehavior(ComponentId id) noexcept;
+    [[nodiscard]] const ScriptBehaviorComponent* findScriptBehavior(ComponentId id) const noexcept;
     core::Result<void> setSpriteRenderer(EntityId entity, assets::AssetId texture, bool visible = true);
     core::Result<void> removeSpriteRenderer(EntityId entity);
+    core::Result<void> setMeshRenderer(EntityId entity, assets::AssetId model,
+        std::uint32_t meshIndex = 0, std::uint32_t primitiveIndex = 0, bool visible = true);
+    core::Result<void> restoreMeshRenderer(EntityId entity, const MeshRendererComponent& component);
+    core::Result<void> removeMeshRenderer(EntityId entity);
+    core::Result<ComponentId> addScriptBehavior(EntityId entity, assets::AssetId scriptAsset,
+        std::string managedTypeName, bool enabled = true);
+    core::Result<void> restoreScriptBehavior(EntityId entity, const ScriptBehaviorComponent& component,
+        std::size_t insertionIndex);
+    core::Result<void> updateScriptBehavior(EntityId entity, ComponentId component,
+        assets::AssetId scriptAsset, std::string managedTypeName, bool enabled);
+    core::Result<void> removeScriptBehavior(EntityId entity, ComponentId component);
     core::Result<void> setPrefabInstance(PrefabInstanceInfo instance);
     core::Result<void> removePrefabInstance(EntityId rootEntity);
     [[nodiscard]] PrefabInstanceInfo* prefabInstance(EntityId rootEntity) noexcept;
@@ -166,6 +206,35 @@ struct SetSpriteRendererPayload
     EntityId entity = 0;
     assets::AssetId texture{};
     bool visible = true;
+};
+
+struct SetMeshRendererPayload
+{
+    EntityId entity = 0;
+    assets::AssetId model{};
+    std::uint32_t meshIndex = 0;
+    std::uint32_t primitiveIndex = 0;
+    bool visible = true;
+};
+
+struct AddScriptBehaviorPayload
+{
+    EntityId entity = 0;
+    assets::AssetId scriptAsset{};
+    std::string managedTypeName;
+};
+
+struct SetScriptBehaviorEnabledPayload
+{
+    EntityId entity = 0;
+    ComponentId component = 0;
+    bool enabled = false;
+};
+
+struct RemoveScriptBehaviorPayload
+{
+    EntityId entity = 0;
+    ComponentId component = 0;
 };
 
 core::Result<void> registerSceneCommands(core::CommandRegistry& commands, Scene& scene);

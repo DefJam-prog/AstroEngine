@@ -1,0 +1,6 @@
+ASTRO_PUZZLE_LEVEL 1
+ID "finale"
+NAME "Finale"
+BOARD 3 3 3 42 10
+TILES 9 0 1 0 2 0 1 2 1 2
+END

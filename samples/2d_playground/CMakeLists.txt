@@ -14,6 +14,13 @@ if(WIN32)
     if(BUILD_TESTING)
         add_test(NAME runtime.2d.playground.smoke COMMAND astro_2d_playground --smoke)
         set_tests_properties(runtime.2d.playground.smoke PROPERTIES TIMEOUT 15 LABELS "smoke;graphics;runtime")
+        add_test(NAME runtime.2d.project.preview.smoke
+            COMMAND "${CMAKE_COMMAND}"
+                "-DAPP=$<TARGET_FILE:astro_2d_playground>"
+                "-DFIXTURE=$<TARGET_FILE:astro_scene_render2d_tests>"
+                "-DWORK_ROOT=${CMAKE_CURRENT_BINARY_DIR}"
+                -P "${CMAKE_SOURCE_DIR}/tests/smoke/2d_project_preview.cmake")
+        set_tests_properties(runtime.2d.project.preview.smoke PROPERTIES TIMEOUT 30 LABELS "smoke;graphics;runtime;scene;assets")
     endif()
 else()
     message(STATUS "astro_2d_playground is currently limited to Windows WIC image decoding")

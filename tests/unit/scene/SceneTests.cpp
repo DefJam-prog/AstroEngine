@@ -44,6 +44,41 @@ int main()
     }
     if (defaultEntity)
     {
+        const auto script = defaults.addScriptBehavior(defaultEntity.value(), {5001}, "Game.PlayerController");
+        check(script && defaults.findScriptBehavior(script.value()) != nullptr,
+            "attach ScriptBehavior with stable AssetId and ComponentId");
+        check(script && defaults.scriptBehaviors(defaultEntity.value()).size() == 1,
+            "enumerate persistent ScriptBehavior components on an entity");
+        if (script)
+        {
+            check(defaults.updateScriptBehavior(defaultEntity.value(), script.value(), {5002}, "Game.PlayerControllerV2", false).hasValue(),
+                "update script reference, type, and enabled state");
+            const auto* updated = defaults.findScriptBehavior(script.value());
+            check(updated && updated->id == script.value() && updated->scriptAsset.value == 5002
+                && updated->managedTypeName == "Game.PlayerControllerV2" && !updated->enabled,
+                "preserve ScriptBehavior ComponentId when updating its binding");
+            check(!defaults.updateScriptBehavior(defaultEntity.value(), script.value(), {}, "Game.Broken", true),
+                "reject a zero script AssetId without changing the component");
+            check(updated && updated->scriptAsset.value == 5002, "invalid update preserves the previous binding");
+            check(defaults.removeScriptBehavior(defaultEntity.value(), script.value()).hasValue(),
+                "remove ScriptBehavior from its owner entity");
+            const auto afterScriptRemoval = defaults.createEntity("After script removal");
+            check(afterScriptRemoval && defaults.transform(afterScriptRemoval.value())->id > script.value(),
+                "do not reuse a removed ScriptBehavior ComponentId");
+        }
+        check(!defaults.addScriptBehavior(defaultEntity.value(), {}, "Game.PlayerController"),
+            "reject a zero script AssetId");
+        check(!defaults.addScriptBehavior(defaultEntity.value(), {5003}, ""),
+            "reject an empty managed type name");
+        check(!defaults.addScriptBehavior(defaultEntity.value(), {5003}, "Game.Player Controller"),
+            "reject whitespace in managed type names");
+        check(!defaults.addScriptBehavior(999999, {5003}, "Game.PlayerController"),
+            "reject a missing ScriptBehavior owner");
+        check(!defaults.removeScriptBehavior(defaultEntity.value(), 999999),
+            "reject removal of a missing ScriptBehavior component");
+    }
+    if (defaultEntity)
+    {
         auto changed = defaults.transform(defaultEntity.value())->value;
         changed.position = {12.5, -4.0, 3.25};
         check(defaults.setTransform(defaultEntity.value(), changed).hasValue(), "set a finite Transform");

@@ -1,4 +1,5 @@
 #include "astro/runtime/SDLImageTextureCache.hpp"
+#include "astro/runtime/WicImageDecoder.hpp"
 
 #include <SDL3/SDL_surface.h>
 #include <objbase.h>
@@ -22,41 +23,42 @@ core::Error imageError(std::string message)
     return {core::ErrorCode::IoError, std::move(message)};
 }
 
-core::Result<std::vector<std::uint8_t>> decodeWic(const std::filesystem::path& path,
-    std::uint32_t& width, std::uint32_t& height)
+}
+
+core::Result<WicDecodedImage> decodeWicImage(const std::filesystem::path& path)
 {
     const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool uninitialize = SUCCEEDED(initialized);
     if (FAILED(initialized) && initialized != RPC_E_CHANGED_MODE)
-        return core::Result<std::vector<std::uint8_t>>::failure(imageError("WIC COM initialization failed"));
+        return core::Result<WicDecodedImage>::failure(imageError("WIC COM initialization failed"));
     struct ComGuard final { bool active; ~ComGuard() { if (active) CoUninitialize(); } } guard{uninitialize};
 
     ComPtr<IWICImagingFactory> factory;
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
         IID_PPV_ARGS(&factory))))
-        return core::Result<std::vector<std::uint8_t>>::failure(imageError("Cannot create WIC imaging factory"));
+        return core::Result<WicDecodedImage>::failure(imageError("Cannot create WIC imaging factory"));
     ComPtr<IWICBitmapDecoder> decoder;
     if (FAILED(factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
         WICDecodeMetadataCacheOnLoad, &decoder)))
-        return core::Result<std::vector<std::uint8_t>>::failure(imageError("WIC cannot decode the cached image asset"));
+        return core::Result<WicDecodedImage>::failure(imageError("WIC cannot decode the cached image asset"));
     ComPtr<IWICBitmapFrameDecode> frame;
-    if (FAILED(decoder->GetFrame(0, &frame)) || FAILED(frame->GetSize(&width, &height))
-        || width == 0 || height == 0 || width > 16384 || height > 16384
-        || std::uint64_t(width) * height > 16ull * 1024 * 1024)
-        return core::Result<std::vector<std::uint8_t>>::failure(imageError("WIC image dimensions exceed supported limits"));
-    const auto byteCount = std::uint64_t(width) * height * 4;
+    WicDecodedImage decoded;
+    if (FAILED(decoder->GetFrame(0, &frame)) || FAILED(frame->GetSize(&decoded.width, &decoded.height))
+        || decoded.width == 0 || decoded.height == 0 || decoded.width > 16384 || decoded.height > 16384
+        || std::uint64_t(decoded.width) * decoded.height > 16ull * 1024 * 1024)
+        return core::Result<WicDecodedImage>::failure(imageError("WIC image dimensions exceed supported limits"));
+    const auto byteCount = std::uint64_t(decoded.width) * decoded.height * 4;
     if (byteCount > (std::numeric_limits<UINT>::max)())
-        return core::Result<std::vector<std::uint8_t>>::failure(imageError("WIC image buffer is too large"));
+        return core::Result<WicDecodedImage>::failure(imageError("WIC image buffer is too large"));
     ComPtr<IWICFormatConverter> converter;
     if (FAILED(factory->CreateFormatConverter(&converter))
         || FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA,
             WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)))
-        return core::Result<std::vector<std::uint8_t>>::failure(imageError("WIC cannot convert image to BGRA8"));
-    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(byteCount));
-    if (FAILED(converter->CopyPixels(nullptr, width * 4, static_cast<UINT>(byteCount), pixels.data())))
-        return core::Result<std::vector<std::uint8_t>>::failure(imageError("WIC cannot read image pixels"));
-    return core::Result<std::vector<std::uint8_t>>::success(std::move(pixels));
-}
+        return core::Result<WicDecodedImage>::failure(imageError("WIC cannot convert image to BGRA8"));
+    decoded.pixels.resize(static_cast<std::size_t>(byteCount));
+    if (FAILED(converter->CopyPixels(nullptr, decoded.width * 4, static_cast<UINT>(byteCount), decoded.pixels.data())))
+        return core::Result<WicDecodedImage>::failure(imageError("WIC cannot read image pixels"));
+    return core::Result<WicDecodedImage>::success(std::move(decoded));
 }
 
 SDLImageTextureCache::SDLImageTextureCache(SDL_Renderer* renderer,
@@ -81,11 +83,11 @@ core::Result<SDL_Texture*> SDLImageTextureCache::texture(const assets::AssetId i
     if (!registry_->find(id))
         return core::Result<SDL_Texture*>::failure({core::ErrorCode::NotFound,
             "Sprite AssetId is absent from the asset registry"});
-    std::uint32_t width = 0, height = 0;
-    auto decoded = decodeWic(registry_->cachedPath(id), width, height);
+    auto decoded = decodeWicImage(registry_->cachedPath(id));
     if (!decoded) return core::Result<SDL_Texture*>::failure(decoded.error());
-    SdlSurface surface(SDL_CreateSurfaceFrom(static_cast<int>(width), static_cast<int>(height),
-        SDL_PIXELFORMAT_BGRA32, decoded.value().data(), static_cast<int>(width * 4)), SDL_DestroySurface);
+    auto& image = decoded.value();
+    SdlSurface surface(SDL_CreateSurfaceFrom(static_cast<int>(image.width), static_cast<int>(image.height),
+        SDL_PIXELFORMAT_BGRA32, image.pixels.data(), static_cast<int>(image.width * 4)), SDL_DestroySurface);
     if (!surface)
         return core::Result<SDL_Texture*>::failure(imageError(std::string("SDL surface creation failed: ") + SDL_GetError()));
     auto* created = SDL_CreateTextureFromSurface(renderer_, surface.get());

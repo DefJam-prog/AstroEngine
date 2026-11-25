@@ -1,6 +1,6 @@
-ASTRO_SCENE 6
+ASTRO_SCENE 7
 SCENE 1 "Renderer smoke"
 ENTITY 1 0 "Imported triangle"
 COMPONENT 1 1 "astro.Transform" 1 0 0 0 0 0 0 1 1 1
-COMPONENT 2 1 "astro.MeshRenderer" 1 1 0 0 1
+COMPONENT 2 1 "astro.MeshRenderer" 2 1 0 0 1 2
 END

@@ -1,0 +1,42 @@
+diff --git a/src/renderer_vk.cpp b/src/renderer_vk.cpp
+index b75807e..b3fac17 100644
+--- a/src/renderer_vk.cpp
++++ b/src/renderer_vk.cpp
+@@ -9417,6 +9417,29 @@ VK_DESTROY
+ 			|| (m_vsync != vsync && !s_renderVK->m_swapchainMaintenance1Supported)
+ 			;
+ 
++		// A fixed-size Vulkan surface can change extent while the BGFX swapchain
++		// descriptor stays identical (for example, when present scaling chose the
++		// previous surface size). Recreate in that case so a later shrink does not
++		// keep presenting through images from the larger extent.
++		bool surfaceExtentChanged = false;
++		if (!m_needToRecreateSwapchain && !m_needToRecreateSurface && VK_NULL_HANDLE != m_surface)
++		{
++			VkSurfaceCapabilitiesKHR surfaceCapabilities = {};
++			const VkResult surfaceResult = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
++				physicalDevice, m_surface, &surfaceCapabilities);
++			const VkExtent2D surfaceExtent = surfaceCapabilities.currentExtent;
++			const bool surfaceExtentIsFixed = true
++				&& UINT32_MAX != surfaceExtent.width
++				&& UINT32_MAX != surfaceExtent.height
++				;
++			surfaceExtentChanged = true
++				&& VK_SUCCESS == surfaceResult
++				&& surfaceExtentIsFixed
++				&& (surfaceExtent.width != m_sci.imageExtent.width
++					|| surfaceExtent.height != m_sci.imageExtent.height)
++				;
++		}
++
+ 		const bool recreateSurface = false
+ 			|| m_needToRecreateSurface
+ 			|| m_nwh != _nwh
+@@ -9425,6 +9448,7 @@ VK_DESTROY
+ 
+ 		const bool recreateSwapchain = false
+ 			|| m_needToRecreateSwapchain
++			|| surfaceExtentChanged
+ 			|| m_desc.formatColor      != _desc.formatColor
+ 			|| m_desc.formatDepthStencil != _desc.formatDepthStencil
+ 			|| m_desc.width       != _desc.width

@@ -1,5 +1,17 @@
 # Сборка минимального приложения
 
+## Опциональный 3D BGFX Runtime adapter (Windows x64)
+
+Использует локальные SDL/BGFX/BX файлы в `build/spike-deps`; сеть и автоматическая загрузка зависимостей не используются. Из Developer PowerShell x64:
+
+```powershell
+cmake -S . -B build/07.2d-release-clean -DASTRO_BUILD_STACK_SPIKE=ON -DASTRO_BUILD_RENDER3D_BGFX_SMOKE=ON -DASTRO_BUILD_RUNTIME_BGFX_3D=ON -DASTRO_BUILD_GLTF_IMPORTER=ON -DASTRO_BUILD_EDITOR=ON -DBUILD_TESTING=ON
+cmake --build build/07.2d-release-clean --config Release --parallel 8
+ctest --test-dir build/07.2d-release-clean -C Release --parallel 1 --output-on-failure -R "^runtime\.render3d\.scene_packet\.bgfx\.smoke$"
+```
+
+Adapter target: `astro_runtime_bgfx_scene3d`. It borrows the host BGFX program/context; destroy or clear it before `bgfx::shutdown`. Test screenshot is saved under the build tree. This prototype is not a Play-host integration or a portable graphics configuration.
+
 Проект использует C++20, CMake 3.20+ и CTest. Preset windows-debug требует Ninja и предварительно настроенного компилятора. Для MSVC нужен C++ toolchain с Windows SDK и Developer PowerShell x64. Установка инструментов требует отдельного согласования; проект ничего не скачивает.
 
 Для MSVC CMake задаёт статический CRT согласованно для проекта (`/MT` в Release, `/MTd` в Debug), так как optional editor использует предсобранные статические SDL3/bgfx библиотеки. Зависимые библиотеки и targets должны использовать совместимую runtime-конфигурацию.
@@ -16,6 +28,18 @@ ctest --preset windows-debug
 ```
 
 Останавливайтесь при ненулевом коде команды. CTest не собирает приложение: сначала необходима успешная сборка. Лог тестов находится в `build/windows-debug/Testing/Temporary/LastTest.log`.
+
+### Русская локаль MSVC с Ninja
+
+Если компилятор печатает `/showIncludes` по-русски, а Ninja показывает `unscanned` compile rules или не обновляет объекты после изменения заголовков, задайте prefix при конфигурации. Иначе у MSVC/Ninja могут остаться старые `.obj` с прежним layout типов:
+
+```powershell
+cmake -S . -B build/windows-debug '-DASTRO_MSVC_SHOWINCLUDES_PREFIX=Примечание: включение файла:'
+cmake --build build/windows-debug --clean-first --config Debug
+ctest --test-dir build/windows-debug -C Debug --output-on-failure
+```
+
+Опция задаёт только строковый prefix `/showIncludes` для dependency scanning; она не меняет пути исходников или компилятор. Используйте текст prefix ровно в том виде, как MSVC печатает его перед путём header. Для уже собранного дерева выполните одноразовую clean rebuild после смены настройки, чтобы все прежние `.obj` получили dependency records.
 
 ## Чистая сборка без удаления файлов
 
@@ -60,6 +84,22 @@ Optional `astro_runtime_animation` (scalar track and timeline playback model) is
 The Puzzle runtime target also contains the standalone level-definition/file API (`PuzzleLevelDefinition`, `PuzzleLevelFile`) with no additional library dependency. Editor's **Puzzle Level Authoring** panel is available in the `Play Puzzle` Game View; its project catalog supports listing, opening, duplication, and confirmed ID rename. New IDs refuse collisions. Authored-level Save/Load uses the selected level identity and stores each level's manual slots below its project-specific SDL user-data directory. Format, GUI bounds and limitations are documented in [PUZZLE_LEVELS.md](PUZZLE_LEVELS.md) and [FILE_FORMATS.md](FILE_FORMATS.md#puzzle-level-v1-0618); results: [06.18](reports/06.18-puzzle-level-authoring.md), [06.19](reports/06.19-level-scoped-progress.md), and [06.20](reports/06.20-puzzle-level-catalog.md).
 
 В этой среде CMake/CTest/Ninja и MSVC доступны через Visual Studio 2022 Developer Command Prompt x64. Фактические результаты текущей сборки и CTest приведены в [отчёте 01.5](reports/01.5.md); поддержку macOS/Android/iOS не проверяли.
+
+## Editor Scene View alpha shader tools (07.2r)
+
+When the optional Windows Editor is built with the glTF importer, CMake compiles the project-owned fragment shaders with a locally staged BGFX `shadercRelease.exe`. The build does not download tools. If that executable is missing but the source is already present under `build/spike-deps/bgfx`, run from the repository root in Visual Studio 2022 Developer PowerShell x64:
+
+```powershell
+Push-Location .\build\spike-deps\bgfx
+& ..\bx\tools\bin\windows\genie.exe --with-tools vs2022
+Pop-Location
+& 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe' '.\build\spike-deps\bgfx\.build\projects\vs2022\shaderc.vcxproj' /m /p:Configuration=Release /p:Platform=x64 /v:minimal
+cmake -S . -B build/07.2d-release-clean
+cmake --build build/07.2d-release-clean --parallel 8
+ctest --test-dir build/07.2d-release-clean --output-on-failure
+```
+
+`shadercRelease.exe` is produced under `build/spike-deps/bgfx/.build/win64_vs2022/bin/`. This local tool build compiles the already staged BGFX shader compiler and its cached dependencies; the source dependency directory is not edited by AstroEngine, and generated files remain in the ignored build tree. If `build/spike-deps/bgfx` has not been staged, the Editor shader target cannot be built offline; configure emits the required local tool path rather than fetching it.
 
 ## Упаковка Windows runtime (этап 05.6)
 
@@ -113,3 +153,37 @@ pwsh -NoProfile -File tools/csharp/build-project.ps1 `
 ```
 
 Exit codes: 0 = successful/current, 1 = restore/compiler failure, 2 = invalid configuration/tool path, 3 = stale or missing successful output in check mode. Restore has no package sources. The build does not auto-register an AssetId, execute scripts, or sandbox C#.
+
+## BGFX Vulkan fixed-surface resize patch (07.2ct)
+
+For the staged BGFX revision `eebf5686a8c5f1c77e1af2dad17b5746ba17da8f`, apply the repository patch and rebuild its Release library from the project root:
+
+```powershell
+pwsh -NoProfile -File scripts/build_bgfx_07_2ct.ps1
+```
+
+The script modifies only `build/spike-deps/bgfx/src/renderer_vk.cpp`, which is in the ignored local dependency cache. It validates the exact BGFX revision and refuses a dirty checkout before applying the patch. To validate, rebuild `astro_editor` and run `editor.runtime_bgfx_vulkan_game_view.tap.smoke`. Do not run the script against another BGFX revision without reviewing and adapting the patch first. This Vulkan-specific dependency change leaves default D3D11 selection unchanged.
+
+To verify a pinned BGFX patch in a fresh local copy, stage BGFX, BX and BIMG under a new ignored directory in `build/`, check them out at the documented commits, copy/regenerate the matching Visual Studio projects, and pass that BGFX directory to the helper:
+
+```powershell
+pwsh -NoProfile -File scripts/build_bgfx_07_2ct.ps1 -BgfxRoot build/07.2cu-bgfx-clean/bgfx
+```
+
+The 07.2cu validation reused the Visual Studio project files from the same pinned BGFX checkout because `genie` was not available. A successful clean-copy library build confirms patch applicability and compilation; it does not replace a linked Editor smoke or a run on another Vulkan driver.
+
+For the local repeatability check used in 07.2cv, CTest supports the repeat-until-failure mode without changing project files:
+
+```powershell
+ctest --test-dir build/07.2d-release-clean -C Release --output-on-failure --parallel 1 --repeat until-fail:5 -R "^(editor\.runtime_bgfx_vulkan_game_view\.texture\.smoke|editor\.runtime_bgfx_vulkan_game_view\.tap\.smoke|editor\.runtime_bgfx_vulkan_game_view\.tap\.1280x800\.smoke)$"
+```
+
+Repeated passes on one physical GPU indicate same-host stability only. Use a second Vulkan device/driver before describing the patch as portable.
+
+The in-process Vulkan resize stress is an opt-in CTest and requires no additional build option once `ASTRO_BUILD_EDITOR` and `BUILD_TESTING` are enabled:
+
+```powershell
+ctest --test-dir build/07.2d-release-clean -C Release --output-on-failure --parallel 1 -R "^editor\.runtime_bgfx_vulkan_game_view\.tap\.resize_stress\.smoke$"
+```
+
+It runs two bounded cycles and stores screenshots under the build test directory. This is local regression coverage; it does not replace a second-driver validation.

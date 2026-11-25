@@ -54,7 +54,45 @@ int main()
     const MeshData cube = MeshData::makeColoredCube();
     CHECK(cube.vertices().size() == 8);
     CHECK(cube.triangleIndices().size() == 36);
-    CHECK(MeshData::create(cube.vertices(), cube.triangleIndices()));
+    const auto recreatedCube = MeshData::create(cube.vertices(), cube.triangleIndices());
+    CHECK(recreatedCube);
+    CHECK(recreatedCube && recreatedCube.value().contentHash() == cube.contentHash());
+    auto changedCubeVertices = cube.vertices();
+    changedCubeVertices[0].position.x += 0.25f;
+    const auto changedCube = MeshData::create(std::move(changedCubeVertices), cube.triangleIndices());
+    CHECK(changedCube && changedCube.value().contentHash() != cube.contentHash());
+    CHECK(!cube.hasNormals() && !cube.hasTexCoords());
+    for (std::uint8_t primitive = 1; primitive <= 4; ++primitive)
+    {
+        const auto generated = MeshData::makePrimitive(primitive);
+        CHECK(generated.hasValue());
+        if (!generated) continue;
+        const auto& mesh = generated.value();
+        CHECK(!mesh.vertices().empty() && !mesh.triangleIndices().empty());
+        CHECK(mesh.hasNormals() && mesh.hasTexCoords());
+        CHECK(mesh.triangleIndices().size() % 3 == 0);
+        for (const auto index : mesh.triangleIndices()) CHECK(index < mesh.vertices().size());
+        for (const auto& vertex : mesh.vertices())
+        {
+            CHECK(std::isfinite(vertex.position.x) && std::isfinite(vertex.position.y)
+                && std::isfinite(vertex.position.z));
+            CHECK(std::isfinite(vertex.normal.x) && std::isfinite(vertex.normal.y)
+                && std::isfinite(vertex.normal.z));
+            CHECK(std::isfinite(vertex.texCoord0.x) && std::isfinite(vertex.texCoord0.y));
+        }
+    }
+    CHECK(!MeshData::makePrimitive(0));
+    CHECK(!MeshData::makePrimitive(5));
+    MeshVertex attributed{{0, 0, 0}, {}, {0, 0, 1}, {0.25f, 0.75f}};
+    const auto attributedMesh = MeshData::create({attributed, attributed, attributed}, {0, 1, 2}, true, true);
+    CHECK(attributedMesh && attributedMesh.value().hasNormals() && attributedMesh.value().hasTexCoords());
+    CHECK(attributedMesh && attributedMesh.value().vertices()[0].normal == (Vec3{0, 0, 1}));
+    CHECK(attributedMesh && attributedMesh.value().vertices()[0].texCoord0 == (Vec2{0.25f, 0.75f}));
+    attributed.normal.x = std::numeric_limits<float>::quiet_NaN();
+    CHECK(!MeshData::create({attributed, attributed, attributed}, {0, 1, 2}, true, false));
+    attributed.normal = {0, 0, 1};
+    attributed.texCoord0.y = std::numeric_limits<float>::infinity();
+    CHECK(!MeshData::create({attributed, attributed, attributed}, {0, 1, 2}, false, true));
     CHECK(!MeshData::create({}, {0, 1, 2}));
     CHECK(!MeshData::create({{{0, 0, 0}, {}}}, {0, 0}));
     CHECK(!MeshData::create({{{std::numeric_limits<float>::infinity(), 0, 0}, {}}}, {0, 0, 0}));

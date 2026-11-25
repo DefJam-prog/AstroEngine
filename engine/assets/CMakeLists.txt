@@ -1,4 +1,4 @@
-add_library(astro_assets src/AssetRegistry.cpp src/AssetBuild.cpp)
+add_library(astro_assets src/AssetRegistry.cpp src/AssetBuild.cpp src/MaterialAsset.cpp)
 target_include_directories(astro_assets PUBLIC include)
 target_link_libraries(astro_assets PUBLIC astro_core)
 target_compile_features(astro_assets PUBLIC cxx_std_20)

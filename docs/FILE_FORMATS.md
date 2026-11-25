@@ -1,17 +1,19 @@
 # Формат файлов сцен AstroEngine
 
-## Astro Scene v6
+## Astro Scene v11
 
 `*.astro-scene` — UTF-8 текстовый формат редакторской Scene/Entity модели.
 
 ```text
-ASTRO_SCENE 6
+ASTRO_SCENE 11
 SCENE <scene-id> "<quoted scene name>"
 ENTITY <entity-id> <parent-id-or-0> "<quoted entity name>"
 COMPONENT <component-id> <entity-id> "astro.Transform" 1 <position xyz> <rotation-degrees xyz> <scale xyz>
 COMPONENT <component-id> <entity-id> "astro.SpriteRenderer" 1 <asset-id> <visible-0-or-1>
 COMPONENT <component-id> <entity-id> "astro.ScriptBehavior" 1 <script-asset-id> <enabled-0-or-1> "<managed-type-name>"
-COMPONENT <component-id> <entity-id> "astro.MeshRenderer" 1 <model-asset-id> <mesh-index> <primitive-index> <visible-0-or-1>
+COMPONENT <component-id> <entity-id> "astro.MeshRenderer" 2 <model-asset-id> <mesh-index> <primitive-index> <visible-0-or-1> <material-override-asset-id-or-0>
+COMPONENT <component-id> <entity-id> "astro.PrimitiveRenderer" 2 <kind-1-4> <visible-0-or-1> <material-override-asset-id-or-0>
+COMPONENT <component-id> <entity-id> "astro.Camera3D" 2 <vertical-fov-degrees> <near-plane> <far-plane> <active-0-or-1>
 PREFAB_INSTANCE <root-entity-id> <prefab-id> <source-link-count> <override-count>
 PREFAB_LINK <root-entity-id> "<source-key>" <entity-id>
 PREFAB_OVERRIDE <root-entity-id> "<source-key>" <property-kind> <typed-value>
@@ -20,7 +22,7 @@ END
 
 Имена и type ID записываются средствами `std::quoted`; числа разбираются с classic locale. Для каждой сущности требуется ровно одна запись Transform версии 1. Scene ID, Entity ID и Component ID ненулевые и не могут достигать максимума своего unsigned типа. Entity ID и Component ID не повторяются внутри сцены; Component ID глобально уникален для этой сцены. Родитель должен существовать, циклы запрещены. Transform числа должны быть конечными. Position и rotation по умолчанию нулевые, scale — (1,1,1). Rotation — локальные углы Эйлера в градусах; композиция и мировые координаты не реализованы.
 
-Файл `ASTRO_SCENE 6` ограничен 16 MiB и 100000 сущностями. Каждая сущность содержит ровно один Transform; SpriteRenderer и MeshRenderer необязательны; ScriptBehavior может отсутствовать или встречаться несколько раз. ComponentId уникальны во всей сцене. MeshRenderer v1 хранит ненулевой Model AssetId, индексы mesh/primitive и visible; Scene-модель проверяет schema и ненулевой AssetId. При запросе геометрии опциональный `resolveMeshRenderer` дополнительно проверяет актуальность исходного model файла, импортный digest (включая внешние buffers) и диапазоны обоих индексов. ScriptBehavior v1 хранит ненулевой стабильный AssetId скрипта, UTF-8 managed type name (1–512 байт без пробелов/control bytes) и enabled-флаг. Prefab instance metadata включает root, PrefabId, source-key map и типизированные overrides (`Name`, целый `Transform`, наличие/AssetId/visibility `SpriteRenderer`). Counts записей проверяются. Неизвестный тип компонента/override, версия, повреждённый UTF-8, неверная структура, повторные ID, отсутствующий владелец/родитель/source key и лишние записи дают ошибку; данные не отбрасываются молча. Полная проверка завершается до публикации загруженной модели.
+Файл `ASTRO_SCENE 11` ограничен 16 MiB и 100000 сущностями. Каждая сущность содержит ровно один Transform; SpriteRenderer, MeshRenderer, PrimitiveRenderer и Camera3D необязательны; ScriptBehavior может отсутствовать или встречаться несколько раз. MeshRenderer и PrimitiveRenderer взаимоисключающие. PrimitiveRenderer v2 хранит тип встроенной геометрии: Cube (1), Plane (2), Sphere (3), Cylinder (4), visible и необязательный project Material AssetId (0 означает отсутствие переопределения). Геометрия генерируется в памяти. Scene v10 PrimitiveRenderer v1 мигрирует с material ID 0; чтение не переписывает файл. Camera3D v2 хранит FOV в диапазоне (0,180), clipping planes 0 < near < far и active-флаг; допускается не более одной активной камеры. Scene v8 Camera3D v1 загружается с active=false. MeshRenderer v2 хранит ненулевой Model AssetId, mesh/primitive indices, visible и необязательный project Material AssetId. MeshRenderer v1 в Scene v6 получает пустой override при чтении. ScriptBehavior v1 хранит ненулевой AssetId, валидное имя managed type и enabled-флаг. Prefab metadata содержит root, PrefabId, source-key map и типизированные overrides. Неизвестный компонент/override, версия, повреждённый UTF-8, неверная структура, повторные ID, отсутствующий владелец/родитель/source key и лишние записи возвращают ошибку; данные не отбрасываются молча. Форматы Scene v1–v10 читаются; переход в v11 происходит только после явного сохранения.
 
 Сохранение сериализует в уникальный временный файл рядом с назначением, затем атомарно заменяет его (Windows `MoveFileExW` с replace/write-through). Это не гарантирует восстановление после аварийного завершения до замены, резервные копии, checksum или одинаковую долговечность на всех файловых системах.
 
@@ -38,20 +40,66 @@ END
 
 Вложенная prefab ссылка разворачивается как дочернее дерево под узлом-владельцем. Цикл graph и глубина свыше 64 отклоняются до изменения Scene. Source key — полный путь числовых PrefabId/localId от корневого ассета; обновление сопоставляет эти ключи и сохраняет EntityId. Instance source map и overrides записываются в Scene v5 (читаются и из v4). Миграция prefab-файла пока не нужна (поддерживается только v1); Editor UI для создания/обновления и конфликтный merge отсутствуют.
 
-## Asset index v1–v3
+## Asset index v1–v4
 
 `<project>/.astro/assets.index` — UTF-8 line-based registry manifest:
 
 ```text
-ASTRO_ASSETS 3
+ASTRO_ASSETS 4
 NEXT <next-asset-id>
 ASSET <asset-id> "<Assets-relative UTF-8 path>" PNG|JPEG <width> <height> <source-size> <sha256-hex>
 SCRIPT <asset-id> "<Scripts-relative .cs path>" "<managed-type-name>" "<Library/Scripts-relative .dll path>" "<Library/Scripts-relative .runtimeconfig.json path>" <source-sha256>
 MODEL <asset-id> "<Assets-relative .gltf|.glb path>" <source-size> <source-sha256> <import-content-sha256>
+MATERIAL <asset-id> "<Assets-relative .astro-material path>" <material-schema-1-or-2> <source-size> <source-sha256>
 END
 ```
 
-Индекс v3 содержит общий монотонный AssetId для image, script и model records. Reader принимает v1–v3; открытие старого индекса само его не меняет, следующая явная регистрация пишет v3. MODEL path — относительный к `Assets/`, только `.gltf/.glb`; исходный основной файл ограничен 8 MiB и хранит размер/SHA-256 плюс digest импортированного содержимого. `registerModel` принимает уже успешно импортированную геометрию, а `resolveModel` проверяет основной файл и его hash. Изменение внешнего glTF buffer обнаруживается повторным `GltfImporter::importAndRegister`, который обновляет content digest; отдельного dependency record для каждого внешнего buffer пока нет. Script source обязан находиться под `Scripts/`, быть UTF-8 `.cs` не больше 16 MiB; сборочные outputs — в `Library/Scripts/`. Дубликаты ID/source/type, неверный hash/размер/путь/format, неизвестная версия, лишние строки и повреждённый UTF-8 отклоняются. Индекс ограничен 16 MiB, 100000 entries и 4096 UTF-8 байт на путь; публикация атомарна. Повреждённый индекс остаётся нетронутым и возвращает ошибку.
+Индекс v4 содержит общий монотонный AssetId для image, script, model и material records. Reader принимает v1–v4; открытие старого индекса само его не меняет, следующая явная регистрация пишет v4. MODEL path — относительный к `Assets/`, только `.gltf/.glb`; исходный основной файл ограничен 8 MiB и хранит размер/SHA-256 плюс digest импортированного содержимого. `registerModel` принимает уже успешно импортированную геометрию, а `resolveModel` проверяет основной файл и его hash. Изменение внешнего glTF buffer обнаруживается повторным `GltfImporter::importAndRegister`, который обновляет content digest; отдельного dependency record для каждого внешнего buffer пока нет. MATERIAL path — относительный к `Assets/Materials/`, только `.astro-material`; запись содержит schema version, размер и SHA-256. `resolveMaterial` проверяет безопасное нахождение источника в проекте, размер/hash, строгий парсинг и то, что все texture AssetIds указывают на зарегистрированные image records. Script source обязан находиться под `Scripts/`, быть UTF-8 `.cs` не больше 16 MiB; сборочные outputs — в `Library/Scripts/`. Дубликаты ID/source/type, неверный hash/размер/путь/format, неизвестная версия, лишние строки и повреждённый UTF-8 отклоняются. Индекс ограничен 16 MiB, 100000 entries и 4096 UTF-8 байт на путь; публикация атомарна. Повреждённый индекс остаётся нетронутым и возвращает ошибку.
+
+## Material asset v1 and v2 (07.2b, 07.2o)
+
+`Assets/Materials/<name>.astro-material` — UTF-8 line format. Первая строка `ASTRO_MATERIAL 1`; далее обязательные строки параметров в фиксированном порядке, ноль-пять TEXTURE records, затем `END`:
+
+```text
+ASTRO_MATERIAL 1
+BASE_COLOR 1 1 1 1
+METALLIC 1
+ROUGHNESS 1
+EMISSIVE 0 0 0
+ALPHA_MODE OPAQUE
+ALPHA_CUTOFF 0.5
+DOUBLE_SIDED 0
+NORMAL_SCALE 1
+OCCLUSION_STRENGTH 1
+TEXTURE_COUNT 1
+TEXTURE BASE_COLOR 12 0
+END
+```
+
+Texture roles are `BASE_COLOR`, `METALLIC_ROUGHNESS`, `NORMAL`, `OCCLUSION`, and `EMISSIVE`. Each binding stores a nonzero registered image AssetId and a non-negative `texCoord` selector. Both versions validate base-color RGBA, metallic, roughness, emissive RGB and alpha cutoff in `[0,1]`, normal scale finite and non-negative, and occlusion strength in `[0,1]`. Defaults are white base color, metallic/roughness 1, black emissive, OPAQUE, cutoff 0.5, single-sided, normal scale 1, occlusion strength 1, and no texture bindings. Floating values use classic locale and finite values only. Duplicate/unknown roles, unknown rows, malformed or extra data, unsupported schema and files over 64 KiB are rejected.
+
+Schema v1 remains readable and resolves to the historical project-preview settings: Clamp to edge on U/V, Nearest min/mag filtering and identity UV transform. Reading/registration does not rewrite v1 source bytes. Schema v2 appends these two required rows after the texture bindings and before `END`:
+
+```text
+BASE_COLOR_SAMPLER MIRRORED_REPEAT REPEAT LINEAR NEAREST
+BASE_COLOR_UV_TRANSFORM 0.1 -0.1 0.15 1.2 0.8
+```
+
+Wrap enums are `REPEAT`, `MIRRORED_REPEAT`, `CLAMP_TO_EDGE`; minification is one of `NEAREST`, `LINEAR`, `NEAREST_MIPMAP_NEAREST`, `LINEAR_MIPMAP_NEAREST`, `NEAREST_MIPMAP_LINEAR`, `LINEAR_MIPMAP_LINEAR`; magnification is `NEAREST` or `LINEAR`. UV transform values are offset U/V, counter-clockwise radians, scale U/V; each must be finite and within +/-1,000,000. New materials default to schema v2. An edited v1 material upgrades only on explicit Inspector save. The save validates the current source hash first, writes via a flushed temporary file and atomic replacement, then refreshes the same AssetId's index record; externally changed sources are rejected rather than overwritten.
+
+Base-color and emissive factors are linear values; base-color and emissive image samples are intended for sRGB decoding. Metallic-roughness texture convention follows glTF: G is roughness and B is metallic in linear data. Normal and occlusion are linear; occlusion uses R. Alpha MASK uses `alphaCutoff`; OPAQUE/BLEND interpretation and rendering are not implemented yet. The values are already validated and serialized/imported; the rendering gap and recommended depth/blend policy are assessed in [07.2q](reports/07.2q-alpha-blending-depth-assessment.md). These are semantic import/render conventions; the current format/parser does not implement generalized PBR or enforce a render queue. The optional Windows Scene View decodes and previews base-color only, applies wrap/filter and UV0 transform for source and project materials, and generates bounded linear-space mip chains when the selected minification mode requests them. AssetRegistry registration reads the file but never edits it; explicit `saveMaterial` retains stable IDs. Resolve detects source hash/size drift and unregistered image references. It does not yet verify that each referenced image file still matches its own registry hash.
+
+07.2h adds a separate Windows BGFX experiment that samples only `BASE_COLOR` from a registered image through `TEXCOORD_0`. The fixture's factor is white to isolate sampling. This experiment does not define a renderer color-space contract: it does not apply sRGB conversion or multiply the linear baseColorFactor. All format roles above remain data semantics, not general texture-role renderer support.
+
+07.2i defines the intended base-color semantics: source image RGB is sRGB encoded, alpha is linear, and `baseColorFactor` is linear RGBA. Its isolated Windows sample decodes source RGB by the IEC sRGB transfer curve, multiplies the factor, and quantizes a temporary linear BGRA8 texture payload; BGFX writes to an sRGB backbuffer. This does not change `.astro-material`, source assets, or cache bytes, and it does not imply that other renderers honor these semantics yet. 07.2cb later documented a transfer mismatch in Editor/Runtime BGFX, corrected and numerically checked by 07.2cc. Other renderers remain unverified. See [assessment 07.2cb](reports/07.2cb-material-color-space-contract.md) and [07.2cc result](reports/07.2cc-bgfx-color-transfer.md).
+
+## glTF material import metadata (07.2c)
+
+This is an in-memory `GltfImportResult`, not a new persisted project file. Each imported mesh has `primitiveMaterialIndices` parallel to its geometry primitive array; an empty optional means glTF supplied no material, otherwise the value indexes `GltfImportResult::materials`. Material records preserve supported core metallic-roughness factors and texture-role references as `(textureIndex, texCoord)` plus optional `KHR_texture_transform` offset/rotation/scale. The transform's optional texCoord override takes precedence. Texture records point to source image and sampler indices; the sampler table preserves wrap modes and optional filters. Image records retain source kind, name, MIME type, safe project-relative path or opaque embedded reference, availability, and source size/hash where bytes are available. External local image bytes are capped at 64 MiB each and 128 MiB total and contribute to `contentHash`; they are read-only and not decoded. `data:` or GLB buffer-view images remain opaque references/hashes.
+
+The geometry cache was `ASTROMSH` v1 through 07.2f. In 07.2g it advances to v2 and stores per-primitive channel flags plus POSITION, optional NORMAL and optional TEXCOORD_0 geometry; caches use a `.v2.astro-mesh-cache` filename, leaving v1 files untouched and unused. Material/image/sampler tables and per-primitive material assignments are reconstructed from the glTF document each import; the content-derived cache key includes external image identity/hash so its import digest detects image changes. Missing local images are kept with diagnostics. Remote image URIs are preserved as unsupported metadata and never fetched. Unsafe traversal, reparse points, or resolved paths outside `Assets/` are rejected. Core metallic-roughness, alpha, normal scale and occlusion strength are validated; unsupported material extensions/properties produce diagnostics. `KHR_texture_transform` and core sampler values are preserved as import metadata; the optional Windows Scene View applies them only to source base-color UV0. Other texture roles are not rendered. No image AssetIds are created by this importer, and no material file or source resource is modified.
+
+The current mesh vertex contract keeps `hasNormals` and `hasTexCoords` independently of default-initialized channel values. `NORMAL` must be a matching, bounded, non-sparse FLOAT VEC3 with finite, non-zero values. `TEXCOORD_0` must be a matching, bounded, non-sparse FLOAT VEC2 or normalized UNSIGNED_BYTE/UNSIGNED_SHORT VEC2; integer UVs are converted to float coordinates. POSITION remains a bounded non-sparse FLOAT VEC3. Other attributes, including TEXCOORD_1+, remain unsupported and are rejected rather than dropped. The optional Editor Scene View samples UV0 for base color; normals and other UV sets are not used by that pass.
 
 ## C# project build manifest/state (04.9–04.10)
 
@@ -171,3 +219,27 @@ The catalog is derived from `<project>/Puzzle/Levels`; it is not a separate mani
 ## Puzzle campaign (06.22, parser and project-file API)
 
 `Puzzle/Campaigns/<ID>.astro-puzzle-campaign` uses `ASTRO_PUZZLE_CAMPAIGN 1`, an explicit ordered level list, a start ID, and score-threshold/default transitions. `PuzzleCampaignFile::read/write` additionally verify each referenced authored level file and enforce safe project-contained paths; writes use a temporary sibling and atomic replacement. Strict grammar, bounds, validation, and limitations are documented in [PUZZLE_CAMPAIGNS.md](PUZZLE_CAMPAIGNS.md). The parser, serializer, structural validator, and project-file API are implemented and covered by `runtime.puzzle.campaign.integration`; Editor authoring, runtime transition selection, migration, and reference-safe level rename remain unimplemented.
+# Scene format v12 — DirectionalLight3D (07.2bw)
+
+Scene v12 adds an optional component record:
+
+```text
+COMPONENT <component-id> <entity-id> "astro.DirectionalLight3D" 1 <enabled:0|1> <linear-r> <linear-g> <linear-b> <intensity>
+```
+
+The three color values must be finite and in `[0,1]`; intensity must be finite and in `[0,64]`. v1–v11 remain readable. Migration is in-memory only until the user explicitly saves; the current writer emits v13. Unknown component types and malformed records continue to fail rather than being discarded.
+
+## Scene format v13 — PointLight3D (07.2cx)
+
+Scene v13 adds an optional point-light record:
+
+```text
+COMPONENT <component-id> <entity-id> "astro.PointLight3D" 1 <enabled:0|1> <linear-r> <linear-g> <linear-b> <intensity> <range>
+```
+
+Color channels must be finite in `[0,1]`, intensity finite in `[0,64]`, and range finite in `[0.1,10000]` scene units. v1–v12 remain readable; loading v12 never invents a point light or rewrites the source file. An explicit save writes v13. Unknown component types and malformed/unsupported component records fail with diagnostics.
+# Material color semantics (07.2cc)
+
+No `.astro-material` schema or serialized color-space field was added. Numeric base-color factors are linear-light values. For glTF imports, base-color texture RGB is sRGB encoded and alpha is linear; `COLOR_0` is a linear multiplier. BGFX converts source RGB, applies factors and creates mips before upload, so its uploaded BGRA8 bytes are linear. See the [Khronos glTF 2.0 material specification](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#reference-material-pbrmetallicroughness). Renderer-specific transfer steps are implementation details and must not change saved material values.
+
+Windows D3D11 BGFX shader paths encode RGB for ordinary BGRA8 outputs; screenshot smoke covers opaque/unlit/lit texture and vertex-color samples. Alpha remains linear. Fixed-function alpha blending into these ordinary targets is not yet established as linear-light correct; this limitation does not change the file format.

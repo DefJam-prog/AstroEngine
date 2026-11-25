@@ -1,0 +1,6 @@
+ASTRO_SCENE 7
+SCENE 3 "Renderer linear base color factor smoke"
+ENTITY 1 0 "UV0 sRGB textured triangle"
+COMPONENT 1 1 "astro.Transform" 1 0 0 0 0 0 0 1 1 1
+COMPONENT 2 1 "astro.MeshRenderer" 2 1 0 0 1 3
+END

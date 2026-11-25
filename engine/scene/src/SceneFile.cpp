@@ -48,7 +48,7 @@ std::string serialize(const Scene& scene)
     std::ostringstream output;
     output.imbue(std::locale::classic());
     output << std::setprecision(std::numeric_limits<double>::max_digits10);
-    output << "ASTRO_SCENE 6\nSCENE " << scene.id() << ' ' << std::quoted(scene.name()) << '\n';
+    output << "ASTRO_SCENE 13\nSCENE " << scene.id() << ' ' << std::quoted(scene.name()) << '\n';
     for (const auto& entity : scene.entities())
         output << "ENTITY " << entity.id << ' ' << entity.parent.value_or(0) << ' '
                << std::quoted(entity.name) << '\n';
@@ -68,9 +68,38 @@ std::string serialize(const Scene& scene)
     for (const auto& entity : scene.entities())
         if (entity.meshRenderer)
             output << "COMPONENT " << entity.meshRenderer->id << ' ' << entity.id << ' '
-                   << std::quoted("astro.MeshRenderer") << ' ' << entity.meshRenderer->schemaVersion << ' '
+                   << std::quoted("astro.MeshRenderer") << ' ' << 2 << ' '
                    << entity.meshRenderer->model.value << ' ' << entity.meshRenderer->meshIndex << ' '
-                   << entity.meshRenderer->primitiveIndex << ' ' << (entity.meshRenderer->visible ? 1 : 0) << '\n';
+                   << entity.meshRenderer->primitiveIndex << ' ' << (entity.meshRenderer->visible ? 1 : 0) << ' '
+                   << entity.meshRenderer->materialOverride.value << '\n';
+    for (const auto& entity : scene.entities())
+        if (entity.primitiveRenderer)
+            output << "COMPONENT " << entity.primitiveRenderer->id << ' ' << entity.id << ' '
+                   << std::quoted("astro.PrimitiveRenderer") << ' ' << entity.primitiveRenderer->schemaVersion << ' '
+                   << static_cast<unsigned>(entity.primitiveRenderer->primitive) << ' '
+                   << (entity.primitiveRenderer->visible ? 1 : 0) << ' '
+                   << entity.primitiveRenderer->materialOverride.value << '\n';
+    for (const auto& entity : scene.entities())
+        if (entity.camera3d)
+            output << "COMPONENT " << entity.camera3d->id << ' ' << entity.id << ' '
+                   << std::quoted("astro.Camera3D") << ' ' << 2 << ' '
+                   << entity.camera3d->verticalFovDegrees << ' ' << entity.camera3d->nearPlane << ' '
+                   << entity.camera3d->farPlane << ' ' << (entity.camera3d->active ? 1 : 0) << '\n';
+    for (const auto& entity : scene.entities())
+        if (entity.directionalLight3d)
+            output << "COMPONENT " << entity.directionalLight3d->id << ' ' << entity.id << ' '
+                   << std::quoted("astro.DirectionalLight3D") << ' ' << entity.directionalLight3d->schemaVersion << ' '
+                   << (entity.directionalLight3d->enabled ? 1 : 0) << ' '
+                   << entity.directionalLight3d->color[0] << ' ' << entity.directionalLight3d->color[1] << ' '
+                   << entity.directionalLight3d->color[2] << ' ' << entity.directionalLight3d->intensity << '\n';
+    for (const auto& entity : scene.entities())
+        if (entity.pointLight3d)
+            output << "COMPONENT " << entity.pointLight3d->id << ' ' << entity.id << ' '
+                   << std::quoted("astro.PointLight3D") << ' ' << entity.pointLight3d->schemaVersion << ' '
+                   << (entity.pointLight3d->enabled ? 1 : 0) << ' '
+                   << entity.pointLight3d->color[0] << ' ' << entity.pointLight3d->color[1] << ' '
+                   << entity.pointLight3d->color[2] << ' ' << entity.pointLight3d->intensity << ' '
+                   << entity.pointLight3d->range << '\n';
     for (const auto& entity : scene.entities())
         for (const auto& behavior : entity.scriptBehaviors)
             output << "COMPONENT " << behavior.id << ' ' << entity.id << ' '
@@ -230,7 +259,7 @@ core::Result<Scene> loadSceneFile(const std::filesystem::path& file)
     std::string magic;
     if (!(header >> magic >> version) || hasExtra(header) || magic != "ASTRO_SCENE")
         return fileError(core::ErrorCode::ParseError, "Invalid scene file header");
-    if (version < 1 || version > 6)
+    if (version < 1 || version > 13)
         return fileError(core::ErrorCode::VersionMismatch, "Unsupported scene file version");
 
     if (!nextLine()) return fileError(core::ErrorCode::ParseError, "Scene metadata is missing");
@@ -304,10 +333,82 @@ core::Result<Scene> loadSceneFile(const std::filesystem::path& file)
                 std::uint32_t meshIndex = 0;
                 std::uint32_t primitiveIndex = 0;
                 unsigned visible = 0;
-                if (!(record >> assetId >> meshIndex >> primitiveIndex >> visible) || visible > 1 || hasExtra(record))
+                std::uint64_t materialOverride = 0;
+                if (!(record >> assetId >> meshIndex >> primitiveIndex >> visible) || visible > 1
+                    || (version >= 7 && !(record >> materialOverride)) || hasExtra(record))
                     return fileError(core::ErrorCode::ParseError, "Invalid MeshRenderer component record");
+                if ((version >= 7 && componentVersion != 2)
+                    || (version == 6 && componentVersion != 1))
+                    return fileError(core::ErrorCode::ValidationError,
+                        "Unsupported MeshRenderer component schema version for this scene file");
                 owner->meshRenderer = MeshRendererComponent{componentId, componentVersion, {assetId},
-                    meshIndex, primitiveIndex, visible != 0};
+                    meshIndex, primitiveIndex, visible != 0, {materialOverride}};
+            }
+            else if (type == "astro.PrimitiveRenderer" && version >= 10)
+            {
+                if (owner->primitiveRenderer)
+                    return fileError(core::ErrorCode::AlreadyExists,
+                        "Entity contains duplicate PrimitiveRenderer components");
+                unsigned primitive = 0, visible = 0;
+                std::uint64_t materialOverride = 0;
+                if (!(record >> primitive >> visible) || visible > 1
+                    || (version >= 11 && !(record >> materialOverride)) || hasExtra(record))
+                    return fileError(core::ErrorCode::ParseError, "Invalid PrimitiveRenderer component record");
+                if ((version == 10 && componentVersion != 1)
+                    || (version >= 11 && componentVersion != 2) || primitive < 1 || primitive > 4
+                    || materialOverride == std::numeric_limits<std::uint64_t>::max())
+                    return fileError(core::ErrorCode::ValidationError,
+                        "Unsupported PrimitiveRenderer schema or primitive kind");
+                owner->primitiveRenderer = PrimitiveRendererComponent{componentId, 2,
+                    static_cast<Primitive3D>(primitive), visible != 0, {materialOverride}};
+            }
+            else if (type == "astro.Camera3D" && version >= 8)
+            {
+                if (owner->camera3d)
+                    return fileError(core::ErrorCode::AlreadyExists, "Entity contains duplicate Camera3D components");
+                Camera3DComponent camera{componentId, componentVersion};
+                unsigned active = 0;
+                if (!(record >> camera.verticalFovDegrees >> camera.nearPlane >> camera.farPlane)
+                    || (version >= 9 && !(record >> active)) || active > 1 || hasExtra(record))
+                    return fileError(core::ErrorCode::ParseError, "Invalid Camera3D component record");
+                if ((version == 8 && componentVersion != 1) || (version >= 9 && componentVersion != 2))
+                    return fileError(core::ErrorCode::ValidationError,
+                        "Unsupported Camera3D component schema version for this scene file");
+                camera.schemaVersion = version >= 9 ? 2 : 1;
+                camera.active = version >= 9 && active != 0;
+                owner->camera3d = camera;
+            }
+            else if (type == "astro.DirectionalLight3D" && version >= 12)
+            {
+                if (owner->directionalLight3d)
+                    return fileError(core::ErrorCode::AlreadyExists,
+                        "Entity contains duplicate DirectionalLight3D components");
+                unsigned enabled = 0;
+                DirectionalLight3DComponent light{componentId, componentVersion};
+                if (!(record >> enabled >> light.color[0] >> light.color[1] >> light.color[2] >> light.intensity)
+                    || enabled > 1 || hasExtra(record))
+                    return fileError(core::ErrorCode::ParseError, "Invalid DirectionalLight3D component record");
+                if (componentVersion != 1)
+                    return fileError(core::ErrorCode::ValidationError,
+                        "Unsupported DirectionalLight3D component schema version");
+                light.enabled = enabled != 0;
+                owner->directionalLight3d = light;
+            }
+            else if (type == "astro.PointLight3D" && version >= 13)
+            {
+                if (owner->pointLight3d)
+                    return fileError(core::ErrorCode::AlreadyExists,
+                        "Entity contains duplicate PointLight3D components");
+                unsigned enabled = 0;
+                PointLight3DComponent light{componentId, componentVersion};
+                if (!(record >> enabled >> light.color[0] >> light.color[1] >> light.color[2]
+                    >> light.intensity >> light.range) || enabled > 1 || hasExtra(record))
+                    return fileError(core::ErrorCode::ParseError, "Invalid PointLight3D component record");
+                if (componentVersion != 1)
+                    return fileError(core::ErrorCode::ValidationError,
+                        "Unsupported PointLight3D component schema version");
+                light.enabled = enabled != 0;
+                owner->pointLight3d = light;
             }
             else if (type == "astro.ScriptBehavior" && version >= 5)
             {

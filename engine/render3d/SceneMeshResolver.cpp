@@ -2,6 +2,7 @@
 
 #include "astro/render3d/GltfImporter.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <string>
 #include <utility>
@@ -25,7 +26,8 @@ std::filesystem::path pathFromUtf8(const std::string& value)
 core::Result<ResolvedSceneMesh> resolveMeshRenderer(const assets::AssetRegistry& registry,
     const scene::MeshRendererComponent& component)
 {
-    if (component.schemaVersion != 1 || component.model.value == 0)
+    if ((component.schemaVersion != 1 && component.schemaVersion != 2) || component.model.value == 0
+        || component.materialOverride.value == UINT64_MAX)
         return failure(core::ErrorCode::ValidationError,
             "MeshRenderer component schema or model AssetId is invalid");
 
@@ -53,8 +55,80 @@ core::Result<ResolvedSceneMesh> resolveMeshRenderer(const assets::AssetRegistry&
         return failure(core::ErrorCode::ValidationError,
             "MeshRenderer primitive index is outside the selected mesh");
 
+    std::optional<std::uint32_t> sourceMaterialIndex;
+    if (component.primitiveIndex < mesh.primitiveMaterialIndices.size())
+        sourceMaterialIndex = mesh.primitiveMaterialIndices[component.primitiveIndex];
+    std::optional<ResolvedSceneSourceMaterial> sourceMaterial;
+    if (sourceMaterialIndex)
+    {
+        if (*sourceMaterialIndex >= imported.value().materials.size())
+            return failure(core::ErrorCode::ValidationError,
+                "MeshRenderer source material index is outside the imported material table");
+        const auto& importedMaterial = imported.value().materials[*sourceMaterialIndex];
+        sourceMaterial.emplace();
+        sourceMaterial->values = importedMaterial.values;
+        if (importedMaterial.baseColorTexture)
+        {
+            const auto& binding = *importedMaterial.baseColorTexture;
+            sourceMaterial->hasBaseColorTexture = true;
+            sourceMaterial->baseColorTexCoord = binding.texCoord;
+            sourceMaterial->baseColorTransform = binding.transform;
+            if (binding.textureIndex >= imported.value().textures.size())
+                return failure(core::ErrorCode::ValidationError,
+                    "MeshRenderer source base-color texture index is outside the imported texture table");
+            const auto& texture = imported.value().textures[binding.textureIndex];
+            if (texture.samplerIndex)
+            {
+                if (*texture.samplerIndex >= imported.value().samplers.size())
+                    return failure(core::ErrorCode::ValidationError,
+                        "MeshRenderer source base-color sampler index is outside the imported sampler table");
+                sourceMaterial->baseColorSampler = imported.value().samplers[*texture.samplerIndex];
+            }
+            if (!texture.imageIndex || *texture.imageIndex >= imported.value().images.size())
+            {
+                sourceMaterial->baseColorImageAvailable = false;
+                sourceMaterial->diagnostic = "Source base-color texture has no supported image; using vertex-color fallback";
+            }
+            else
+            {
+                const auto& image = imported.value().images[*texture.imageIndex];
+                if (image.sourceKind != GltfImageSourceKind::ExternalFile || !image.available)
+                {
+                    sourceMaterial->baseColorImageAvailable = false;
+                    sourceMaterial->diagnostic = "Source base-color image is missing or not a local external file; using vertex-color fallback";
+                }
+                else
+                {
+                    const auto imageRelative = pathFromUtf8(image.reference);
+                    const auto safeRelative = imageRelative.lexically_normal();
+                    if (imageRelative.empty() || imageRelative.is_absolute() || imageRelative.has_root_name()
+                        || safeRelative != imageRelative
+                        || std::any_of(imageRelative.begin(), imageRelative.end(), [](const auto& part) {
+                            return part == "..";
+                        }))
+                    {
+                        sourceMaterial->baseColorImageAvailable = false;
+                        sourceMaterial->diagnostic = "Source base-color image path is invalid; using vertex-color fallback";
+                    }
+                    else
+                    {
+                        sourceMaterial->baseColorImagePath = registry.projectRoot()
+                            / std::filesystem::path("Assets") / imageRelative;
+                        sourceMaterial->baseColorImageHash = image.sourceHash;
+                    }
+                }
+            }
+        }
+    }
+    if (component.materialOverride.value != 0)
+    {
+        auto material = registry.resolveMaterial(component.materialOverride);
+        if (!material) return failure(material.error().code, material.error().message);
+    }
+
     return core::Result<ResolvedSceneMesh>::success({component.model, component.meshIndex,
-        component.primitiveIndex, std::move(mesh.name),
+        component.primitiveIndex, sourceMaterialIndex, component.materialOverride, std::move(sourceMaterial),
+        std::move(mesh.name),
         std::move(mesh.primitives[component.primitiveIndex]), component.visible});
 }
 }

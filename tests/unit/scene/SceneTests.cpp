@@ -34,6 +34,42 @@ int main()
     const auto anotherEntity = defaults.createEntity("Second");
     check(anotherEntity && defaults.transform(anotherEntity.value())->id > defaults.transform(defaultEntity.value())->id,
         "component IDs are scene-unique and monotonically allocated");
+    if (defaultEntity)
+    {
+        check(defaults.setDirectionalLight3D(defaultEntity.value()).hasValue(),
+            "add DirectionalLight3D with documented defaults");
+        const auto* light = defaults.directionalLight3D(defaultEntity.value());
+        check(light && light->id != 0 && light->schemaVersion == 1 && light->enabled
+            && light->color == std::array<float, 3>{1, 1, 1} && light->intensity == 1.0f,
+            "DirectionalLight3D defaults to enabled linear white at unit intensity");
+        check(!defaults.setDirectionalLight3D(defaultEntity.value(), {-0.1f, 1, 1}, 1)
+            && !defaults.setDirectionalLight3D(defaultEntity.value(), {1, 1, 1}, 64.1f)
+            && defaults.directionalLight3D(defaultEntity.value())->intensity == 1.0f,
+            "reject out-of-range light values without mutating existing component");
+        check(defaults.setDirectionalLight3D(defaultEntity.value(), {0.2f, 0.3f, 0.4f}, 4.0f, false).hasValue()
+            && defaults.directionalLight3D(defaultEntity.value())->color[1] == 0.3f
+            && !defaults.directionalLight3D(defaultEntity.value())->enabled,
+            "update light properties while preserving its component identity");
+        check(defaults.removeDirectionalLight3D(defaultEntity.value()).hasValue()
+            && !defaults.directionalLight3D(defaultEntity.value()), "remove DirectionalLight3D");
+        check(defaults.setPointLight3D(defaultEntity.value()).hasValue(),
+            "add PointLight3D with documented defaults");
+        const auto* point = defaults.pointLight3D(defaultEntity.value());
+        check(point && point->id != 0 && point->schemaVersion == 1 && point->enabled
+            && point->color == std::array<float, 3>{1, 1, 1} && point->intensity == 1.0f
+            && point->range == 10.0f, "PointLight3D defaults to enabled white, unit intensity and 10-unit range");
+        check(!defaults.setPointLight3D(defaultEntity.value(), {1, 0, 0}, 1.0f, 0.0f)
+            && !defaults.setPointLight3D(defaultEntity.value(), {1, 0, 0}, 1.0f,
+                std::numeric_limits<float>::infinity())
+            && defaults.pointLight3D(defaultEntity.value())->range == 10.0f,
+            "reject invalid point-light range without mutating existing values");
+        check(defaults.setPointLight3D(defaultEntity.value(), {0.2f, 0.3f, 0.4f}, 2.5f, 25.0f, false).hasValue()
+            && defaults.pointLight3D(defaultEntity.value())->color[2] == 0.4f
+            && !defaults.pointLight3D(defaultEntity.value())->enabled,
+            "update point-light authoring fields while preserving component identity");
+        check(defaults.removePointLight3D(defaultEntity.value()).hasValue()
+            && !defaults.pointLight3D(defaultEntity.value()), "remove PointLight3D");
+    }
     if (anotherEntity)
     {
         const auto removedComponentId = defaults.transform(anotherEntity.value())->id;
@@ -79,11 +115,17 @@ int main()
     }
     if (defaultEntity)
     {
+        const auto originalTransformComponentId = defaults.transform(defaultEntity.value())->id;
         auto changed = defaults.transform(defaultEntity.value())->value;
         changed.position = {12.5, -4.0, 3.25};
-        check(defaults.setTransform(defaultEntity.value(), changed).hasValue(), "set a finite Transform");
+        check(defaults.setTransform(defaultEntity.value(), changed).hasValue()
+            && defaults.transform(defaultEntity.value())->id == originalTransformComponentId,
+            "set a finite Transform without replacing its stable component ID");
+        const auto validBeforeInvalidEdit = defaults.transform(defaultEntity.value())->value;
         changed.position.x = std::numeric_limits<double>::infinity();
-        check(!defaults.setTransform(defaultEntity.value(), changed), "reject non-finite Transform values");
+        check(!defaults.setTransform(defaultEntity.value(), changed)
+            && defaults.transform(defaultEntity.value())->value == validBeforeInvalidEdit,
+            "reject non-finite Transform values without mutation");
     }
     const auto root = scene.createEntity("Игрок Ω");
     check(root.hasValue(), "create UTF-8 root entity");
@@ -110,6 +152,12 @@ int main()
     check(!scene.createEntity(std::string(241, 'x')), "reject names beyond schema byte limit");
     check(!scene.createEntity(std::string("\xC0\xAF", 2)), "reject invalid UTF-8 entity names");
     check(!scene.erase(123456), "reject deletion of a missing entity");
+    astro::scene::Scene primitiveScene(3, "Primitive deletion");
+    const auto primitiveEntity = primitiveScene.createEntity("Cube");
+    check(primitiveEntity && primitiveScene.setPrimitiveRenderer(primitiveEntity.value(),
+        astro::scene::Primitive3D::Cube).hasValue(), "create a primitive entity for deletion coverage");
+    check(primitiveEntity && primitiveScene.erase(primitiveEntity.value()).hasValue()
+        && primitiveScene.entities().empty(), "delete a selected primitive entity");
     if (failures == 0)
     {
         std::cout << "All scene tests passed.\n";

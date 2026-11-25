@@ -1,13 +1,22 @@
 #include <filesystem>
 #include <fstream>
+#include <cwchar>
 #include <string>
 #include "ProjectFile.hpp"
+#include "ProjectPathPolicy.hpp"
 #include "Localization.hpp"
 #include "CSharpPlayApproval.hpp"
 #include "CSharpCodeWorkspace.hpp"
 #include "CSharpBuildManifest.hpp"
 #include "CSharpMetadataDiagnostics.hpp"
+#include "AssetBrowserModel.hpp"
+#include "SceneViewRenderPolicy.hpp"
+#include "VulkanSurfaceFormatProbe.hpp"
+#include "EditorUiScalePolicy.hpp"
+#include "EditorWorkspaceLayoutPolicy.hpp"
 #include "astro/assets/AssetRegistry.hpp"
+#include "astro/assets/MaterialAsset.hpp"
+#include "astro/ai/CodexChangeReviewModel.hpp"
 #include "astro/logic/VisualLogicGraph.hpp"
 #include "astro/runtime/AnimationTimeline.hpp"
 #include "astro/runtime/CameraRig.hpp"
@@ -25,16 +34,25 @@
 #endif
 #include "astro/render2d/SceneSprites.hpp"
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+#include "SceneCameraPose.hpp"
 #include "astro/render3d/SceneMeshResolver.hpp"
 #include "astro/render3d/Camera3D.hpp"
+#include "astro/render3d/NormalMatrix.hpp"
+#include "astro/render3d/SceneRenderPacket.hpp"
+#include "astro/render3d/BaseColorTexture.hpp"
 #include "astro/render3d/GltfImporter.hpp"
+#include "astro/runtime/WicImageDecoder.hpp"
 #include "SceneViewCamera3D.hpp"
+#endif
+#if defined(ASTRO_EDITOR_HAS_RUNTIME_BGFX_3D)
+#include "BgfxSceneRenderer.hpp"
 #endif
 #include "astro/save_editor/SaveSystemDocument.hpp"
 #include "astro/scene/Scene.hpp"
 #include "astro/scene/SceneFile.hpp"
 #include "astro/ui/UiDocument.hpp"
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_dialog.h>
 #include <bgfx/bgfx.h>
 #include <bx/math.h>
 #include <imgui.h>
@@ -47,6 +65,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -65,6 +84,7 @@
 #include <future>
 #include <charconv>
 #include <unordered_map>
+#include <mutex>
 
 // Upstream bgfx shader binaries; licenses remain in the dependency cache.
 #include <vs_ocornut_imgui.bin.h>
@@ -72,11 +92,62 @@
 
 namespace
 {
+struct ProjectPathDialogResult final
+{
+    std::mutex mutex;
+    bool completed = false;
+    bool cancelled = false;
+    std::string selectedPath;
+    std::string error;
+};
+
+void SDLCALL completeProjectPathDialog(void* userdata, const char* const* filelist, int)
+{
+    std::unique_ptr<std::shared_ptr<ProjectPathDialogResult>> callbackOwner(
+        static_cast<std::shared_ptr<ProjectPathDialogResult>*>(userdata));
+    if (!callbackOwner || !*callbackOwner) return;
+
+    auto& result = **callbackOwner;
+    std::lock_guard lock(result.mutex);
+    result.completed = true;
+    if (!filelist)
+    {
+        const char* error = SDL_GetError();
+        result.error = error ? error : "SDL file dialog failed";
+    }
+    else if (!filelist[0]) result.cancelled = true;
+    else result.selectedPath = filelist[0];
+}
+
 using astro::editor::EditorLanguage;
 EditorLanguage gEditorLanguage = EditorLanguage::English;
 const char* tr(const char* text) noexcept
 {
     return astro::editor::translateEditorText(text, gEditorLanguage);
+}
+std::string localizedSceneViewDiagnostics(const std::string_view diagnostics)
+{
+    std::string result;
+    std::size_t begin = 0;
+    while (begin <= diagnostics.size())
+    {
+        const auto end = diagnostics.find('\n', begin);
+        const auto line = diagnostics.substr(begin, end == std::string_view::npos ? end : end - begin);
+        constexpr std::string_view decodePrefix = "Base-color image decode failed; using vertex-color fallback: ";
+        constexpr std::string_view gameCameraPrefix = "Active Game View Camera3D is invalid: ";
+        if (!result.empty()) result.push_back('\n');
+        if (line.starts_with(decodePrefix))
+            result += astro::editor::translateEditorDiagnostic(decodePrefix.substr(0, decodePrefix.size() - 2), gEditorLanguage)
+                + ": " + astro::editor::translateEditorDiagnostic(line.substr(decodePrefix.size()), gEditorLanguage);
+        else if (line.starts_with(gameCameraPrefix))
+            result += astro::editor::translateEditorDiagnostic(
+                gameCameraPrefix.substr(0, gameCameraPrefix.size() - 2), gEditorLanguage)
+                + ": " + astro::editor::translateEditorDiagnostic(line.substr(gameCameraPrefix.size()), gEditorLanguage);
+        else result += astro::editor::translateEditorDiagnostic(line, gEditorLanguage);
+        if (end == std::string_view::npos) break;
+        begin = end + 1;
+    }
+    return result;
 }
 std::string pathUtf8(const std::filesystem::path& path)
 {
@@ -253,9 +324,62 @@ int resizeCodeText(ImGuiInputTextCallbackData* data)
     return 0;
 }
 
+struct RegisteredAssetInfo final
+{
+    std::string_view kind;
+    std::string_view sourceRelativePath;
+};
+
+bool bgfxSupportsSrgbBgra8Target() noexcept
+{
+    const auto* caps = bgfx::getCaps();
+    if (!caps) return false;
+    const auto format = caps->formats[bgfx::TextureFormat::BGRA8];
+    return (format & BGFX_CAPS_FORMAT_TEXTURE_2D_SRGB) != 0
+        && (format & BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER) != 0;
+}
+
+std::optional<bgfx::TextureFormat::Enum> bgfxSupportedDepthFormat() noexcept
+{
+    const auto* caps = bgfx::getCaps();
+    if (!caps) return std::nullopt;
+    constexpr std::array candidates{bgfx::TextureFormat::D24S8, bgfx::TextureFormat::D32F,
+        bgfx::TextureFormat::D24, bgfx::TextureFormat::D16};
+    for (const auto format : candidates)
+        if ((caps->formats[format] & BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER) != 0)
+            return format;
+    return std::nullopt;
+}
+
+std::uint8_t srgbToLinearByte(const std::uint8_t value) noexcept
+{
+    const float encoded = static_cast<float>(value) / 255.0f;
+    const float linear = encoded <= 0.04045f ? encoded / 12.92f
+        : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
+    return static_cast<std::uint8_t>(std::lround(std::clamp(linear, 0.0f, 1.0f) * 255.0f));
+}
+
+std::optional<RegisteredAssetInfo> registeredAssetInfo(
+    const astro::assets::AssetRegistry& registry, const astro::assets::AssetId id)
+{
+    if (const auto* image = registry.find(id)) return RegisteredAssetInfo{"Image", image->sourceRelativePath};
+    if (const auto* model = registry.findModel(id)) return RegisteredAssetInfo{"Model", model->sourceRelativePath};
+    if (const auto* material = registry.findMaterial(id)) return RegisteredAssetInfo{"Material", material->sourceRelativePath};
+    if (const auto* script = registry.findScript(id)) return RegisteredAssetInfo{"Script", script->sourceRelativePath};
+    return std::nullopt;
+}
+
 class SceneViewTarget final
 {
 public:
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+    struct DiagnosticEntry final
+    {
+        std::string message;
+        std::optional<EntityId> relatedEntity;
+        std::optional<astro::assets::AssetId> relatedAsset;
+    };
+#endif
     struct Timings final
     {
         double prepareMs = 0.0, submitMs = 0.0;
@@ -267,11 +391,50 @@ public:
     SceneViewTarget(const SceneViewTarget&) = delete;
     SceneViewTarget& operator=(const SceneViewTarget&) = delete;
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
-    void configure3d(bgfx::ProgramHandle program)
+    void configure3d(bgfx::ProgramHandle program, bgfx::ProgramHandle texturedProgram,
+        bgfx::UniformHandle baseColorSampler, bgfx::UniformHandle alphaParams,
+        bgfx::ProgramHandle runtimeLitProgram = BGFX_INVALID_HANDLE,
+        bgfx::ProgramHandle runtimeLitTexturedProgram = BGFX_INVALID_HANDLE,
+        bgfx::UniformHandle runtimeNormalMatrix = BGFX_INVALID_HANDLE,
+        bgfx::UniformHandle runtimeLightParams = BGFX_INVALID_HANDLE,
+        bgfx::UniformHandle runtimeLightDirections = BGFX_INVALID_HANDLE,
+        bgfx::UniformHandle runtimeLightColors = BGFX_INVALID_HANDLE,
+        bgfx::UniformHandle runtimeBaseColorFactor = BGFX_INVALID_HANDLE,
+        bgfx::UniformHandle runtimePointPositions = BGFX_INVALID_HANDLE,
+        bgfx::UniformHandle runtimePointColors = BGFX_INVALID_HANDLE,
+        bgfx::UniformHandle runtimePointRanges = BGFX_INVALID_HANDLE)
     {
         program3d_ = program;
+        texturedProgram3d_ = texturedProgram;
+        baseColorSampler_ = baseColorSampler;
+        alphaParams_ = alphaParams;
         meshLayout_.begin().add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float)
-            .add(bgfx::Attrib::Color0, 4, bgfx::AttribType::Uint8, true).end();
+            .add(bgfx::Attrib::Color0, 4, bgfx::AttribType::Uint8, true)
+            .add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float)
+            .add(bgfx::Attrib::Normal, 3, bgfx::AttribType::Float).end();
+        litProgram3d_ = runtimeLitProgram;
+        litTexturedProgram3d_ = runtimeLitTexturedProgram;
+        normalMatrix3d_ = runtimeNormalMatrix;
+        lightParams3d_ = runtimeLightParams;
+        lightDirections3d_ = runtimeLightDirections;
+        lightColors3d_ = runtimeLightColors;
+        pointPositions3d_ = runtimePointPositions;
+        pointColors3d_ = runtimePointColors;
+        pointRanges3d_ = runtimePointRanges;
+        baseColorFactor3d_ = runtimeBaseColorFactor;
+#if defined(ASTRO_EDITOR_HAS_RUNTIME_BGFX_3D)
+        if (view_ == 2)
+        {
+            runtimeSceneRenderer_ = std::make_unique<astro::runtime::BgfxSceneRenderer>(
+                bgfx::isValid(runtimeLitProgram) ? runtimeLitProgram : program,
+                bgfx::isValid(runtimeLitTexturedProgram) ? runtimeLitTexturedProgram : texturedProgram,
+                baseColorSampler, alphaParams);
+            runtimeSceneRenderer_->configureDirectionalLighting(runtimeNormalMatrix, runtimeLightParams,
+                runtimeLightDirections, runtimeLightColors, runtimeBaseColorFactor);
+            runtimeSceneRenderer_->configurePointLighting(runtimePointPositions, runtimePointColors,
+                runtimePointRanges);
+        }
+#endif
     }
     void invalidate3dCache() noexcept
     {
@@ -288,21 +451,62 @@ public:
     void requestFrameAll() noexcept { frameAllRequested_ = true; }
     [[nodiscard]] std::uint64_t meshSubmissions() const noexcept { return meshSubmissions_; }
     [[nodiscard]] std::uint32_t frameMeshSubmissions() const noexcept { return frameMeshSubmissions_; }
+    [[nodiscard]] bool frameCameraDriven() const noexcept { return frameCameraDriven_; }
     [[nodiscard]] std::uint32_t frameMeshDiagnostics() const noexcept { return frameMeshDiagnostics_; }
+    [[nodiscard]] const std::vector<DiagnosticEntry>& diagnostics() const noexcept { return diagnostics_; }
+    [[nodiscard]] std::uint32_t frameTexturedMeshSubmissions() const noexcept { return frameTexturedMeshSubmissions_; }
+    [[nodiscard]] std::uint32_t framePrimitiveMaterialSubmissions() const noexcept
+    { return framePrimitiveMaterialSubmissions_; }
+    [[nodiscard]] std::uint32_t frameMaterialFallbacks() const noexcept { return frameMaterialFallbacks_; }
+    [[nodiscard]] std::uint32_t frameAlphaModeSubmissions(astro::assets::MaterialAlphaMode mode) const noexcept
+    { return mode == astro::assets::MaterialAlphaMode::Opaque ? frameOpaqueMeshSubmissions_
+        : mode == astro::assets::MaterialAlphaMode::Mask ? frameMaskMeshSubmissions_ : frameBlendMeshSubmissions_; }
+    [[nodiscard]] std::uint32_t frameSourceSamplerSubmissions() const noexcept { return frameSourceSamplerSubmissions_; }
+    [[nodiscard]] std::uint32_t frameTextureTransformSubmissions() const noexcept { return frameTextureTransformSubmissions_; }
+    [[nodiscard]] std::uint32_t lastSourceSamplerFlags() const noexcept { return lastSourceSamplerFlags_; }
+    [[nodiscard]] std::uint32_t frameProjectSamplerSubmissions() const noexcept { return frameProjectSamplerSubmissions_; }
+    [[nodiscard]] std::uint32_t frameProjectTransformSubmissions() const noexcept { return frameProjectTransformSubmissions_; }
+    [[nodiscard]] std::uint32_t lastProjectSamplerFlags() const noexcept { return lastProjectSamplerFlags_; }
+    [[nodiscard]] std::uint32_t frameMipmappedTextureSubmissions() const noexcept { return frameMipmappedTextureSubmissions_; }
+    [[nodiscard]] std::uint32_t frameMaskMipmappedTextureSubmissions() const noexcept
+    { return frameMaskMipmappedTextureSubmissions_; }
+    [[nodiscard]] std::uint64_t sharedTextureCacheHits() const noexcept { return baseColorTextureCacheHits_; }
     [[nodiscard]] bx::Vec3 lastMeshOrigin() const noexcept { return lastMeshOrigin_; }
     [[nodiscard]] const std::string& meshError() const noexcept { return meshError_; }
     [[nodiscard]] float cameraDistance() const noexcept { return camera3d_.distance(); }
     [[nodiscard]] astro::render3d::Vec3 cameraFocus() const noexcept { return camera3d_.focus(); }
+    [[nodiscard]] float cameraYaw() const noexcept { return camera3d_.yawRadians(); }
     [[nodiscard]] bool frameAllApplied() const noexcept { return frameAllApplied_; }
+    void forceZeroLightLambert(const bool enabled) noexcept { forceZeroLightLambert_ = enabled; }
+#if defined(ASTRO_EDITOR_HAS_RUNTIME_BGFX_3D)
+    [[nodiscard]] bool runtimeBgfxAdapterUsed() const noexcept { return frameRuntimeBgfxAdapterUsed_; }
+    [[nodiscard]] std::uint32_t frameRuntimeBgfxSubmissions() const noexcept
+    { return frameRuntimeBgfxSubmissions_; }
+    [[nodiscard]] std::size_t runtimeBgfxCachedMeshCount() const noexcept
+    { return runtimeSceneRenderer_ ? runtimeSceneRenderer_->cachedMeshCount() : 0; }
+    [[nodiscard]] std::size_t runtimeBgfxCachedTextureCount() const noexcept
+    { return runtimeSceneRenderer_ ? runtimeSceneRenderer_->cachedTextureCount() : 0; }
+    [[nodiscard]] std::size_t runtimeBgfxCachedMipTextureCount() const noexcept
+    { return runtimeSceneRenderer_ ? runtimeSceneRenderer_->cachedMipTextureCount() : 0; }
+    [[nodiscard]] std::uint32_t frameRuntimeBgfxTextureSubmissions() const noexcept
+    { return frameRuntimeBgfxTextureSubmissions_; }
+#endif
 #endif
     [[nodiscard]] int framebufferWidth() const noexcept { return width_; }
     [[nodiscard]] int framebufferHeight() const noexcept { return height_; }
+    [[nodiscard]] bool usesSrgbAttachment() const noexcept { return srgbAttachment_; }
+    [[nodiscard]] bgfx::TextureHandle framebufferTexture() const noexcept
+    {
+        if (!bgfx::isValid(frameBuffer_)) return BGFX_INVALID_HANDLE;
+        return bgfx::getTexture(frameBuffer_);
+    }
 
     bool render(const Scene& scene, const astro::assets::AssetRegistry* assets,
         const std::map<std::uint64_t, bgfx::TextureHandle>& textures, const int width, const int height,
         const bgfx::ProgramHandle program, const bgfx::UniformHandle sampler,
         const bgfx::UniformHandle outputMode, const bgfx::VertexLayout& layout,
-        bgfx::TextureHandle& output, std::string& error, Timings* timings = nullptr)
+        bgfx::TextureHandle& output, std::string& error, Timings* timings = nullptr,
+        const bool playRuntime3d = false)
     {
         using Clock = std::chrono::steady_clock;
         const auto totalStart = Clock::now();
@@ -355,8 +559,11 @@ public:
                 if (!std::isfinite(screenX) || !std::isfinite(screenY)
                     || std::abs(screenX) > 10000000.0 || std::abs(screenY) > 10000000.0)
                 { error = "Projected sprite vertex is outside the supported view range"; return false; }
+                const auto red = srgbAttachment_ ? srgbToLinearByte(sprite.tint.r) : sprite.tint.r;
+                const auto green = srgbAttachment_ ? srgbToLinearByte(sprite.tint.g) : sprite.tint.g;
+                const auto blue = srgbAttachment_ ? srgbToLinearByte(sprite.tint.b) : sprite.tint.b;
                 vertices.push_back({ImVec2(static_cast<float>(screenX), static_cast<float>(screenY)),
-                    uv[corner], IM_COL32(sprite.tint.r, sprite.tint.g, sprite.tint.b, sprite.tint.a)});
+                    uv[corner], IM_COL32(red, green, blue, sprite.tint.a)});
             }
             indices.insert(indices.end(), {base, static_cast<std::uint16_t>(base + 1),
                 static_cast<std::uint16_t>(base + 2), base, static_cast<std::uint16_t>(base + 2),
@@ -368,7 +575,7 @@ public:
         if (!bgfx::isValid(frameBuffer_))
         { error = "bgfx could not allocate the Scene/Game framebuffer"; return false; }
         const auto prepareDone = Clock::now();
-        bgfx::setViewName(view_, view_ == 1 ? "Scene View" : "Game View");
+        bgfx::setViewName(view_, view_ == 1 ? "Scene View" : view_ == 5 ? "Project Model Preview" : "Game View");
         bgfx::setViewFrameBuffer(view_, frameBuffer_);
         bgfx::setViewRect(view_, 0, 0, static_cast<std::uint16_t>(targetWidth),
             static_cast<std::uint16_t>(targetHeight));
@@ -378,7 +585,7 @@ public:
         bx::mtxOrtho(projection, 0.0f, static_cast<float>(targetWidth), static_cast<float>(targetHeight), 0.0f,
             0.0f, 1000.0f, 0.0f, bgfx::getCaps()->homogeneousDepth);
         bgfx::setViewTransform(view_, nullptr, projection);
-        const float colorMode[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+        const float colorMode[4] = {0.0f, 1.0f, srgbAttachment_ ? 1.0f : 0.0f, 0.0f};
         bgfx::setFrameUniform(outputMode, colorMode);
         bgfx::touch(view_);
 
@@ -402,7 +609,7 @@ public:
                 const auto texture = textures.find(asset);
                 if (texture == textures.end() || !bgfx::isValid(texture->second))
                 { error = "SpriteRenderer texture has not been uploaded to bgfx"; return false; }
-                bgfx::setTexture(0, sampler, texture->second);
+                bgfx::setTexture(0, sampler, texture->second, srgbAttachment_ ? BGFX_SAMPLER_SRGB : BGFX_SAMPLER_NONE);
                 bgfx::setVertexBuffer(0, &vertexBuffer, static_cast<std::uint32_t>(first * 4),
                     static_cast<std::uint32_t>((end - first) * 4));
                 bgfx::setIndexBuffer(&indexBuffer, static_cast<std::uint32_t>(first * 6),
@@ -416,8 +623,9 @@ public:
                 timings->transientCopyMs = std::chrono::duration<double, std::milli>(transientCopyDone - geometryDone).count();
         }
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
-        if (view_ == 1 && bgfx::isValid(program3d_))
-            drawSceneMeshes(scene, assets, targetWidth, targetHeight, timings);
+        if ((view_ == 1 || view_ == 2 || view_ == 5) && bgfx::isValid(program3d_))
+            drawSceneMeshes(scene, assets, targetWidth, targetHeight, timings, playRuntime3d,
+                forceZeroLightLambert_);
 #endif
         const auto submitDone = Clock::now();
         if (timings)
@@ -437,80 +645,669 @@ public:
 
 private:
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+    struct SceneMeshVertex final { float x, y, z; std::uint32_t color; float u, v, nx, ny, nz; };
+
     struct CachedMesh final
     {
         astro::assets::AssetId model{};
         std::uint32_t mesh = 0, primitive = 0;
+        std::uint8_t builtinPrimitive = 0;
         bx::Vec3 minimum{0.0f, 0.0f, 0.0f}, maximum{0.0f, 0.0f, 0.0f};
         bgfx::VertexBufferHandle vertices = BGFX_INVALID_HANDLE;
         bgfx::IndexBufferHandle indices = BGFX_INVALID_HANDLE;
+        std::vector<SceneMeshVertex> sourceVertices;
+        bgfx::TextureHandle baseColorTexture = BGFX_INVALID_HANDLE;
+        std::string baseColorTextureCacheKey;
+        astro::assets::AssetId materialOverride{};
+        std::string materialSourceHash;
+        std::optional<astro::assets::MaterialAssetData> materialData;
+        std::optional<astro::assets::AssetId> projectBaseColorImage;
+        std::optional<astro::render3d::ResolvedSceneSourceMaterial> sourceMaterial;
+        std::string textureSourceHash;
+        std::string materialDiagnostic;
+        std::optional<astro::render3d::BaseColorUvTransform> baseColorUvTransform;
+        std::uint32_t baseColorSamplerFlags = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+            | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT;
+        bool sourceGltfSampling = false, sourceUvTransform = false;
+        bool projectOverrideSampling = false;
+        bool textureHasMips = false;
+        bool hasTexCoords = false, hasNormals = false, materialAttempted = false, textured = false;
+    };
+
+    struct BaseColorTextureCacheEntry final
+    {
+        bgfx::TextureHandle texture = BGFX_INVALID_HANDLE;
+        std::uint32_t references = 0;
+        std::uint64_t bytes = 0;
     };
 
     struct DrawItem final
     {
         EntityId entity = 0;
         std::array<float, 16> transform{};
+        astro::assets::MaterialAlphaMode alphaMode = astro::assets::MaterialAlphaMode::Opaque;
+        float alphaCutoff = 0.5f;
+        bool doubleSided = false;
+        bool primitiveMaterialOverride = false;
     };
 
     void releaseMesh(CachedMesh& mesh) noexcept
     {
         if (bgfx::isValid(mesh.indices)) bgfx::destroy(mesh.indices);
         if (bgfx::isValid(mesh.vertices)) bgfx::destroy(mesh.vertices);
+        releaseBaseColorTexture(mesh);
         mesh = {};
+    }
+
+    void releaseBaseColorTexture(CachedMesh& mesh) noexcept
+    {
+        if (mesh.baseColorTextureCacheKey.empty())
+        {
+            mesh.baseColorTexture = BGFX_INVALID_HANDLE;
+            return;
+        }
+        const auto found = baseColorTextureCache_.find(mesh.baseColorTextureCacheKey);
+        if (found != baseColorTextureCache_.end())
+        {
+            if (found->second.references > 0) --found->second.references;
+            if (found->second.references == 0)
+            {
+                if (bgfx::isValid(found->second.texture)) bgfx::destroy(found->second.texture);
+                baseColorTextureCacheBytes_ -= found->second.bytes;
+                baseColorTextureCache_.erase(found);
+            }
+        }
+        mesh.baseColorTexture = BGFX_INVALID_HANDLE;
+        mesh.baseColorTextureCacheKey.clear();
+        mesh.textureHasMips = false;
+    }
+
+    bool acquireBaseColorTexture(CachedMesh& mesh, const std::span<const std::uint8_t> srgbPixels,
+        const std::uint32_t width, const std::uint32_t height,
+        const std::array<float, 4>& linearFactor, const bool includeMipmaps,
+        const astro::render3d::BaseColorAlphaMipMode alphaMipMode, const float alphaCutoff)
+    {
+        std::string key = astro::assets::sha256Hex(srgbPixels) + ":" + std::to_string(width) + "x"
+            + std::to_string(height) + ":" + (includeMipmaps ? "m:" : "1:");
+        key += std::to_string(static_cast<int>(alphaMipMode)) + ":"
+            + std::to_string(std::bit_cast<std::uint32_t>(alphaCutoff)) + ":";
+        for (const auto value : linearFactor)
+            key += std::to_string(std::bit_cast<std::uint32_t>(value)) + ":";
+        const auto cached = baseColorTextureCache_.find(key);
+        if (cached != baseColorTextureCache_.end())
+        {
+            ++cached->second.references;
+            ++baseColorTextureCacheHits_;
+            mesh.baseColorTexture = cached->second.texture;
+            mesh.baseColorTextureCacheKey = key;
+            mesh.textureHasMips = includeMipmaps
+                && (width > 1 || height > 1);
+            return true;
+        }
+
+        constexpr std::uint64_t MaxSceneViewTextureCacheBytes = 256ull * 1024 * 1024;
+        auto chain = astro::render3d::prepareLinearBaseColorMipChainBgra8(
+            srgbPixels, width, height, linearFactor, includeMipmaps, alphaMipMode, alphaCutoff);
+        if (!chain)
+        {
+            mesh.materialDiagnostic = "Base-color mip generation failed; using vertex-color fallback: "
+                + chain.error().message;
+            return false;
+        }
+        const auto uploadBytes = static_cast<std::uint64_t>(chain.value().pixels.size());
+        if (baseColorTextureCacheBytes_ > MaxSceneViewTextureCacheBytes
+            || uploadBytes > MaxSceneViewTextureCacheBytes - baseColorTextureCacheBytes_)
+        {
+            mesh.materialDiagnostic = "Scene View base-color texture cache reached its 256 MiB safety limit; using vertex-color fallback";
+            return false;
+        }
+        const bool hasMips = chain.value().levels.size() > 1;
+        const auto& base = chain.value().levels.front();
+        const auto texture = bgfx::createTexture2D(static_cast<std::uint16_t>(base.width),
+            static_cast<std::uint16_t>(base.height), hasMips, 1, bgfx::TextureFormat::BGRA8,
+            BGFX_TEXTURE_NONE, bgfx::copy(chain.value().pixels.data(),
+                static_cast<std::uint32_t>(chain.value().pixels.size())));
+        if (!bgfx::isValid(texture))
+        {
+            mesh.materialDiagnostic = "Base-color GPU mip-chain upload failed; using vertex-color fallback";
+            return false;
+        }
+        baseColorTextureCache_.emplace(key, BaseColorTextureCacheEntry{texture, 1, uploadBytes});
+        baseColorTextureCacheBytes_ += uploadBytes;
+        mesh.baseColorTexture = texture;
+        mesh.baseColorTextureCacheKey = std::move(key);
+        mesh.textureHasMips = hasMips;
+        return true;
     }
 
     bool getWorldMatrix(const Scene& scene, const Entity& entity, float* output)
     {
-        std::vector<const Entity*> parents;
-        const Entity* current = &entity;
-        while (current)
+        const auto world = astro::editor::sceneEntityWorldMatrix(scene, entity.id);
+        if (!world) return false;
+        std::memcpy(output, world.value().data(), sizeof(float) * 16);
+        return true;
+    }
+
+    void prepareSceneMaterial(CachedMesh& mesh, const astro::scene::MeshRendererComponent& component,
+        const astro::assets::AssetRegistry& assets)
+    {
+        releaseBaseColorTexture(mesh);
+        mesh.materialData.reset();
+        mesh.projectBaseColorImage.reset();
+        mesh.textureSourceHash.clear();
+        mesh.materialDiagnostic.clear();
+        mesh.textured = false;
+        mesh.baseColorUvTransform.reset();
+        mesh.sourceGltfSampling = false;
+        mesh.sourceUvTransform = false;
+        mesh.projectOverrideSampling = false;
+        mesh.baseColorSamplerFlags = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+            | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT;
+        bool includeMipmaps = false;
+
+        std::optional<astro::assets::MaterialAssetData> selectedMaterial;
+        std::optional<std::filesystem::path> imagePath;
+        bool hasTexture = false;
+        std::uint32_t texCoord = 0;
+        if (component.materialOverride.value != 0)
         {
-            if (parents.size() >= scene.entities().size()) return false;
-            parents.push_back(current);
-            if (!current->parent) break;
-            current = scene.find(*current->parent);
-            if (!current) return false;
-        }
-        bx::mtxIdentity(output);
-        for (auto it = parents.rbegin(); it != parents.rend(); ++it)
-        {
-            const auto* transform = scene.transform((*it)->id);
-            if (!transform) return false;
-            const auto& t = transform->value;
-            const std::array values{t.position.x, t.position.y, t.position.z, t.rotationDegrees.x,
-                t.rotationDegrees.y, t.rotationDegrees.z, t.scale.x, t.scale.y, t.scale.z};
-            if (!std::all_of(values.begin(), values.end(), [](double v) { return std::isfinite(v); })
-                || std::any_of(values.begin(), values.end(), [](double v) {
-                    return std::abs(v) > static_cast<double>(std::numeric_limits<float>::max());
-                })
-                || t.scale.x == 0.0 || t.scale.y == 0.0 || t.scale.z == 0.0) return false;
-            constexpr double rad = 3.14159265358979323846 / 180.0;
-            float local[16], world[16];
-            bx::mtxSRT(local, float(t.scale.x), float(t.scale.y), float(t.scale.z),
-                float(t.rotationDegrees.x * rad), float(t.rotationDegrees.y * rad),
-                float(t.rotationDegrees.z * rad), float(t.position.x), float(t.position.y), float(t.position.z));
-            bx::mtxMul(world, local, output);
-            if (!std::all_of(std::begin(world), std::end(world), [](float v) { return std::isfinite(v); }))
+            const auto resolved = assets.resolveMaterial(component.materialOverride);
+            if (!resolved)
+            {
+                mesh.materialDiagnostic = "Material override cannot be resolved; using vertex-color fallback";
+                return;
+            }
+            selectedMaterial = resolved.value().material;
+            const auto& sampler = *selectedMaterial;
+            mesh.baseColorSamplerFlags = BGFX_SAMPLER_NONE;
+            const auto mapWrap = [&mesh](const astro::assets::MaterialTextureWrapMode wrap,
+                const bool vertical) -> bool {
+                switch (wrap)
+                {
+                case astro::assets::MaterialTextureWrapMode::Repeat: return true;
+                case astro::assets::MaterialTextureWrapMode::MirroredRepeat:
+                    mesh.baseColorSamplerFlags |= vertical ? BGFX_SAMPLER_V_MIRROR : BGFX_SAMPLER_U_MIRROR;
+                    return true;
+                case astro::assets::MaterialTextureWrapMode::ClampToEdge:
+                    mesh.baseColorSamplerFlags |= vertical ? BGFX_SAMPLER_V_CLAMP : BGFX_SAMPLER_U_CLAMP;
+                    return true;
+                }
                 return false;
-            std::memcpy(output, world, sizeof(world));
+            };
+            if (!mapWrap(sampler.baseColorWrapU, false) || !mapWrap(sampler.baseColorWrapV, true))
+            {
+                mesh.materialDiagnostic = "Project base-color sampler wrap mode is invalid; using vertex-color fallback";
+                return;
+            }
+            if (sampler.baseColorMagFilter == astro::assets::MaterialTextureMagFilter::Nearest)
+                mesh.baseColorSamplerFlags |= BGFX_SAMPLER_MAG_POINT;
+            const auto mapMinFilter = [](const astro::assets::MaterialTextureMinFilter filter)
+                -> std::optional<astro::render3d::BaseColorMinFilter> {
+                using A = astro::assets::MaterialTextureMinFilter;
+                using R = astro::render3d::BaseColorMinFilter;
+                switch (filter)
+                {
+                case A::Nearest: return R::Nearest;
+                case A::Linear: return R::Linear;
+                case A::NearestMipmapNearest: return R::NearestMipmapNearest;
+                case A::LinearMipmapNearest: return R::LinearMipmapNearest;
+                case A::NearestMipmapLinear: return R::NearestMipmapLinear;
+                case A::LinearMipmapLinear: return R::LinearMipmapLinear;
+                }
+                return std::nullopt;
+            };
+            const auto selection = mapMinFilter(sampler.baseColorMinFilter);
+            const auto minSelection = selection
+                ? astro::render3d::selectBaseColorMinFilter(*selection) : std::nullopt;
+            if (!minSelection)
+            {
+                mesh.materialData = *selectedMaterial;
+                mesh.materialDiagnostic = "Project base-color minification filter is invalid; using vertex-color fallback";
+                return;
+            }
+            if (minSelection->nearestTexel) mesh.baseColorSamplerFlags |= BGFX_SAMPLER_MIN_POINT;
+            if (minSelection->nearestMip) mesh.baseColorSamplerFlags |= BGFX_SAMPLER_MIP_POINT;
+            includeMipmaps = minSelection->usesMipmaps;
+            mesh.sourceUvTransform = sampler.baseColorUvTransform != astro::assets::MaterialUvTransform{};
+            mesh.projectOverrideSampling = selectedMaterial->baseColorTexture.has_value();
+            mesh.baseColorUvTransform = astro::render3d::BaseColorUvTransform{
+                sampler.baseColorUvTransform.offsetU, sampler.baseColorUvTransform.offsetV,
+                sampler.baseColorUvTransform.rotationRadians, sampler.baseColorUvTransform.scaleU,
+                sampler.baseColorUvTransform.scaleV};
+            if (selectedMaterial->baseColorTexture)
+            {
+                const auto& binding = *selectedMaterial->baseColorTexture;
+                hasTexture = true;
+                texCoord = binding.texCoord;
+                const auto* image = assets.find(binding.imageAssetId);
+                if (!image)
+                {
+                    mesh.materialDiagnostic = "Base-color texture image AssetId is not registered; using vertex-color fallback";
+                    mesh.materialData = *selectedMaterial;
+                    return;
+                }
+                mesh.projectBaseColorImage = binding.imageAssetId;
+                mesh.textureSourceHash = image->sha256;
+                imagePath = assets.cachedPath(binding.imageAssetId);
+            }
         }
+        else if (mesh.sourceMaterial)
+        {
+            selectedMaterial = mesh.sourceMaterial->values;
+            if (mesh.sourceMaterial->hasBaseColorTexture)
+            {
+                hasTexture = true;
+                texCoord = mesh.sourceMaterial->baseColorTexCoord;
+                mesh.sourceGltfSampling = true;
+                mesh.sourceUvTransform = mesh.sourceMaterial->baseColorTransform.has_value();
+                mesh.baseColorUvTransform = mesh.sourceMaterial->baseColorTransform;
+                mesh.baseColorSamplerFlags = BGFX_SAMPLER_NONE;
+                const auto mapWrap = [&mesh](const astro::render3d::GltfSamplerWrap wrap,
+                    const bool vertical) -> bool {
+                    switch (wrap)
+                    {
+                    case astro::render3d::GltfSamplerWrap::Repeat: return true;
+                    case astro::render3d::GltfSamplerWrap::MirroredRepeat:
+                        mesh.baseColorSamplerFlags |= vertical ? BGFX_SAMPLER_V_MIRROR : BGFX_SAMPLER_U_MIRROR;
+                        return true;
+                    case astro::render3d::GltfSamplerWrap::ClampToEdge:
+                        mesh.baseColorSamplerFlags |= vertical ? BGFX_SAMPLER_V_CLAMP : BGFX_SAMPLER_U_CLAMP;
+                        return true;
+                    }
+                    return false;
+                };
+                if (mesh.sourceMaterial->baseColorSampler)
+                {
+                    const auto& sampler = *mesh.sourceMaterial->baseColorSampler;
+                    if (!mapWrap(sampler.wrapS, false) || !mapWrap(sampler.wrapT, true))
+                    {
+                        mesh.materialDiagnostic = "Source base-color sampler wrap mode is unsupported; using vertex-color fallback";
+                        mesh.sourceGltfSampling = false;
+                        mesh.baseColorUvTransform.reset();
+                        return;
+                    }
+                    if (sampler.magFilter == astro::render3d::GltfSamplerFilter::Nearest)
+                        mesh.baseColorSamplerFlags |= BGFX_SAMPLER_MAG_POINT;
+                    using G = astro::render3d::GltfSamplerFilter;
+                    std::optional<astro::render3d::BaseColorMinFilter> minFilter;
+                    switch (sampler.minFilter.value_or(G::Linear))
+                    {
+                    case G::Nearest: minFilter = astro::render3d::BaseColorMinFilter::Nearest; break;
+                    case G::Linear: minFilter = astro::render3d::BaseColorMinFilter::Linear; break;
+                    case G::NearestMipMapNearest: minFilter = astro::render3d::BaseColorMinFilter::NearestMipmapNearest; break;
+                    case G::LinearMipMapNearest: minFilter = astro::render3d::BaseColorMinFilter::LinearMipmapNearest; break;
+                    case G::NearestMipMapLinear: minFilter = astro::render3d::BaseColorMinFilter::NearestMipmapLinear; break;
+                    case G::LinearMipMapLinear: minFilter = astro::render3d::BaseColorMinFilter::LinearMipmapLinear; break;
+                    }
+                    const auto minSelection = minFilter
+                        ? astro::render3d::selectBaseColorMinFilter(*minFilter) : std::nullopt;
+                    if (!minSelection)
+                    {
+                        mesh.materialDiagnostic = "Source base-color minification filter is invalid; using vertex-color fallback";
+                        mesh.sourceGltfSampling = false;
+                        mesh.baseColorUvTransform.reset();
+                        return;
+                    }
+                    if (minSelection->nearestTexel) mesh.baseColorSamplerFlags |= BGFX_SAMPLER_MIN_POINT;
+                    if (minSelection->nearestMip) mesh.baseColorSamplerFlags |= BGFX_SAMPLER_MIP_POINT;
+                    includeMipmaps = minSelection->usesMipmaps;
+                }
+                if (!mesh.sourceMaterial->baseColorImageAvailable)
+                {
+                    mesh.materialDiagnostic = mesh.sourceMaterial->diagnostic;
+                    mesh.materialData = *selectedMaterial;
+                    return;
+                }
+                imagePath = mesh.sourceMaterial->baseColorImagePath;
+            }
+        }
+        else return; // A primitive with no source material keeps its imported vertex colors.
+
+        mesh.materialData = *selectedMaterial;
+        if (hasTexture && (texCoord != 0 || !mesh.hasTexCoords))
+        {
+            mesh.materialDiagnostic = "Base-color texture requires UV0; using vertex-color fallback";
+            mesh.sourceGltfSampling = false;
+            mesh.baseColorUvTransform.reset();
+            return;
+        }
+
+        std::vector<std::uint8_t> srgbPixels{255, 255, 255, 255};
+        std::uint32_t width = 1, height = 1;
+        if (hasTexture)
+        {
+            if (!imagePath || imagePath->empty())
+            {
+                mesh.materialDiagnostic = "Base-color texture image path is unavailable; using vertex-color fallback";
+                return;
+            }
+            auto decoded = astro::runtime::decodeWicImage(*imagePath);
+            if (!decoded)
+            {
+                mesh.materialDiagnostic = "Base-color image decode failed; using vertex-color fallback: "
+                    + decoded.error().message;
+                return;
+            }
+            width = decoded.value().width;
+            height = decoded.value().height;
+            srgbPixels = std::move(decoded).value().pixels;
+        }
+
+        const auto alphaMipMode = selectedMaterial->alphaMode == astro::assets::MaterialAlphaMode::Mask
+            ? astro::render3d::BaseColorAlphaMipMode::Mask
+            : selectedMaterial->alphaMode == astro::assets::MaterialAlphaMode::Blend
+                ? astro::render3d::BaseColorAlphaMipMode::Blend
+                : astro::render3d::BaseColorAlphaMipMode::Opaque;
+        mesh.textured = acquireBaseColorTexture(mesh, srgbPixels, width, height,
+            selectedMaterial->baseColorFactor, includeMipmaps, alphaMipMode, selectedMaterial->alphaCutoff);
+    }
+
+    bool uploadSceneMeshVertices(CachedMesh& mesh)
+    {
+        auto vertices = mesh.sourceVertices;
+        if (mesh.textured && mesh.baseColorUvTransform)
+        {
+            bool transformValid = true;
+            for (auto& vertex : vertices)
+            {
+                const auto transformed = astro::render3d::transformBaseColorUv({vertex.u, vertex.v},
+                    *mesh.baseColorUvTransform);
+                if (!transformed) { transformValid = false; break; }
+                vertex.u = transformed.value().x;
+                vertex.v = transformed.value().y;
+            }
+            if (!transformValid)
+            {
+                mesh.materialDiagnostic = "Source base-color UV transform is invalid; using vertex-color fallback";
+                mesh.textured = false;
+                mesh.sourceGltfSampling = false;
+                mesh.baseColorUvTransform.reset();
+                vertices = mesh.sourceVertices;
+            }
+        }
+        const auto handle = bgfx::createVertexBuffer(bgfx::copy(vertices.data(),
+            static_cast<std::uint32_t>(vertices.size() * sizeof(SceneMeshVertex))), meshLayout_);
+        if (!bgfx::isValid(handle)) return false;
+        if (bgfx::isValid(mesh.vertices)) bgfx::destroy(mesh.vertices);
+        mesh.vertices = handle;
         return true;
     }
 
     void drawSceneMeshes(const Scene& scene, const astro::assets::AssetRegistry* assets, int width, int height,
-        Timings* timings)
+        Timings* timings, const bool playRuntime3d, const bool forceZeroLightLambert)
     {
         const auto meshPrepareStart = std::chrono::steady_clock::now();
         meshError_.clear();
         frameMeshSubmissions_ = 0;
+        frameCameraDriven_ = false;
         frameMeshDiagnostics_ = 0;
+        diagnostics_.clear();
+        frameTexturedMeshSubmissions_ = 0;
+        framePrimitiveMaterialSubmissions_ = 0;
+        frameOpaqueMeshSubmissions_ = frameMaskMeshSubmissions_ = frameBlendMeshSubmissions_ = 0;
+        frameMaterialFallbacks_ = 0;
+        frameSourceSamplerSubmissions_ = 0;
+        frameMipmappedTextureSubmissions_ = 0;
+        frameMaskMipmappedTextureSubmissions_ = 0;
+        frameTextureTransformSubmissions_ = 0;
+        lastSourceSamplerFlags_ = 0;
+        frameProjectSamplerSubmissions_ = 0;
+        frameProjectTransformSubmissions_ = 0;
+        lastProjectSamplerFlags_ = 0;
+#if defined(ASTRO_EDITOR_HAS_RUNTIME_BGFX_3D)
+        frameRuntimeBgfxAdapterUsed_ = false;
+        frameRuntimeBgfxSubmissions_ = 0;
+        frameRuntimeBgfxTextureSubmissions_ = 0;
+#endif
+        const auto addMeshDiagnostic = [this](std::string diagnostic,
+            const std::optional<EntityId> relatedEntity = std::nullopt,
+            const std::optional<astro::assets::AssetId> relatedAsset = std::nullopt) {
+            if (!meshError_.empty()) meshError_ += "\n";
+            meshError_ += diagnostic;
+            diagnostics_.push_back({std::move(diagnostic), relatedEntity, relatedAsset});
+        };
+        std::vector<astro::render3d::SceneDirectionalLight> directionalLights;
+        std::vector<astro::render3d::ScenePointLight> pointLights;
+        if (view_ == 1 && !forceZeroLightLambert)
+        {
+            for (const auto& entity : scene.entities())
+            {
+                const auto* light = scene.directionalLight3D(entity.id);
+                if (!light || !light->enabled) continue;
+                const auto direction = astro::render3d::resolveSceneDirectionalLightDirection(scene, entity.id);
+                if (!direction)
+                {
+                    addMeshDiagnostic("Directional light could not be resolved: " + direction.error().message,
+                        entity.id);
+                    continue;
+                }
+                directionalLights.push_back({entity.id, light->id, direction.value(), light->color, light->intensity});
+            }
+            std::sort(directionalLights.begin(), directionalLights.end(), [](const auto& left, const auto& right) {
+                return left.entity < right.entity;
+            });
+            if (directionalLights.size() > 4)
+            {
+                addMeshDiagnostic("Directional light limit is 4; higher EntityId lights are omitted");
+                directionalLights.resize(4);
+            }
+        }
+        if (view_ == 1)
+        {
+            for (const auto& entity : scene.entities())
+            {
+                const auto* light = scene.pointLight3D(entity.id);
+                if (!light || !light->enabled) continue;
+                const auto position = astro::render3d::resolveScenePointLightPosition(scene, entity.id);
+                if (!position)
+                {
+                    addMeshDiagnostic("Point light could not be resolved: " + position.error().message, entity.id);
+                    continue;
+                }
+                pointLights.push_back({entity.id, light->id, position.value(), light->color,
+                    light->intensity, light->range});
+            }
+            std::sort(pointLights.begin(), pointLights.end(), [](const auto& left, const auto& right) {
+                return left.entity < right.entity;
+            });
+            if (pointLights.size() > 4)
+            {
+                addMeshDiagnostic("Point light limit is 4; higher EntityId lights are omitted");
+                pointLights.resize(4);
+            }
+        }
+        std::array<float, 16> lightDirections{};
+        std::array<float, 16> lightColors{};
+        for (std::size_t index = 0; index < directionalLights.size(); ++index)
+        {
+            const auto& light = directionalLights[index];
+            lightDirections[index * 4] = light.direction.x;
+            lightDirections[index * 4 + 1] = light.direction.y;
+            lightDirections[index * 4 + 2] = light.direction.z;
+            lightColors[index * 4] = std::max(0.0f, light.color[0]) * std::max(0.0f, light.intensity);
+            lightColors[index * 4 + 1] = std::max(0.0f, light.color[1]) * std::max(0.0f, light.intensity);
+            lightColors[index * 4 + 2] = std::max(0.0f, light.color[2]) * std::max(0.0f, light.intensity);
+        }
+        std::array<float, 16> pointPositions{};
+        std::array<float, 16> pointColors{};
+        std::array<float, 16> pointRanges{};
+        for (std::size_t index = 0; index < pointLights.size(); ++index)
+        {
+            const auto& light = pointLights[index];
+            pointPositions[index * 4] = light.position.x;
+            pointPositions[index * 4 + 1] = light.position.y;
+            pointPositions[index * 4 + 2] = light.position.z;
+            pointColors[index * 4] = std::max(0.0f, light.color[0]) * std::max(0.0f, light.intensity);
+            pointColors[index * 4 + 1] = std::max(0.0f, light.color[1]) * std::max(0.0f, light.intensity);
+            pointColors[index * 4 + 2] = std::max(0.0f, light.color[2]) * std::max(0.0f, light.intensity);
+            pointRanges[index * 4] = light.range;
+        }
+        if ((!directionalLights.empty() || !pointLights.empty() || forceZeroLightLambert) && bgfx::isValid(litProgram3d_)
+            && bgfx::isValid(litTexturedProgram3d_))
+        {
+            bgfx::setUniform(lightDirections3d_, lightDirections.data(), 4);
+            bgfx::setUniform(lightColors3d_, lightColors.data(), 4);
+            bgfx::setUniform(pointPositions3d_, pointPositions.data(), 4);
+            bgfx::setUniform(pointColors3d_, pointColors.data(), 4);
+            bgfx::setUniform(pointRanges3d_, pointRanges.data(), 4);
+        }
         const auto view = static_cast<bgfx::ViewId>(view_ + 2);
-        bgfx::setViewName(view, "Scene View 3D");
+        bgfx::setViewName(view, view_ == 1 ? "Scene View 3D"
+            : view_ == 2 ? "Game View 3D" : "Project Model Preview 3D");
         bgfx::setViewFrameBuffer(view, frameBuffer_);
         bgfx::setViewRect(view, 0, 0, static_cast<std::uint16_t>(width), static_cast<std::uint16_t>(height));
         bgfx::setViewClear(view, BGFX_CLEAR_DEPTH, 0x121822ff, 1.0f, 0);
         bgfx::setViewMode(view, bgfx::ViewMode::Sequential);
         bgfx::touch(view);
+#if defined(ASTRO_EDITOR_HAS_RUNTIME_BGFX_3D)
+        if (view_ == 2 && playRuntime3d && runtimeSceneRenderer_ && assets)
+        {
+            astro::render3d::SceneMeshResolver resolver = [assets](
+                const astro::scene::MeshRendererComponent& component)
+                -> astro::core::Result<astro::render3d::SceneMeshSource> {
+                const auto resolved = astro::render3d::resolveMeshRenderer(*assets, component);
+                if (!resolved)
+                    return astro::core::Result<astro::render3d::SceneMeshSource>::failure(resolved.error());
+                const auto& mesh = resolved.value();
+                astro::render3d::SceneMeshSource source;
+                source.geometry = std::make_shared<const astro::render3d::MeshData>(mesh.geometry);
+                if (mesh.sourceMaterial)
+                {
+                    source.sourceMaterial = mesh.sourceMaterial->values;
+                    if (component.materialOverride.value == 0 && mesh.sourceMaterial->hasBaseColorTexture)
+                    {
+                        if (!mesh.sourceMaterial->baseColorImageAvailable
+                            || mesh.sourceMaterial->baseColorImagePath.empty())
+                            return astro::core::Result<astro::render3d::SceneMeshSource>::failure({
+                                astro::core::ErrorCode::NotFound,
+                                mesh.sourceMaterial->diagnostic.empty()
+                                    ? "Runtime BGFX source glTF texture is unavailable"
+                                    : mesh.sourceMaterial->diagnostic});
+                        source.sourceBaseColorImage = mesh.sourceMaterial->baseColorImagePath;
+                        source.sourceBaseColorImageHash = mesh.sourceMaterial->baseColorImageHash;
+                        source.sourceBaseColorTexCoord = mesh.sourceMaterial->baseColorTexCoord;
+                        source.sourceBaseColorUvTransform = mesh.sourceMaterial->baseColorTransform
+                            ? astro::assets::MaterialUvTransform{mesh.sourceMaterial->baseColorTransform->offsetU,
+                                mesh.sourceMaterial->baseColorTransform->offsetV,
+                                mesh.sourceMaterial->baseColorTransform->rotationRadians,
+                                mesh.sourceMaterial->baseColorTransform->scaleU,
+                                mesh.sourceMaterial->baseColorTransform->scaleV}
+                            : astro::assets::MaterialUvTransform{};
+                        if (mesh.sourceMaterial->baseColorSampler)
+                        {
+                            const auto& sampler = *mesh.sourceMaterial->baseColorSampler;
+                            using W = astro::assets::MaterialTextureWrapMode;
+                            source.sourceBaseColorWrapU = static_cast<W>(sampler.wrapS);
+                            source.sourceBaseColorWrapV = static_cast<W>(sampler.wrapT);
+                            using G = astro::render3d::GltfSamplerFilter;
+                            using M = astro::assets::MaterialTextureMinFilter;
+                            switch (sampler.minFilter.value_or(G::Linear))
+                            {
+                            case G::Nearest: source.sourceBaseColorMinFilter = M::Nearest; break;
+                            case G::Linear: source.sourceBaseColorMinFilter = M::Linear; break;
+                            case G::NearestMipMapNearest: source.sourceBaseColorMinFilter = M::NearestMipmapNearest; break;
+                            case G::LinearMipMapNearest: source.sourceBaseColorMinFilter = M::LinearMipmapNearest; break;
+                            case G::NearestMipMapLinear: source.sourceBaseColorMinFilter = M::NearestMipmapLinear; break;
+                            case G::LinearMipMapLinear: source.sourceBaseColorMinFilter = M::LinearMipmapLinear; break;
+                            }
+                            source.sourceBaseColorMagFilter = sampler.magFilter == G::Nearest
+                                ? astro::assets::MaterialTextureMagFilter::Nearest
+                                : astro::assets::MaterialTextureMagFilter::Linear;
+                        }
+                    }
+                }
+                return astro::core::Result<astro::render3d::SceneMeshSource>::success(std::move(source));
+            };
+            auto packet = astro::render3d::buildSceneRenderPacket(scene, assets, resolver);
+            if (packet && packet.value().diagnostics.empty())
+            {
+                if (packet.value().directionalLights.size() > 4)
+                {
+                    diagnostics_.push_back({"Directional light limit is 4; higher EntityId lights are omitted",
+                        std::nullopt, {}});
+                    ++frameMeshDiagnostics_;
+                }
+                if (!packet.value().directionalLights.empty())
+                    for (const auto& item : packet.value().items)
+                        if (item.geometry && !item.geometry->hasNormals())
+                        {
+                            diagnostics_.push_back({"Directional diffuse lighting disabled: mesh has no NORMAL channel; rendered unlit",
+                                item.entity, {}});
+                            ++frameMeshDiagnostics_;
+                        }
+                const astro::runtime::BgfxSceneRenderer::BaseColorImageResolver imageResolver = [assets](
+                    const astro::assets::AssetId imageAssetId)
+                    -> astro::core::Result<astro::runtime::BgfxSceneRenderer::BaseColorImage> {
+                    if (!assets->find(imageAssetId))
+                        return astro::core::Result<astro::runtime::BgfxSceneRenderer::BaseColorImage>::failure({
+                            astro::core::ErrorCode::NotFound,
+                            "Runtime BGFX base-color image AssetId is not registered"});
+                    auto decoded = astro::runtime::decodeWicImage(assets->cachedPath(imageAssetId));
+                    if (!decoded)
+                        return astro::core::Result<astro::runtime::BgfxSceneRenderer::BaseColorImage>::failure(decoded.error());
+                    auto image = std::move(decoded).value();
+                    return astro::core::Result<astro::runtime::BgfxSceneRenderer::BaseColorImage>::success({
+                        image.width, image.height, std::move(image.pixels)});
+                };
+                const astro::runtime::BgfxSceneRenderer::BaseColorImageHashResolver imageHashResolver = [assets](
+                    const astro::assets::AssetId imageAssetId) -> astro::core::Result<std::string> {
+                    const auto* reference = assets->find(imageAssetId);
+                    if (!reference || reference->sha256.empty())
+                        return astro::core::Result<std::string>::failure({astro::core::ErrorCode::NotFound,
+                            "Runtime BGFX base-color image hash is unavailable"});
+                    return astro::core::Result<std::string>::success(reference->sha256);
+                };
+                const astro::runtime::BgfxSceneRenderer::ExternalBaseColorImageResolver externalImageResolver = [assets](
+                    const std::filesystem::path& sourcePath)
+                    -> astro::core::Result<astro::runtime::BgfxSceneRenderer::BaseColorImage> {
+                    std::error_code error;
+                    const auto assetsRoot = std::filesystem::weakly_canonical(assets->projectRoot() / "Assets", error);
+                    if (error) return astro::core::Result<astro::runtime::BgfxSceneRenderer::BaseColorImage>::failure({
+                        astro::core::ErrorCode::IoError, "Unable to resolve project Assets directory"});
+                    const auto resolved = std::filesystem::weakly_canonical(sourcePath, error);
+                    if (error) return astro::core::Result<astro::runtime::BgfxSceneRenderer::BaseColorImage>::failure({
+                        astro::core::ErrorCode::NotFound, "Unable to resolve external glTF base-color image"});
+                    const auto relative = std::filesystem::relative(resolved, assetsRoot, error);
+                    if (error || relative.empty() || relative.is_absolute()
+                        || std::any_of(relative.begin(), relative.end(), [](const auto& part) { return part == ".."; })
+                        || !std::filesystem::is_regular_file(resolved, error) || error)
+                        return astro::core::Result<astro::runtime::BgfxSceneRenderer::BaseColorImage>::failure({
+                            astro::core::ErrorCode::ValidationError,
+                            "External glTF image must resolve to a regular file inside project Assets"});
+                    auto decoded = astro::runtime::decodeWicImage(resolved);
+                    if (!decoded) return astro::core::Result<astro::runtime::BgfxSceneRenderer::BaseColorImage>::failure(decoded.error());
+                    auto image = std::move(decoded).value();
+                    return astro::core::Result<astro::runtime::BgfxSceneRenderer::BaseColorImage>::success({
+                        image.width, image.height, std::move(image.pixels)});
+                };
+                const auto rendered = runtimeSceneRenderer_->render(packet.value(), view,
+                    static_cast<std::uint16_t>(width), static_cast<std::uint16_t>(height), imageResolver,
+                    imageHashResolver, externalImageResolver, srgbAttachment_);
+                if (rendered)
+                {
+                    frameRuntimeBgfxAdapterUsed_ = true;
+                    frameRuntimeBgfxSubmissions_ = rendered.value();
+                    frameRuntimeBgfxTextureSubmissions_ = static_cast<std::uint32_t>(std::count_if(
+                        packet.value().items.begin(), packet.value().items.end(), [](const auto& item) {
+                            return (item.material && item.material->baseColorTexture.has_value())
+                                || item.sourceBaseColorImage.has_value();
+                        }));
+                    frameMeshSubmissions_ = rendered.value();
+                    frameOpaqueMeshSubmissions_ = rendered.value();
+                    frameCameraDriven_ = true;
+                    meshSubmissions_ += rendered.value();
+                    for (const auto& item : packet.value().items)
+                        if (item.kind == astro::render3d::SceneRenderItemKind::Primitive
+                            && item.materialAsset.value != 0)
+                            ++framePrimitiveMaterialSubmissions_;
+                    if (timings)
+                        timings->meshSubmitMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - meshPrepareStart).count();
+                    return;
+                }
+            }
+        }
+#endif
         std::unordered_map<EntityId, bool> live;
         std::vector<DrawItem> drawItems;
         drawItems.reserve(scene.entities().size());
@@ -532,26 +1329,47 @@ private:
                 {
                     if (found != meshCache_.end()) { releaseMesh(found->second); meshCache_.erase(found); }
                     auto resolved = astro::render3d::resolveMeshRenderer(*assets, *component);
+                    const bool invalidMaterialOverride = !resolved && component->materialOverride.value != 0;
+                    if (invalidMaterialOverride)
+                    {
+                        // The shared resolver validates overrides for non-editor callers. Scene View
+                        // still needs the geometry so it can honor the documented vertex-color fallback.
+                        auto geometryOnly = *component;
+                        geometryOnly.materialOverride = {};
+                        resolved = astro::render3d::resolveMeshRenderer(*assets, geometryOnly);
+                    }
                     if (!resolved)
-                    { meshError_ = resolved.error().message; ++frameMeshDiagnostics_; continue; }
+                    {
+                        const auto* registeredModel = assets->findModel(component->model);
+                        const auto assetId = registeredModel
+                            ? std::optional<astro::assets::AssetId>{component->model} : std::nullopt;
+                        addMeshDiagnostic(resolved.error().message, entity.id, assetId);
+                        ++frameMeshDiagnostics_;
+                        continue;
+                    }
                     const auto& geometry = resolved.value().geometry;
                     if (geometry.vertices().size() > 65536 || geometry.triangleIndices().size() > 196608)
-                    { meshError_ = "3D Scene View mesh exceeds the 16-bit preview budget"; ++frameMeshDiagnostics_; continue; }
-                    struct Vertex { float x, y, z; std::uint32_t color; };
-                    static_assert(sizeof(Vertex) == 16);
-                    std::vector<Vertex> vertices;
+                    { addMeshDiagnostic("3D Scene View mesh exceeds the 16-bit preview budget", entity.id, component->model);
+                      ++frameMeshDiagnostics_; continue; }
+                    static_assert(sizeof(SceneMeshVertex) == 36);
+                    std::vector<SceneMeshVertex> vertices;
                     vertices.reserve(geometry.vertices().size());
                     for (const auto& v : geometry.vertices())
                     {
                         const auto color = std::uint32_t(v.color.r) | (std::uint32_t(v.color.g) << 8)
                             | (std::uint32_t(v.color.b) << 16) | (std::uint32_t(v.color.a) << 24);
-                        vertices.push_back({v.position.x, v.position.y, v.position.z, color});
+                        vertices.push_back({v.position.x, v.position.y, v.position.z, color,
+                            v.texCoord0.x, v.texCoord0.y, v.normal.x, v.normal.y, v.normal.z});
                     }
                     std::vector<std::uint16_t> indices;
                     indices.reserve(geometry.triangleIndices().size());
                     for (auto index : geometry.triangleIndices()) indices.push_back(static_cast<std::uint16_t>(index));
                     CachedMesh gpu;
                     gpu.model = component->model; gpu.mesh = component->meshIndex; gpu.primitive = component->primitiveIndex;
+                    gpu.hasTexCoords = geometry.hasTexCoords();
+                    gpu.hasNormals = geometry.hasNormals();
+                    gpu.sourceMaterial = resolved.value().sourceMaterial;
+                    gpu.sourceVertices = std::move(vertices);
                     gpu.minimum = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
                         std::numeric_limits<float>::max()};
                     gpu.maximum = {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(),
@@ -565,20 +1383,68 @@ private:
                         gpu.maximum.y = std::max(gpu.maximum.y, v.position.y);
                         gpu.maximum.z = std::max(gpu.maximum.z, v.position.z);
                     }
-                    gpu.vertices = bgfx::createVertexBuffer(bgfx::copy(vertices.data(),
-                        static_cast<std::uint32_t>(vertices.size() * sizeof(Vertex))), meshLayout_);
                     gpu.indices = bgfx::createIndexBuffer(bgfx::copy(indices.data(),
                         static_cast<std::uint32_t>(indices.size() * sizeof(std::uint16_t))));
-                    if (!bgfx::isValid(gpu.vertices) || !bgfx::isValid(gpu.indices))
-                    { releaseMesh(gpu); meshError_ = "bgfx could not upload Scene MeshRenderer geometry";
+                    if (!bgfx::isValid(gpu.indices))
+                    { releaseMesh(gpu); addMeshDiagnostic("bgfx could not upload Scene MeshRenderer geometry",
+                        entity.id, component->model);
                       ++frameMeshDiagnostics_; continue; }
                     meshCache_.emplace(entity.id, gpu);
                     found = meshCache_.find(entity.id);
                 }
                 if (found == meshCache_.end()) continue;
+                auto& cachedMesh = found->second;
+                if (cachedMesh.materialOverride != component->materialOverride || !cachedMesh.materialAttempted)
+                {
+                    cachedMesh.materialSourceHash.clear();
+                }
+                const auto* materialReference = component->materialOverride.value
+                    ? assets->findMaterial(component->materialOverride) : nullptr;
+                const auto currentMaterialHash = materialReference ? materialReference->sourceSha256 : std::string{};
+                if (cachedMesh.materialOverride != component->materialOverride || !cachedMesh.materialAttempted
+                    || cachedMesh.materialSourceHash != currentMaterialHash)
+                {
+                    cachedMesh.materialOverride = component->materialOverride;
+                    cachedMesh.materialSourceHash = currentMaterialHash;
+                    cachedMesh.materialAttempted = true;
+                    prepareSceneMaterial(cachedMesh, *component, *assets);
+                    if (!uploadSceneMeshVertices(cachedMesh))
+                    {
+                        cachedMesh.materialDiagnostic = "bgfx could not upload Scene MeshRenderer vertices";
+                        cachedMesh.textured = false;
+                    }
+                }
+                if (cachedMesh.projectBaseColorImage)
+                {
+                    const auto* image = assets->find(*cachedMesh.projectBaseColorImage);
+                    if (!image || image->sha256 != cachedMesh.textureSourceHash)
+                    {
+                        releaseBaseColorTexture(cachedMesh);
+                        cachedMesh.textured = false;
+                        cachedMesh.materialData.reset();
+                        cachedMesh.materialAttempted = true;
+                        cachedMesh.materialDiagnostic = "Base-color image changed; reload 3D meshes to refresh the preview";
+                    }
+                }
+                if ((component->materialOverride.value != 0 || cachedMesh.sourceMaterial.has_value())
+                    && !cachedMesh.textured)
+                {
+                    if (!cachedMesh.materialDiagnostic.empty())
+                    {
+                        std::optional<astro::assets::AssetId> materialAsset;
+                        if (component->materialOverride.value != 0 && assets->findMaterial(component->materialOverride))
+                            materialAsset = component->materialOverride;
+                        else if (component->materialOverride.value == 0 && cachedMesh.sourceMaterial
+                            && assets->findModel(component->model))
+                            materialAsset = component->model;
+                        addMeshDiagnostic(cachedMesh.materialDiagnostic, entity.id, materialAsset);
+                    }
+                    ++frameMeshDiagnostics_; ++frameMaterialFallbacks_;
+                }
                 float model[16];
                 if (!getWorldMatrix(scene, entity, model))
-                { meshError_ = "Scene hierarchy has a missing Transform, invalid value, or parent cycle";
+                { addMeshDiagnostic("Scene hierarchy has a missing Transform, invalid value, or parent cycle",
+                    entity.id, component->model);
                   ++frameMeshDiagnostics_; continue; }
                 astro::editor::SceneViewBounds3D meshBounds{
                     {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()},
@@ -604,13 +1470,17 @@ private:
                 }
                 if (!validBounds)
                 {
-                    meshError_ = "Transformed mesh bounds exceed the Scene View range";
+                    addMeshDiagnostic("Transformed mesh bounds exceed the Scene View range", entity.id, component->model);
                     ++frameMeshDiagnostics_;
                     continue;
                 }
+                const auto& selectedMaterial = cachedMesh.materialData;
                 drawItems.push_back({entity.id, {model[0], model[1], model[2], model[3],
                     model[4], model[5], model[6], model[7], model[8], model[9], model[10], model[11],
-                    model[12], model[13], model[14], model[15]}});
+                    model[12], model[13], model[14], model[15]},
+                    selectedMaterial ? selectedMaterial->alphaMode : astro::assets::MaterialAlphaMode::Opaque,
+                    selectedMaterial ? selectedMaterial->alphaCutoff : 0.5f,
+                    selectedMaterial ? selectedMaterial->doubleSided : false});
                 sceneBounds.minimum.x = std::min(sceneBounds.minimum.x, meshBounds.minimum.x);
                 sceneBounds.minimum.y = std::min(sceneBounds.minimum.y, meshBounds.minimum.y);
                 sceneBounds.minimum.z = std::min(sceneBounds.minimum.z, meshBounds.minimum.z);
@@ -619,6 +1489,143 @@ private:
                 sceneBounds.maximum.z = std::max(sceneBounds.maximum.z, meshBounds.maximum.z);
                 hasBounds = true;
             }
+        }
+        for (const auto& entity : scene.entities())
+        {
+            const auto* primitive = scene.primitiveRenderer(entity.id);
+            if (!primitive || !primitive->visible) continue;
+            live.emplace(entity.id, true);
+            auto found = meshCache_.find(entity.id);
+            const auto kind = static_cast<std::uint8_t>(primitive->primitive);
+            if (found == meshCache_.end() || found->second.builtinPrimitive != kind)
+            {
+                if (found != meshCache_.end()) { releaseMesh(found->second); meshCache_.erase(found); }
+                auto generated = astro::render3d::MeshData::makePrimitive(kind);
+                if (!generated)
+                {
+                    addMeshDiagnostic(generated.error().message, entity.id);
+                    ++frameMeshDiagnostics_;
+                    continue;
+                }
+                const auto& geometry = generated.value();
+                CachedMesh gpu;
+                gpu.builtinPrimitive = kind;
+                gpu.hasTexCoords = geometry.hasTexCoords();
+                gpu.hasNormals = geometry.hasNormals();
+                gpu.minimum = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+                    std::numeric_limits<float>::max()};
+                gpu.maximum = {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(),
+                    std::numeric_limits<float>::lowest()};
+                gpu.sourceVertices.reserve(geometry.vertices().size());
+                for (const auto& vertex : geometry.vertices())
+                {
+                    const auto color = std::uint32_t(vertex.color.r) | (std::uint32_t(vertex.color.g) << 8)
+                        | (std::uint32_t(vertex.color.b) << 16) | (std::uint32_t(vertex.color.a) << 24);
+                    gpu.sourceVertices.push_back({vertex.position.x, vertex.position.y, vertex.position.z,
+                        color, vertex.texCoord0.x, vertex.texCoord0.y,
+                        vertex.normal.x, vertex.normal.y, vertex.normal.z});
+                    gpu.minimum.x = std::min(gpu.minimum.x, vertex.position.x);
+                    gpu.minimum.y = std::min(gpu.minimum.y, vertex.position.y);
+                    gpu.minimum.z = std::min(gpu.minimum.z, vertex.position.z);
+                    gpu.maximum.x = std::max(gpu.maximum.x, vertex.position.x);
+                    gpu.maximum.y = std::max(gpu.maximum.y, vertex.position.y);
+                    gpu.maximum.z = std::max(gpu.maximum.z, vertex.position.z);
+                }
+                std::vector<std::uint16_t> indices;
+                indices.reserve(geometry.triangleIndices().size());
+                for (const auto index : geometry.triangleIndices())
+                    indices.push_back(static_cast<std::uint16_t>(index));
+                gpu.indices = bgfx::createIndexBuffer(bgfx::copy(indices.data(),
+                    static_cast<std::uint32_t>(indices.size() * sizeof(std::uint16_t))));
+                if (!bgfx::isValid(gpu.indices) || !uploadSceneMeshVertices(gpu))
+                {
+                    releaseMesh(gpu);
+                    addMeshDiagnostic("bgfx could not upload built-in 3D primitive geometry", entity.id);
+                    ++frameMeshDiagnostics_;
+                    continue;
+                }
+                meshCache_.emplace(entity.id, std::move(gpu));
+                found = meshCache_.find(entity.id);
+            }
+            if (found == meshCache_.end()) continue;
+            auto& primitiveMesh = found->second;
+            const auto* registeredMaterial = assets && primitive->materialOverride.value
+                ? assets->findMaterial(primitive->materialOverride) : nullptr;
+            const auto primitiveMaterialHash = registeredMaterial ? registeredMaterial->sourceSha256 : std::string{};
+            if (primitiveMesh.materialOverride != primitive->materialOverride || !primitiveMesh.materialAttempted
+                || primitiveMesh.materialSourceHash != primitiveMaterialHash)
+            {
+                primitiveMesh.materialOverride = primitive->materialOverride;
+                primitiveMesh.materialSourceHash = primitiveMaterialHash;
+                primitiveMesh.materialAttempted = true;
+                if (assets)
+                {
+                    const astro::scene::MeshRendererComponent materialSource{
+                        primitive->id, 2, {}, 0, 0, primitive->visible, primitive->materialOverride};
+                    prepareSceneMaterial(primitiveMesh, materialSource, *assets);
+                    if (!uploadSceneMeshVertices(primitiveMesh))
+                    {
+                        primitiveMesh.textured = false;
+                        primitiveMesh.materialDiagnostic = "bgfx could not upload primitive material vertices";
+                    }
+                }
+            }
+            if (primitive->materialOverride.value != 0 && !primitiveMesh.textured
+                && !primitiveMesh.materialDiagnostic.empty())
+            {
+                const auto* registered = assets ? assets->findMaterial(primitive->materialOverride) : nullptr;
+                addMeshDiagnostic(primitiveMesh.materialDiagnostic, entity.id,
+                    registered ? std::optional<astro::assets::AssetId>{primitive->materialOverride} : std::nullopt);
+                ++frameMeshDiagnostics_;
+                ++frameMaterialFallbacks_;
+            }
+            float model[16];
+            if (!getWorldMatrix(scene, entity, model))
+            {
+                addMeshDiagnostic("Scene hierarchy has a missing Transform, invalid value, or parent cycle", entity.id);
+                ++frameMeshDiagnostics_;
+                continue;
+            }
+            astro::editor::SceneViewBounds3D bounds{
+                {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()},
+                {std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()}};
+            bool validBounds = true;
+            for (int corner = 0; corner < 8; ++corner)
+            {
+                const bx::Vec3 local{(corner & 1) ? found->second.maximum.x : found->second.minimum.x,
+                    (corner & 2) ? found->second.maximum.y : found->second.minimum.y,
+                    (corner & 4) ? found->second.maximum.z : found->second.minimum.z};
+                const auto world = bx::mul(local, model);
+                if (!std::isfinite(world.x) || !std::isfinite(world.y) || !std::isfinite(world.z))
+                { validBounds = false; break; }
+                bounds.minimum.x = std::min(bounds.minimum.x, world.x);
+                bounds.minimum.y = std::min(bounds.minimum.y, world.y);
+                bounds.minimum.z = std::min(bounds.minimum.z, world.z);
+                bounds.maximum.x = std::max(bounds.maximum.x, world.x);
+                bounds.maximum.y = std::max(bounds.maximum.y, world.y);
+                bounds.maximum.z = std::max(bounds.maximum.z, world.z);
+            }
+            if (!validBounds)
+            {
+                addMeshDiagnostic("Transformed primitive bounds are invalid", entity.id);
+                ++frameMeshDiagnostics_;
+                continue;
+            }
+            const auto& primitiveMaterialData = primitiveMesh.materialData;
+            drawItems.push_back({entity.id, {model[0], model[1], model[2], model[3],
+                model[4], model[5], model[6], model[7], model[8], model[9], model[10], model[11],
+                model[12], model[13], model[14], model[15]},
+                primitiveMaterialData ? primitiveMaterialData->alphaMode : astro::assets::MaterialAlphaMode::Opaque,
+                primitiveMaterialData ? primitiveMaterialData->alphaCutoff : 0.5f,
+                primitiveMaterialData ? primitiveMaterialData->doubleSided : true,
+                primitive->materialOverride.value != 0});
+            sceneBounds.minimum.x = std::min(sceneBounds.minimum.x, bounds.minimum.x);
+            sceneBounds.minimum.y = std::min(sceneBounds.minimum.y, bounds.minimum.y);
+            sceneBounds.minimum.z = std::min(sceneBounds.minimum.z, bounds.minimum.z);
+            sceneBounds.maximum.x = std::max(sceneBounds.maximum.x, bounds.maximum.x);
+            sceneBounds.maximum.y = std::max(sceneBounds.maximum.y, bounds.maximum.y);
+            sceneBounds.maximum.z = std::max(sceneBounds.maximum.z, bounds.maximum.z);
+            hasBounds = true;
         }
         for (auto it = meshCache_.begin(); it != meshCache_.end();)
         {
@@ -632,25 +1639,71 @@ private:
             frameAllApplied_ = hasBounds && camera3d_.frame(sceneBounds, float(width) / float(height));
             if (!frameAllApplied_)
             {
-                meshError_ = "Frame All could not fit visible mesh bounds in this Scene View";
+                addMeshDiagnostic("Frame All could not fit visible mesh bounds in this Scene View");
                 ++frameMeshDiagnostics_;
             }
         }
-        const auto camera = camera3d_.camera();
+        auto camera = camera3d_.camera();
+        if (view_ == 2)
+        {
+            const auto activeCamera = scene.activeCamera3D();
+            if (!activeCamera)
+            {
+                addMeshDiagnostic("Game View has no active Camera3D; 3D meshes were skipped");
+                ++frameMeshDiagnostics_;
+                if (timings)
+                    timings->meshPrepareMs = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - meshPrepareStart).count();
+                return;
+            }
+            const auto resolvedCamera = astro::editor::sceneCameraPose(scene, *activeCamera);
+            if (!resolvedCamera)
+            {
+                addMeshDiagnostic("Active Game View Camera3D is invalid: " + resolvedCamera.error().message,
+                    *activeCamera);
+                ++frameMeshDiagnostics_;
+                if (timings)
+                    timings->meshPrepareMs = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - meshPrepareStart).count();
+                return;
+            }
+            camera = resolvedCamera.value();
+        }
         const auto viewMatrix = camera.viewMatrix();
         const auto projection = camera.projectionMatrix(float(width) / float(height));
         if (!viewMatrix || !projection)
         {
-            meshError_ = "Scene View camera produced an invalid view or projection matrix";
+            addMeshDiagnostic("Scene View camera produced an invalid view or projection matrix");
             return;
         }
+        frameCameraDriven_ = view_ == 2;
         bgfx::setViewTransform(view, viewMatrix.value().values.data(), projection.value().values.data());
+        std::vector<astro::editor::SceneViewSortItem> sortedItems;
+        sortedItems.reserve(drawItems.size());
+        std::unordered_map<EntityId, std::size_t> drawItemByEntity;
+        drawItemByEntity.reserve(drawItems.size());
+        for (std::size_t index = 0; index < drawItems.size(); ++index)
+        {
+            const auto& item = drawItems[index];
+            const float model[16]{item.transform[0], item.transform[1], item.transform[2], item.transform[3],
+                item.transform[4], item.transform[5], item.transform[6], item.transform[7],
+                item.transform[8], item.transform[9], item.transform[10], item.transform[11],
+                item.transform[12], item.transform[13], item.transform[14], item.transform[15]};
+            const auto worldCenter = bx::mul(bx::Vec3{0.0f, 0.0f, 0.0f}, model);
+            const auto cameraCenter = bx::mul(worldCenter, viewMatrix.value().values.data());
+            sortedItems.push_back({item.entity, item.alphaMode, cameraCenter.z});
+            drawItemByEntity.emplace(item.entity, index);
+        }
+        astro::editor::sortSceneViewItems(sortedItems);
         const auto meshPrepareDone = std::chrono::steady_clock::now();
         if (timings)
             timings->meshPrepareMs = std::chrono::duration<double, std::milli>(meshPrepareDone - meshPrepareStart).count();
         const auto meshSubmitStart = std::chrono::steady_clock::now();
-        for (const auto& item : drawItems)
+        for (const auto& sortedItem : sortedItems)
         {
+            const auto itemIndex = drawItemByEntity.find(sortedItem.entity);
+            if (itemIndex == drawItemByEntity.end()) continue;
+            const auto& item = drawItems[itemIndex->second];
             const auto found = meshCache_.find(item.entity);
             if (found == meshCache_.end()) continue;
             float model[16];
@@ -659,9 +1712,79 @@ private:
             bgfx::setTransform(model);
             bgfx::setVertexBuffer(0, found->second.vertices);
             bgfx::setIndexBuffer(found->second.indices);
-            bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_WRITE_Z
-                | BGFX_STATE_DEPTH_TEST_LESS | BGFX_STATE_MSAA);
-            bgfx::submit(view, program3d_);
+            std::uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                | BGFX_STATE_DEPTH_TEST_LESS | BGFX_STATE_MSAA;
+            if (!item.doubleSided) state |= BGFX_STATE_CULL_CW;
+            float alphaParams[4]{0.0f, item.alphaCutoff, srgbAttachment_ ? 1.0f : 0.0f, 0.0f};
+            if (item.alphaMode == astro::assets::MaterialAlphaMode::Mask)
+            {
+                alphaParams[0] = 1.0f;
+                state |= BGFX_STATE_WRITE_Z;
+                ++frameMaskMeshSubmissions_;
+            }
+            else if (item.alphaMode == astro::assets::MaterialAlphaMode::Blend)
+            {
+                alphaParams[0] = 2.0f;
+                state |= BGFX_STATE_BLEND_FUNC_SEPARATE(BGFX_STATE_BLEND_SRC_ALPHA,
+                    BGFX_STATE_BLEND_INV_SRC_ALPHA, BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_INV_SRC_ALPHA);
+                ++frameBlendMeshSubmissions_;
+            }
+            else { state |= BGFX_STATE_WRITE_Z; ++frameOpaqueMeshSubmissions_; }
+            bgfx::setUniform(alphaParams_, alphaParams);
+            bgfx::setState(state);
+            const auto& mesh = found->second;
+            bool useDirectionalLighting = false;
+            if ((!directionalLights.empty() || !pointLights.empty() || forceZeroLightLambert) && mesh.hasNormals
+                && bgfx::isValid(litProgram3d_) && bgfx::isValid(litTexturedProgram3d_))
+            {
+                const astro::render3d::Mat4 world{item.transform};
+                const auto normalMatrix = astro::render3d::inverseTransposeNormalMatrix(world);
+                if (normalMatrix)
+                {
+                    const float lightParams[4]{static_cast<float>(directionalLights.size()),
+                        static_cast<float>(pointLights.size()), 0.0f, 0.0f};
+                    const float whiteFactor[4]{1.0f, 1.0f, 1.0f, 1.0f};
+                    bgfx::setUniform(normalMatrix3d_, normalMatrix.value().values.data());
+                    bgfx::setUniform(lightParams3d_, lightParams);
+                    // Scene View bakes material factors into its cached base-color texture.
+                    bgfx::setUniform(baseColorFactor3d_, whiteFactor);
+                    useDirectionalLighting = true;
+                }
+                else addMeshDiagnostic("Directional diffuse lighting disabled: world normal transform is singular; rendered unlit",
+                    item.entity);
+            }
+            else if ((!directionalLights.empty() || !pointLights.empty()) && !mesh.hasNormals)
+                addMeshDiagnostic("Directional diffuse lighting disabled: mesh has no NORMAL channel; rendered unlit",
+                    item.entity);
+            const auto program = useDirectionalLighting
+                ? (mesh.textured ? litTexturedProgram3d_ : litProgram3d_)
+                : (mesh.textured ? texturedProgram3d_ : program3d_);
+            if (mesh.textured && bgfx::isValid(baseColorSampler_))
+            {
+                bgfx::setTexture(0, baseColorSampler_, mesh.baseColorTexture, mesh.baseColorSamplerFlags);
+                bgfx::submit(view, program);
+                ++frameTexturedMeshSubmissions_;
+                if (item.primitiveMaterialOverride) ++framePrimitiveMaterialSubmissions_;
+                if (mesh.textureHasMips)
+                {
+                    ++frameMipmappedTextureSubmissions_;
+                    if (mesh.materialData && mesh.materialData->alphaMode == astro::assets::MaterialAlphaMode::Mask)
+                        ++frameMaskMipmappedTextureSubmissions_;
+                }
+                if (mesh.sourceGltfSampling)
+                {
+                    ++frameSourceSamplerSubmissions_;
+                    lastSourceSamplerFlags_ = mesh.baseColorSamplerFlags;
+                    if (mesh.sourceUvTransform) ++frameTextureTransformSubmissions_;
+                }
+                if (mesh.projectOverrideSampling)
+                {
+                    ++frameProjectSamplerSubmissions_;
+                    lastProjectSamplerFlags_ = mesh.baseColorSamplerFlags;
+                    if (mesh.sourceUvTransform) ++frameProjectTransformSubmissions_;
+                }
+            }
+            else bgfx::submit(view, program);
             ++meshSubmissions_;
             ++frameMeshSubmissions_;
         }
@@ -685,6 +1808,7 @@ private:
         if (bgfx::isValid(depthTexture_)) bgfx::destroy(depthTexture_);
         colorTexture_ = depthTexture_ = BGFX_INVALID_HANDLE;
         frameBuffer_ = BGFX_INVALID_HANDLE;
+        srgbAttachment_ = false;
         width_ = height_ = 0;
     }
 
@@ -699,14 +1823,38 @@ private:
         if (bgfx::isValid(colorTexture_)) bgfx::destroy(colorTexture_);
         if (bgfx::isValid(depthTexture_)) bgfx::destroy(depthTexture_);
         colorTexture_ = depthTexture_ = BGFX_INVALID_HANDLE;
-        if (view_ == 1)
+        srgbAttachment_ = (view_ == 1 || view_ == 2) && bgfxSupportsSrgbBgra8Target();
+        if ((view_ == 1 || view_ == 2) && !srgbAttachment_)
         {
+            static bool warnedAboutSrgbTarget = false;
+            if (!warnedAboutSrgbTarget)
+            {
+                std::cerr << "[warning] BGFX BGRA8 sRGB framebuffer is unavailable; Scene/Game blending uses legacy output\n";
+                warnedAboutSrgbTarget = true;
+            }
+        }
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+        if (view_ == 1 || bgfx::isValid(program3d_))
+#else
+        if (view_ == 1)
+#endif
+        {
+            const auto depthFormat = bgfxSupportedDepthFormat();
+            if (!depthFormat)
+            {
+                error = "No BGFX depth texture format supports framebuffer attachments on this renderer";
+                return false;
+            }
             colorTexture_ = bgfx::createTexture2D(static_cast<std::uint16_t>(width), static_cast<std::uint16_t>(height),
                 false, 1, bgfx::TextureFormat::BGRA8,
-                BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+                BGFX_TEXTURE_RT | (srgbAttachment_ ? BGFX_TEXTURE_SRGB_MUTABLE : BGFX_TEXTURE_NONE)
+                    | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
             depthTexture_ = bgfx::createTexture2D(static_cast<std::uint16_t>(width), static_cast<std::uint16_t>(height),
-                false, 1, bgfx::TextureFormat::D24S8, BGFX_TEXTURE_RT);
-            const bgfx::TextureHandle attachments[]{colorTexture_, depthTexture_};
+                false, 1, *depthFormat, BGFX_TEXTURE_RT);
+            bgfx::Attachment attachments[2];
+            attachments[0].init(colorTexture_, bgfx::Access::Write, 0, 1, 0,
+                srgbAttachment_ ? BGFX_ATTACHMENT_SRGB : BGFX_ATTACHMENT_NONE);
+            attachments[1].init(depthTexture_, bgfx::Access::Write, 0, 1, 0, BGFX_ATTACHMENT_NONE);
             if (bgfx::isValid(colorTexture_) && bgfx::isValid(depthTexture_))
                 frameBuffer_ = bgfx::createFrameBuffer(2, attachments, false);
         }
@@ -721,7 +1869,9 @@ private:
             error = "bgfx could not allocate the Scene/Game framebuffer attachment";
             return false;
         }
-        bgfx::setName(frameBuffer_, view_ == 1 ? "Scene View BGRA8" : "Game View BGRA8");
+        bgfx::setName(frameBuffer_, view_ == 1 ? (srgbAttachment_ ? "Scene View BGRA8 sRGB" : "Scene View BGRA8")
+            : view_ == 5 ? "Project Model Preview BGRA8"
+            : (srgbAttachment_ ? "Game View BGRA8 sRGB" : "Game View BGRA8"));
         width_ = width; height_ = height;
         return true;
     }
@@ -730,15 +1880,47 @@ private:
     bgfx::FrameBufferHandle frameBuffer_ = BGFX_INVALID_HANDLE;
     bgfx::TextureHandle colorTexture_ = BGFX_INVALID_HANDLE, depthTexture_ = BGFX_INVALID_HANDLE;
     int width_ = 0, height_ = 0;
+    bool srgbAttachment_ = false;
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
     bgfx::ProgramHandle program3d_ = BGFX_INVALID_HANDLE;
+    bgfx::ProgramHandle texturedProgram3d_ = BGFX_INVALID_HANDLE;
+    bgfx::ProgramHandle litProgram3d_ = BGFX_INVALID_HANDLE, litTexturedProgram3d_ = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle baseColorSampler_ = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle alphaParams_ = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle normalMatrix3d_ = BGFX_INVALID_HANDLE, lightParams3d_ = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle lightDirections3d_ = BGFX_INVALID_HANDLE, lightColors3d_ = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle pointPositions3d_ = BGFX_INVALID_HANDLE, pointColors3d_ = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle pointRanges3d_ = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle baseColorFactor3d_ = BGFX_INVALID_HANDLE;
     bgfx::VertexLayout meshLayout_;
     std::unordered_map<EntityId, CachedMesh> meshCache_;
+    std::unordered_map<std::string, BaseColorTextureCacheEntry> baseColorTextureCache_;
+    std::uint64_t baseColorTextureCacheBytes_ = 0;
+    std::uint64_t baseColorTextureCacheHits_ = 0;
     std::uint64_t meshSubmissions_ = 0;
-    std::uint32_t frameMeshSubmissions_ = 0, frameMeshDiagnostics_ = 0;
+    std::uint32_t frameMeshSubmissions_ = 0, frameMeshDiagnostics_ = 0,
+        frameTexturedMeshSubmissions_ = 0, frameMaterialFallbacks_ = 0,
+        framePrimitiveMaterialSubmissions_ = 0;
+    bool frameCameraDriven_ = false;
+    std::uint32_t frameOpaqueMeshSubmissions_ = 0, frameMaskMeshSubmissions_ = 0,
+        frameBlendMeshSubmissions_ = 0;
+    std::uint32_t frameSourceSamplerSubmissions_ = 0, frameTextureTransformSubmissions_ = 0;
+    std::uint32_t frameMipmappedTextureSubmissions_ = 0;
+    std::uint32_t frameMaskMipmappedTextureSubmissions_ = 0;
+#if defined(ASTRO_EDITOR_HAS_RUNTIME_BGFX_3D)
+    std::unique_ptr<astro::runtime::BgfxSceneRenderer> runtimeSceneRenderer_;
+    bool frameRuntimeBgfxAdapterUsed_ = false;
+    std::uint32_t frameRuntimeBgfxSubmissions_ = 0;
+    std::uint32_t frameRuntimeBgfxTextureSubmissions_ = 0;
+#endif
+    std::uint32_t lastSourceSamplerFlags_ = 0;
+        std::uint32_t frameProjectSamplerSubmissions_ = 0, frameProjectTransformSubmissions_ = 0;
+        std::uint32_t lastProjectSamplerFlags_ = 0;
     bx::Vec3 lastMeshOrigin_{0.0f, 0.0f, 0.0f};
     std::string meshError_;
+    std::vector<DiagnosticEntry> diagnostics_;
     astro::editor::SceneViewCamera3D camera3d_;
+    bool forceZeroLightLambert_ = false;
     bool frameAllRequested_ = false, frameAllApplied_ = false;
 #endif
 };
@@ -783,7 +1965,8 @@ void appendPngChunk(std::vector<std::uint8_t>& png, const std::array<char, 4> ty
 }
 
 std::vector<std::uint8_t> makeSmokePng(const std::array<std::uint8_t, 4> color,
-    const std::uint32_t width = 1, const std::uint32_t height = 1)
+    const std::uint32_t width = 1, const std::uint32_t height = 1, const bool checker = false,
+    const bool checkerAlpha = false)
 {
     if (width == 0 || height == 0 || std::uint64_t(width) * height * 4 + height > 65535)
         throw std::runtime_error("Smoke PNG dimensions exceed the test encoder limit");
@@ -797,7 +1980,104 @@ std::vector<std::uint8_t> makeSmokePng(const std::array<std::uint8_t, 4> color,
     for (std::uint32_t y = 0; y < height; ++y)
     {
         raw.push_back(0); // PNG filter: None
-        for (std::uint32_t x = 0; x < width; ++x) raw.insert(raw.end(), color.begin(), color.end());
+        for (std::uint32_t x = 0; x < width; ++x)
+        {
+            auto pixel = checker && ((x / 2 + y / 2) % 2 != 0)
+                ? std::array<std::uint8_t, 4>{24, 90, 112, 255} : color;
+            if (checkerAlpha && checker && ((x / 2 + y / 2) % 2 != 0)) pixel[3] = 0;
+            raw.insert(raw.end(), pixel.begin(), pixel.end());
+        }
+    }
+    std::vector<std::uint8_t> compressed{0x78, 0x01, 0x01};
+    const auto length = static_cast<std::uint16_t>(raw.size());
+    compressed.push_back(static_cast<std::uint8_t>(length));
+    compressed.push_back(static_cast<std::uint8_t>(length >> 8));
+    const auto inverse = static_cast<std::uint16_t>(~length);
+    compressed.push_back(static_cast<std::uint8_t>(inverse));
+    compressed.push_back(static_cast<std::uint8_t>(inverse >> 8));
+    compressed.insert(compressed.end(), raw.begin(), raw.end());
+    std::uint32_t a = 1, b = 0;
+    for (const auto byte : raw) { a = (a + byte) % 65521; b = (b + a) % 65521; }
+    appendPngBe32(compressed, (b << 16) | a);
+    appendPngChunk(png, {'I','D','A','T'}, compressed);
+    appendPngChunk(png, {'I','E','N','D'}, {});
+    return png;
+}
+
+std::uint16_t runtimeBgfxSmokeMipFilter()
+{
+    std::array<wchar_t, 16> value{};
+    const auto length = GetEnvironmentVariableW(L"ASTRO_RUNTIME_BGFX_MIP_FILTER", value.data(),
+        static_cast<DWORD>(value.size()));
+    if (length == 0) return 9987;
+    if (length >= value.size()) throw std::runtime_error("Runtime BGFX mip-filter test value is too long");
+    wchar_t* end = nullptr;
+    const auto parsed = std::wcstol(value.data(), &end, 10);
+    if (!end || *end != L'\0' || parsed < 9984 || parsed > 9987)
+        throw std::runtime_error("Runtime BGFX mip-filter test value must be a glTF mip minFilter enum");
+    return static_cast<std::uint16_t>(parsed);
+}
+
+bool runtimeBgfxSmokeAlphaMask()
+{
+    std::array<wchar_t, 8> value{};
+    const auto length = GetEnvironmentVariableW(L"ASTRO_RUNTIME_BGFX_MASK_SMOKE", value.data(),
+        static_cast<DWORD>(value.size()));
+    if (length == 0) return false;
+    if (length >= value.size() || std::wstring_view(value.data()) != L"1")
+        throw std::runtime_error("Runtime BGFX MASK smoke flag must be 1 when set");
+    return true;
+}
+
+enum class SmokeMaskMipPattern
+{
+    Split,
+    Checker,
+    CenterHole,
+    FractionalRamp,
+    CutoffBelow,
+    CutoffFirstPassing,
+    CutoffAbove,
+    CutoffBands,
+    CutoffTransitionRamp
+};
+
+std::vector<std::uint8_t> makeSmokeMaskMipPng(const SmokeMaskMipPattern pattern,
+    const std::uint32_t width = 64, const std::uint32_t height = 64)
+{
+    if (width < 2 || height == 0 || std::uint64_t(width) * height * 4 + height > 65535)
+        throw std::runtime_error("Mask mip smoke PNG dimensions exceed the test encoder limit");
+    std::vector<std::uint8_t> png{137,80,78,71,13,10,26,10};
+    std::vector<std::uint8_t> header;
+    appendPngBe32(header, width); appendPngBe32(header, height);
+    header.insert(header.end(), {8, 6, 0, 0, 0});
+    appendPngChunk(png, {'I','H','D','R'}, header);
+    std::vector<std::uint8_t> raw;
+    raw.reserve(static_cast<std::size_t>(height) * (static_cast<std::size_t>(width) * 4 + 1));
+    for (std::uint32_t y = 0; y < height; ++y)
+    {
+        raw.push_back(0);
+        for (std::uint32_t x = 0; x < width; ++x)
+        {
+            const auto alpha = pattern == SmokeMaskMipPattern::CutoffBelow ? std::uint8_t{127}
+                : pattern == SmokeMaskMipPattern::CutoffFirstPassing ? std::uint8_t{128}
+                : pattern == SmokeMaskMipPattern::CutoffAbove ? std::uint8_t{129}
+                : pattern == SmokeMaskMipPattern::CutoffBands
+                ? ((std::uint64_t(x) * 4 / width) == 1 ? std::uint8_t{128}
+                    : (std::uint64_t(x) * 4 / width) == 2 ? std::uint8_t{129}
+                    : std::uint8_t{127})
+                : pattern == SmokeMaskMipPattern::CutoffTransitionRamp
+                ? static_cast<std::uint8_t>(112 + (std::uint64_t(x) * 31) / (width - 1))
+                : pattern == SmokeMaskMipPattern::FractionalRamp
+                ? static_cast<std::uint8_t>((std::uint64_t(x) * 255) / (width - 1))
+                : static_cast<std::uint8_t>((pattern == SmokeMaskMipPattern::Split
+                    ? x < width / 2
+                    : pattern == SmokeMaskMipPattern::Checker
+                        ? ((x / 16 + y / 16) % 2 == 0)
+                        : !(x >= width / 4 && x < 3 * width / 4
+                            && y >= height / 4 && y < 3 * height / 4)) ? 255 : 0);
+            raw.insert(raw.end(), {255, 0, 255, alpha});
+        }
     }
     std::vector<std::uint8_t> compressed{0x78, 0x01, 0x01};
     const auto length = static_cast<std::uint16_t>(raw.size());
@@ -834,7 +2114,10 @@ bool smokeScreenshotContainsSpriteColors(const std::filesystem::path& file)
         // bgfx screenshot is BGRA. The blend reference is green (128 alpha) over #121822.
         if (pixel[2] > 235 && pixel[1] < 20 && pixel[0] < 20) ++red;
         if (pixel[0] > 235 && pixel[1] < 20 && pixel[2] < 20) ++blue;
-        if (pixel[1] > 100 && pixel[1] < 180 && pixel[2] < 25 && pixel[0] < 25) ++blendedGreen;
+        // Linear-light blend of the fixture's translucent green sprite over
+        // the sRGB Scene View clear color (measured on the D3D11 sRGB target).
+        if (pixel[2] >= 35 && pixel[2] <= 65 && pixel[1] >= 140 && pixel[1] <= 175
+            && pixel[0] >= 50 && pixel[0] <= 80) ++blendedGreen;
     }
     return red >= 8 && blue >= 8 && blendedGreen >= 8;
 }
@@ -879,6 +2162,625 @@ std::uint64_t smokeScreenshotSceneViewWhitePixels(const std::filesystem::path& f
         }
     }
     return whitePixels;
+}
+
+std::uint64_t smokeScreenshotModelPreviewPixels(const std::filesystem::path& file,
+    const std::array<float, 4>& normalizedPreviewRect)
+{
+    std::ifstream input(file, std::ios::binary);
+    std::array<std::uint8_t, 18> header{};
+    if (!input.read(reinterpret_cast<char*>(header.data()), header.size()) || header[2] != 2 || header[16] != 32)
+        return 0;
+    const auto width = std::uint32_t(header[12]) | (std::uint32_t(header[13]) << 8);
+    const auto height = std::uint32_t(header[14]) | (std::uint32_t(header[15]) << 8);
+    const auto pixelCount = std::uint64_t(width) * height;
+    if (!width || !height || pixelCount > 100'000'000 || normalizedPreviewRect[0] < 0.0f
+        || normalizedPreviewRect[1] < 0.0f || normalizedPreviewRect[2] > 1.0f
+        || normalizedPreviewRect[3] > 1.0f || normalizedPreviewRect[0] >= normalizedPreviewRect[2]
+        || normalizedPreviewRect[1] >= normalizedPreviewRect[3]) return 0;
+    input.seekg(18u + header[0], std::ios::beg);
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(pixelCount) * 4);
+    if (!input.read(reinterpret_cast<char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()))) return 0;
+    const auto x0 = static_cast<std::uint32_t>(normalizedPreviewRect[0] * float(width));
+    const auto y0 = static_cast<std::uint32_t>(normalizedPreviewRect[1] * float(height));
+    const auto x1 = std::min(width, static_cast<std::uint32_t>(std::ceil(normalizedPreviewRect[2] * float(width))));
+    const auto y1 = std::min(height, static_cast<std::uint32_t>(std::ceil(normalizedPreviewRect[3] * float(height))));
+    const bool topOrigin = (header[17] & 0x20u) != 0, rightOrigin = (header[17] & 0x10u) != 0;
+    std::uint64_t visibleModelPixels = 0;
+    for (std::uint32_t y = y0; y < y1; ++y)
+    {
+        const auto storedY = topOrigin ? y : height - 1u - y;
+        for (std::uint32_t x = x0; x < x1; ++x)
+        {
+            const auto storedX = rightOrigin ? width - 1u - x : x;
+            const auto offset = (std::size_t(storedY) * width + storedX) * 4;
+            const auto blue = pixels[offset], green = pixels[offset + 1], red = pixels[offset + 2];
+            if (pixels[offset + 3] >= 200 && (red > 55 || green > 55 || blue > 55)) ++visibleModelPixels;
+        }
+    }
+    return visibleModelPixels;
+}
+
+std::uint64_t smokeScreenshotSceneViewBaseColorPixels(const std::filesystem::path& file,
+    const std::array<float, 4>& normalizedSceneViewRect, const bool countCyan = false)
+{
+    std::ifstream input(file, std::ios::binary);
+    std::array<std::uint8_t, 18> header{};
+    if (!input.read(reinterpret_cast<char*>(header.data()), header.size()) || header[2] != 2 || header[16] != 32)
+        return 0;
+    const auto width = std::uint32_t(header[12]) | (std::uint32_t(header[13]) << 8);
+    const auto height = std::uint32_t(header[14]) | (std::uint32_t(header[15]) << 8);
+    const auto pixelCount = std::uint64_t(width) * height;
+    if (!width || !height || pixelCount > 100'000'000 || normalizedSceneViewRect[0] < 0.0f
+        || normalizedSceneViewRect[1] < 0.0f || normalizedSceneViewRect[2] > 1.0f
+        || normalizedSceneViewRect[3] > 1.0f || normalizedSceneViewRect[0] >= normalizedSceneViewRect[2]
+        || normalizedSceneViewRect[1] >= normalizedSceneViewRect[3]) return 0;
+    input.seekg(18u + header[0], std::ios::beg);
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(pixelCount) * 4);
+    if (!input.read(reinterpret_cast<char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()))) return 0;
+    const auto x0 = static_cast<std::uint32_t>(normalizedSceneViewRect[0] * float(width));
+    const auto y0 = static_cast<std::uint32_t>(normalizedSceneViewRect[1] * float(height));
+    const auto x1 = std::min(width, static_cast<std::uint32_t>(std::ceil(normalizedSceneViewRect[2] * float(width))));
+    const auto y1 = std::min(height, static_cast<std::uint32_t>(std::ceil(normalizedSceneViewRect[3] * float(height))));
+    const bool topOrigin = (header[17] & 0x20u) != 0, rightOrigin = (header[17] & 0x10u) != 0;
+    std::uint64_t baseColorPixels = 0;
+    for (std::uint32_t y = y0; y < y1; ++y)
+    {
+        const auto storedY = topOrigin ? y : height - 1u - y;
+        for (std::uint32_t x = x0; x < x1; ++x)
+        {
+            const auto storedX = rightOrigin ? width - 1u - x : x;
+            const auto offset = (std::size_t(storedY) * width + storedX) * 4;
+            const auto blue = pixels[offset], green = pixels[offset + 1], red = pixels[offset + 2];
+            const bool redBaseColor = red > 80 && red > unsigned(green) * 5 / 4
+                && red > unsigned(blue) * 3 / 2;
+            const bool cyanBaseColor = blue > 80 && blue > unsigned(red) * 3 / 2
+                && blue > unsigned(green) * 6 / 5;
+            if (countCyan ? cyanBaseColor : redBaseColor)
+                ++baseColorPixels;
+        }
+    }
+    return baseColorPixels;
+}
+
+std::uint64_t smokeScreenshotRedLightPixels(const std::filesystem::path& file,
+    const std::array<float, 4>& normalizedRect, const std::array<float, 4>& localRect = {0.0f, 0.0f, 1.0f, 1.0f})
+{
+    std::ifstream input(file, std::ios::binary);
+    std::array<std::uint8_t, 18> header{};
+    if (!input.read(reinterpret_cast<char*>(header.data()), header.size()) || header[2] != 2 || header[16] != 32)
+        return 0;
+    const auto width = std::uint32_t(header[12]) | (std::uint32_t(header[13]) << 8);
+    const auto height = std::uint32_t(header[14]) | (std::uint32_t(header[15]) << 8);
+    if (!width || !height || std::uint64_t(width) * height > 100'000'000
+        || normalizedRect[0] < 0.0f || normalizedRect[1] < 0.0f
+        || normalizedRect[2] > 1.0f || normalizedRect[3] > 1.0f
+        || normalizedRect[0] >= normalizedRect[2] || normalizedRect[1] >= normalizedRect[3]
+        || localRect[0] < 0.0f || localRect[1] < 0.0f || localRect[2] > 1.0f || localRect[3] > 1.0f
+        || localRect[0] >= localRect[2] || localRect[1] >= localRect[3]) return 0;
+    input.seekg(18u + header[0], std::ios::beg);
+    std::vector<std::uint8_t> pixels(std::size_t(width) * height * 4);
+    if (!input.read(reinterpret_cast<char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()))) return 0;
+    const auto viewX0 = static_cast<std::uint32_t>(normalizedRect[0] * float(width));
+    const auto viewY0 = static_cast<std::uint32_t>(normalizedRect[1] * float(height));
+    const auto viewX1 = std::min(width, static_cast<std::uint32_t>(std::ceil(normalizedRect[2] * float(width))));
+    const auto viewY1 = std::min(height, static_cast<std::uint32_t>(std::ceil(normalizedRect[3] * float(height))));
+    const auto viewWidth = viewX1 - viewX0, viewHeight = viewY1 - viewY0;
+    const auto x0 = viewX0 + static_cast<std::uint32_t>(localRect[0] * float(viewWidth));
+    const auto y0 = viewY0 + static_cast<std::uint32_t>(localRect[1] * float(viewHeight));
+    const auto x1 = std::min(viewX1, viewX0 + static_cast<std::uint32_t>(std::ceil(localRect[2] * float(viewWidth))));
+    const auto y1 = std::min(viewY1, viewY0 + static_cast<std::uint32_t>(std::ceil(localRect[3] * float(viewHeight))));
+    const bool topOrigin = (header[17] & 0x20u) != 0, rightOrigin = (header[17] & 0x10u) != 0;
+    std::uint64_t count = 0;
+    for (auto y = y0; y < y1; ++y)
+        for (auto x = x0; x < x1; ++x)
+        {
+            const auto sx = rightOrigin ? width - 1u - x : x;
+            const auto sy = topOrigin ? y : height - 1u - y;
+            const auto offset = (std::size_t(sy) * width + sx) * 4;
+            if (pixels[offset + 2] > 80 && pixels[offset + 1] < 24 && pixels[offset] < 24
+                && pixels[offset + 3] >= 200) ++count;
+        }
+    return count;
+}
+
+std::uint64_t smokeScreenshotBlueLightPixels(const std::filesystem::path& file,
+    const std::array<float, 4>& normalizedRect)
+{
+    std::ifstream input(file, std::ios::binary);
+    std::array<std::uint8_t, 18> header{};
+    if (!input.read(reinterpret_cast<char*>(header.data()), header.size()) || header[2] != 2 || header[16] != 32)
+        return 0;
+    const auto width = std::uint32_t(header[12]) | (std::uint32_t(header[13]) << 8);
+    const auto height = std::uint32_t(header[14]) | (std::uint32_t(header[15]) << 8);
+    if (!width || !height || std::uint64_t(width) * height > 100'000'000
+        || normalizedRect[0] < 0.0f || normalizedRect[1] < 0.0f
+        || normalizedRect[2] > 1.0f || normalizedRect[3] > 1.0f
+        || normalizedRect[0] >= normalizedRect[2] || normalizedRect[1] >= normalizedRect[3]) return 0;
+    input.seekg(18u + header[0], std::ios::beg);
+    std::vector<std::uint8_t> pixels(std::size_t(width) * height * 4);
+    if (!input.read(reinterpret_cast<char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()))) return 0;
+    const auto x0 = static_cast<std::uint32_t>(normalizedRect[0] * float(width));
+    const auto y0 = static_cast<std::uint32_t>(normalizedRect[1] * float(height));
+    const auto x1 = std::min(width, static_cast<std::uint32_t>(std::ceil(normalizedRect[2] * float(width))));
+    const auto y1 = std::min(height, static_cast<std::uint32_t>(std::ceil(normalizedRect[3] * float(height))));
+    const bool topOrigin = (header[17] & 0x20u) != 0, rightOrigin = (header[17] & 0x10u) != 0;
+    std::uint64_t count = 0;
+    for (auto y = y0; y < y1; ++y)
+        for (auto x = x0; x < x1; ++x)
+        {
+            const auto sx = rightOrigin ? width - 1u - x : x;
+            const auto sy = topOrigin ? y : height - 1u - y;
+            const auto offset = (std::size_t(sy) * width + sx) * 4;
+            if (pixels[offset] > 80 && pixels[offset + 1] < 24 && pixels[offset + 2] < 24
+                && pixels[offset + 3] >= 200) ++count;
+        }
+    return count;
+}
+
+bool smokeWriteSceneViewRawCrop(const std::filesystem::path& screenshot,
+    const std::filesystem::path& output, const std::array<float, 4>& normalizedRect)
+{
+    std::ifstream input(screenshot, std::ios::binary);
+    std::array<std::uint8_t, 18> header{};
+    if (!input.read(reinterpret_cast<char*>(header.data()), header.size())
+        || header[2] != 2 || header[16] != 32) return false;
+    const auto width = std::uint32_t(header[12]) | (std::uint32_t(header[13]) << 8);
+    const auto height = std::uint32_t(header[14]) | (std::uint32_t(header[15]) << 8);
+    if (!width || !height || std::uint64_t(width) * height > 100'000'000
+        || normalizedRect[0] < 0.0f || normalizedRect[1] < 0.0f
+        || normalizedRect[2] > 1.0f || normalizedRect[3] > 1.0f
+        || normalizedRect[0] >= normalizedRect[2] || normalizedRect[1] >= normalizedRect[3]) return false;
+    input.seekg(18u + header[0], std::ios::beg);
+    std::vector<std::uint8_t> pixels(std::size_t(width) * height * 4);
+    if (!input.read(reinterpret_cast<char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()))) return false;
+    const auto x0 = static_cast<std::uint32_t>(normalizedRect[0] * float(width));
+    const auto y0 = static_cast<std::uint32_t>(normalizedRect[1] * float(height));
+    const auto x1 = std::min(width, static_cast<std::uint32_t>(std::ceil(normalizedRect[2] * float(width))));
+    const auto y1 = std::min(height, static_cast<std::uint32_t>(std::ceil(normalizedRect[3] * float(height))));
+    if (x0 >= x1 || y0 >= y1) return false;
+    const bool topOrigin = (header[17] & 0x20u) != 0, rightOrigin = (header[17] & 0x10u) != 0;
+    std::ofstream raw(output, std::ios::binary | std::ios::trunc);
+    if (!raw) return false;
+    const std::uint32_t cropWidth = x1 - x0, cropHeight = y1 - y0;
+    raw.write(reinterpret_cast<const char*>(&cropWidth), sizeof(cropWidth));
+    raw.write(reinterpret_cast<const char*>(&cropHeight), sizeof(cropHeight));
+    for (std::uint32_t y = y0; y < y1; ++y)
+    {
+        const auto sourceY = topOrigin ? y : height - 1u - y;
+        for (std::uint32_t x = x0; x < x1; ++x)
+        {
+            const auto sourceX = rightOrigin ? width - 1u - x : x;
+            const auto offset = (std::size_t(sourceY) * width + sourceX) * 4;
+            raw.write(reinterpret_cast<const char*>(pixels.data() + offset), 4);
+        }
+    }
+    return raw.good();
+}
+
+struct ColorChartComparison final
+{
+    std::size_t samples = 0;
+    std::size_t matched = 0;
+    int maximumDelta = 0;
+    std::uint32_t originX = 0;
+    std::uint32_t originY = 0;
+    std::array<std::array<std::uint8_t, 4>, 4> actualBgra{};
+    bool valid = false;
+};
+
+ColorChartComparison smokeCompareColorChart(const std::filesystem::path& file)
+{
+    ColorChartComparison result;
+    std::ifstream input(file, std::ios::binary);
+    std::array<std::uint8_t, 18> header{};
+    if (!input.read(reinterpret_cast<char*>(header.data()), header.size())
+        || header[2] != 2 || header[16] != 32) return result;
+    const auto width = std::uint32_t(header[12]) | (std::uint32_t(header[13]) << 8);
+    const auto height = std::uint32_t(header[14]) | (std::uint32_t(header[15]) << 8);
+    if (!width || !height || std::uint64_t(width) * height > 100'000'000) return result;
+    input.seekg(18u + header[0], std::ios::beg);
+    std::vector<std::uint8_t> pixels(std::size_t(width) * height * 4);
+    if (!input.read(reinterpret_cast<char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()))) return result;
+    const bool topOrigin = (header[17] & 0x20u) != 0, rightOrigin = (header[17] & 0x10u) != 0;
+    constexpr std::array<std::array<std::uint8_t, 4>, 4> expectedBgra{{
+        {{0, 0, 0, 255}}, {{64, 128, 192, 255}}, {{200, 100, 30, 255}}, {{255, 255, 255, 255}}
+    }};
+    constexpr int channelTolerance = 8;
+    constexpr std::uint32_t chartWidth = 192;
+    constexpr std::uint32_t chartHeight = 48;
+    if (width < chartWidth || height < chartHeight) return result;
+    result.samples = expectedBgra.size();
+    int bestScore = -1;
+    int bestDelta = 256;
+    for (std::uint32_t y0 = 0; y0 + chartHeight <= height; ++y0)
+        for (std::uint32_t x0 = 0; x0 + chartWidth <= width; ++x0)
+        {
+            const auto x = x0 + chartWidth / 8;
+            const auto y = y0 + chartHeight / 2;
+            int score = 0;
+            int deltaSum = 0;
+            std::array<std::array<std::uint8_t, 4>, 4> actual{};
+            for (std::size_t index = 0; index < expectedBgra.size(); ++index)
+            {
+                const auto sxLogical = x + static_cast<std::uint32_t>(index) * chartWidth / 4;
+                const auto sx = rightOrigin ? width - 1u - sxLogical : sxLogical;
+                const auto sy = topOrigin ? y : height - 1u - y;
+                const auto offset = (std::size_t(sy) * width + sx) * 4;
+                int maximumDelta = 0;
+                for (std::size_t channel = 0; channel < 4; ++channel)
+                {
+                    actual[index][channel] = pixels[offset + channel];
+                    maximumDelta = std::max(maximumDelta, std::abs(int(pixels[offset + channel])
+                        - int(expectedBgra[index][channel])));
+                }
+                if (maximumDelta <= channelTolerance) ++score;
+                deltaSum += maximumDelta;
+            }
+            if (score > bestScore || (score == bestScore && deltaSum < bestDelta))
+            {
+                bestScore = score;
+                bestDelta = deltaSum;
+                result.matched = static_cast<std::size_t>(score);
+                result.maximumDelta = 0;
+                result.originX = x0;
+                result.originY = y0;
+                result.actualBgra = actual;
+                for (std::size_t index = 0; index < actual.size(); ++index)
+                    for (std::size_t channel = 0; channel < 4; ++channel)
+                        result.maximumDelta = std::max(result.maximumDelta,
+                            std::abs(int(actual[index][channel]) - int(expectedBgra[index][channel])));
+            }
+        }
+    result.valid = result.matched == result.samples;
+    return result;
+}
+
+struct FramebufferReadbackComparison final
+{
+    struct TapSample final
+    {
+        int gridX = 0, gridY = 0;
+        std::uint32_t screenX = 0, screenY = 0, targetX = 0, targetY = 0;
+        std::array<std::uint8_t, 4> screenBgra{};
+        std::array<std::uint8_t, 4> targetBgra{};
+    };
+    std::size_t samples = 0;
+    std::size_t matched = 0;
+    int maximumDelta = 255;
+    std::size_t alternateOrientationMatched = 0;
+    int alternateOrientationMaximumDelta = 255;
+    std::array<double, 3> meanScreenChannels{};
+    std::array<double, 3> meanSourceChannels{};
+    int screenWidth = 0, screenHeight = 0, screenRectX = 0, screenRectY = 0;
+    int screenRectWidth = 0, screenRectHeight = 0;
+    int targetWidth = 0, targetHeight = 0;
+    std::array<std::size_t, 24> rowMatches{}, alternateRowMatches{};
+    std::array<TapSample, 5> tapSamples{};
+    bool valid = false;
+};
+
+FramebufferReadbackComparison smokeCompareFramebufferReadback(const std::filesystem::path& screenshot,
+    const std::array<float, 4>& normalizedRect, const std::vector<std::uint8_t>& framebuffer,
+    const int framebufferWidth, const int framebufferHeight, const bool backendBottomLeft,
+    const std::size_t minimumMatchPermille = 995)
+{
+    FramebufferReadbackComparison result;
+    if (framebufferWidth <= 0 || framebufferHeight <= 0
+        || framebuffer.size() != std::size_t(framebufferWidth) * framebufferHeight * 4
+        || normalizedRect[0] < 0.0f || normalizedRect[1] < 0.0f
+        || normalizedRect[2] > 1.0f || normalizedRect[3] > 1.0f
+        || normalizedRect[0] >= normalizedRect[2] || normalizedRect[1] >= normalizedRect[3]) return result;
+    std::ifstream input(screenshot, std::ios::binary);
+    std::array<std::uint8_t, 18> header{};
+    if (!input.read(reinterpret_cast<char*>(header.data()), header.size())
+        || header[2] != 2 || header[16] != 32) return result;
+    const auto width = std::uint32_t(header[12]) | (std::uint32_t(header[13]) << 8);
+    const auto height = std::uint32_t(header[14]) | (std::uint32_t(header[15]) << 8);
+    if (!width || !height || std::uint64_t(width) * height > 100'000'000) return result;
+    result.screenWidth = static_cast<int>(width);
+    result.screenHeight = static_cast<int>(height);
+    result.screenRectX = static_cast<int>(normalizedRect[0] * float(width));
+    result.screenRectY = static_cast<int>(normalizedRect[1] * float(height));
+    result.screenRectWidth = static_cast<int>((normalizedRect[2] - normalizedRect[0]) * float(width));
+    result.screenRectHeight = static_cast<int>((normalizedRect[3] - normalizedRect[1]) * float(height));
+    result.targetWidth = framebufferWidth;
+    result.targetHeight = framebufferHeight;
+    input.seekg(18u + header[0], std::ios::beg);
+    std::vector<std::uint8_t> screen(std::size_t(width) * height * 4);
+    if (!input.read(reinterpret_cast<char*>(screen.data()), static_cast<std::streamsize>(screen.size()))) return result;
+    const bool screenTopLeft = (header[17] & 0x20u) != 0;
+    const bool screenRightOrigin = (header[17] & 0x10u) != 0;
+    constexpr int gridX = 32, gridY = 24, tolerance = 8;
+    constexpr std::array<std::array<int, 2>, 5> tapGridPoints{{
+        {{0, 0}}, {{gridX - 1, 0}}, {{0, gridY - 1}}, {{gridX - 1, gridY - 1}}, {{gridX / 2, gridY / 2}}
+    }};
+    int bestMatched = -1, bestDelta = 255;
+    int bestAlternateMatched = -1, bestAlternateDelta = 255;
+    for (const bool flipY : {false, true})
+    {
+        for (const bool swapRedBlue : {false, true})
+        {
+            std::size_t matched = 0;
+            int maximumDelta = 0;
+            std::array<std::size_t, gridY> rowMatches{};
+            std::array<double, 3> screenChannelSums{};
+            std::array<double, 3> sourceChannelSums{};
+            for (int gy = 0; gy < gridY; ++gy)
+            for (int gx = 0; gx < gridX; ++gx)
+            {
+                const float u = 0.07f + 0.86f * (float(gx) + 0.5f) / float(gridX);
+                const float v = 0.07f + 0.86f * (float(gy) + 0.5f) / float(gridY);
+                const auto sx = std::min(width - 1, std::uint32_t((normalizedRect[0]
+                    + (normalizedRect[2] - normalizedRect[0]) * u) * float(width)));
+                const auto sy = std::min(height - 1, std::uint32_t((normalizedRect[1]
+                    + (normalizedRect[3] - normalizedRect[1]) * v) * float(height)));
+                const auto screenX = screenRightOrigin ? width - 1 - sx : sx;
+                const auto screenY = screenTopLeft ? sy : height - 1 - sy;
+                const auto screenOffset = (std::size_t(screenY) * width + screenX) * 4;
+                const auto sourceX = std::min(framebufferWidth - 1,
+                    int(u * float(framebufferWidth)));
+                int sourceY = std::min(framebufferHeight - 1, int(v * float(framebufferHeight)));
+                if (flipY) sourceY = framebufferHeight - 1 - sourceY;
+                const auto sourceOffset = (std::size_t(sourceY) * framebufferWidth + sourceX) * 4;
+                int delta = 0;
+                for (int channel = 0; channel < 3; ++channel)
+                {
+                    const int sourceChannel = swapRedBlue && channel != 1 ? 2 - channel : channel;
+                    const auto screenValue = screen[screenOffset + channel];
+                    const auto sourceValue = framebuffer[sourceOffset + sourceChannel];
+                    screenChannelSums[channel] += screenValue;
+                    sourceChannelSums[channel] += sourceValue;
+                    delta = std::max(delta, std::abs(int(screenValue) - int(sourceValue)));
+                }
+                maximumDelta = std::max(maximumDelta, delta);
+                if (delta <= tolerance) { ++matched; ++rowMatches[gy]; }
+                if (!swapRedBlue && flipY == backendBottomLeft)
+                    for (std::size_t probe = 0; probe < tapGridPoints.size(); ++probe)
+                        if (gx == tapGridPoints[probe][0] && gy == tapGridPoints[probe][1])
+                        {
+                            auto& sample = result.tapSamples[probe];
+                            sample.gridX = gx;
+                            sample.gridY = gy;
+                            sample.screenX = screenX;
+                            sample.screenY = screenY;
+                            sample.targetX = static_cast<std::uint32_t>(sourceX);
+                            sample.targetY = static_cast<std::uint32_t>(sourceY);
+                            std::copy_n(screen.data() + screenOffset, 4, sample.screenBgra.data());
+                            std::copy_n(framebuffer.data() + sourceOffset, 4, sample.targetBgra.data());
+                        }
+            }
+            auto& orientationMatched = flipY == backendBottomLeft ? bestMatched : bestAlternateMatched;
+            auto& orientationDelta = flipY == backendBottomLeft ? bestDelta : bestAlternateDelta;
+            if (static_cast<int>(matched) > orientationMatched
+                || (static_cast<int>(matched) == orientationMatched && maximumDelta < orientationDelta))
+            {
+                orientationMatched = static_cast<int>(matched);
+                orientationDelta = maximumDelta;
+                if (flipY == backendBottomLeft) result.rowMatches = rowMatches;
+                else result.alternateRowMatches = rowMatches;
+                if (flipY == backendBottomLeft)
+                    for (std::size_t channel = 0; channel < 3; ++channel)
+                    {
+                        result.meanScreenChannels[channel] = screenChannelSums[channel] / double(gridX * gridY);
+                        result.meanSourceChannels[channel] = sourceChannelSums[channel] / double(gridX * gridY);
+                    }
+            }
+        }
+    }
+    result.samples = gridX * gridY;
+    result.matched = static_cast<std::size_t>(std::max(0, bestMatched));
+    result.maximumDelta = bestDelta;
+    result.alternateOrientationMatched = static_cast<std::size_t>(std::max(0, bestAlternateMatched));
+    result.alternateOrientationMaximumDelta = bestAlternateDelta;
+    result.valid = result.matched * 1000 >= result.samples * minimumMatchPermille;
+    return result;
+}
+
+std::uint64_t smokeScreenshotPrimitiveMaterialPixels(const std::filesystem::path& file,
+    const std::array<float, 4>& normalizedSceneViewRect)
+{
+    std::ifstream input(file, std::ios::binary);
+    std::array<std::uint8_t, 18> header{};
+    if (!input.read(reinterpret_cast<char*>(header.data()), header.size()) || header[2] != 2 || header[16] != 32)
+        return 0;
+    const auto width = std::uint32_t(header[12]) | (std::uint32_t(header[13]) << 8);
+    const auto height = std::uint32_t(header[14]) | (std::uint32_t(header[15]) << 8);
+    if (!width || !height || std::uint64_t(width) * height > 100'000'000
+        || normalizedSceneViewRect[0] < 0.0f || normalizedSceneViewRect[1] < 0.0f
+        || normalizedSceneViewRect[2] > 1.0f || normalizedSceneViewRect[3] > 1.0f
+        || normalizedSceneViewRect[0] >= normalizedSceneViewRect[2]
+        || normalizedSceneViewRect[1] >= normalizedSceneViewRect[3]) return 0;
+    input.seekg(18u + header[0], std::ios::beg);
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width) * height * 4);
+    if (!input.read(reinterpret_cast<char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()))) return 0;
+    const auto x0 = static_cast<std::uint32_t>(normalizedSceneViewRect[0] * float(width));
+    const auto y0 = static_cast<std::uint32_t>(normalizedSceneViewRect[1] * float(height));
+    const auto x1 = std::min(width, static_cast<std::uint32_t>(std::ceil(normalizedSceneViewRect[2] * float(width))));
+    const auto y1 = std::min(height, static_cast<std::uint32_t>(std::ceil(normalizedSceneViewRect[3] * float(height))));
+    const bool topOrigin = (header[17] & 0x20u) != 0, rightOrigin = (header[17] & 0x10u) != 0;
+    std::uint64_t yellowMaterialPixels = 0;
+    for (std::uint32_t y = y0; y < y1; ++y)
+    {
+        const auto storedY = topOrigin ? y : height - 1u - y;
+        for (std::uint32_t x = x0; x < x1; ++x)
+        {
+            const auto storedX = rightOrigin ? width - 1u - x : x;
+            const auto offset = (std::size_t(storedY) * width + storedX) * 4;
+            const auto blue = pixels[offset], green = pixels[offset + 1], red = pixels[offset + 2];
+            if (pixels[offset + 3] >= 200 && red >= 150 && green >= 130 && blue <= 100
+                && red > green && green > unsigned(blue) * 2)
+                ++yellowMaterialPixels;
+        }
+    }
+    return yellowMaterialPixels;
+}
+
+std::uint64_t smokeScreenshotSceneViewBlendPixels(const std::filesystem::path& file,
+    const std::array<float, 4>& normalizedSceneViewRect)
+{
+    std::ifstream input(file, std::ios::binary);
+    std::array<std::uint8_t, 18> header{};
+    if (!input.read(reinterpret_cast<char*>(header.data()), header.size()) || header[2] != 2 || header[16] != 32)
+        return 0;
+    const auto width = std::uint32_t(header[12]) | (std::uint32_t(header[13]) << 8);
+    const auto height = std::uint32_t(header[14]) | (std::uint32_t(header[15]) << 8);
+    if (!width || !height || std::uint64_t(width) * height > 100'000'000
+        || normalizedSceneViewRect[0] < 0.0f || normalizedSceneViewRect[1] < 0.0f
+        || normalizedSceneViewRect[2] > 1.0f || normalizedSceneViewRect[3] > 1.0f
+        || normalizedSceneViewRect[0] >= normalizedSceneViewRect[2]
+        || normalizedSceneViewRect[1] >= normalizedSceneViewRect[3]) return 0;
+    input.seekg(18u + header[0], std::ios::beg);
+    const auto size = std::uint64_t(width) * height * 4;
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(size));
+    if (!input.read(reinterpret_cast<char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()))) return 0;
+    const auto x0 = static_cast<std::uint32_t>(normalizedSceneViewRect[0] * float(width));
+    const auto y0 = static_cast<std::uint32_t>(normalizedSceneViewRect[1] * float(height));
+    const auto x1 = std::min(width, static_cast<std::uint32_t>(std::ceil(normalizedSceneViewRect[2] * float(width))));
+    const auto y1 = std::min(height, static_cast<std::uint32_t>(std::ceil(normalizedSceneViewRect[3] * float(height))));
+    const bool topOrigin = (header[17] & 0x20u) != 0, rightOrigin = (header[17] & 0x10u) != 0;
+    std::uint64_t blendedPixels = 0;
+    for (std::uint32_t y = y0; y < y1; ++y)
+    {
+        const auto storedY = topOrigin ? y : height - 1u - y;
+        for (std::uint32_t x = x0; x < x1; ++x)
+        {
+            const auto storedX = rightOrigin ? width - 1u - x : x;
+            const auto offset = (std::size_t(storedY) * width + storedX) * 4;
+            const auto blue = pixels[offset], green = pixels[offset + 1], red = pixels[offset + 2];
+            // D3D11 sRGB attachment linear-light blend of the authored cyan overlap.
+            if (red >= 45 && red <= 80 && green >= 120 && green <= 155
+                && blue >= 155 && blue <= 200 && blue > green && green > red)
+                ++blendedPixels;
+        }
+    }
+    return blendedPixels;
+}
+
+std::uint64_t smokeScreenshotSceneViewMagentaPixels(const std::filesystem::path& file,
+    const std::array<float, 4>& normalizedSceneViewRect)
+{
+    std::ifstream input(file, std::ios::binary);
+    std::array<std::uint8_t, 18> header{};
+    if (!input.read(reinterpret_cast<char*>(header.data()), header.size()) || header[2] != 2 || header[16] != 32)
+        return 0;
+    const auto width = std::uint32_t(header[12]) | (std::uint32_t(header[13]) << 8);
+    const auto height = std::uint32_t(header[14]) | (std::uint32_t(header[15]) << 8);
+    if (!width || !height || std::uint64_t(width) * height > 100'000'000
+        || normalizedSceneViewRect[0] < 0.0f || normalizedSceneViewRect[1] < 0.0f
+        || normalizedSceneViewRect[2] > 1.0f || normalizedSceneViewRect[3] > 1.0f
+        || normalizedSceneViewRect[0] >= normalizedSceneViewRect[2]
+        || normalizedSceneViewRect[1] >= normalizedSceneViewRect[3]) return 0;
+    input.seekg(18u + header[0], std::ios::beg);
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(std::uint64_t(width) * height * 4));
+    if (!input.read(reinterpret_cast<char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()))) return 0;
+    const auto x0 = static_cast<std::uint32_t>(normalizedSceneViewRect[0] * float(width));
+    const auto y0 = static_cast<std::uint32_t>(normalizedSceneViewRect[1] * float(height));
+    const auto x1 = std::min(width, static_cast<std::uint32_t>(std::ceil(normalizedSceneViewRect[2] * float(width))));
+    const auto y1 = std::min(height, static_cast<std::uint32_t>(std::ceil(normalizedSceneViewRect[3] * float(height))));
+    const bool topOrigin = (header[17] & 0x20u) != 0, rightOrigin = (header[17] & 0x10u) != 0;
+    std::uint64_t magentaPixels = 0;
+    for (std::uint32_t y = y0; y < y1; ++y)
+    {
+        const auto storedY = topOrigin ? y : height - 1u - y;
+        for (std::uint32_t x = x0; x < x1; ++x)
+        {
+            const auto storedX = rightOrigin ? width - 1u - x : x;
+            const auto offset = (std::size_t(storedY) * width + storedX) * 4;
+            const auto blue = pixels[offset], green = pixels[offset + 1], red = pixels[offset + 2];
+            // The sRGB swapchain encodes linear 1.0 to a driver-rounded magenta near 149.
+            if (red >= 100 && blue >= 100 && green <= 80) ++magentaPixels;
+        }
+    }
+    return magentaPixels;
+}
+
+struct SmokeSceneViewAlphaSpatialCounts
+{
+    std::array<std::uint64_t, 64> mask{};
+    std::array<std::uint64_t, 64> blend{};
+    std::array<std::uint64_t, 64> samples{};
+
+    [[nodiscard]] std::uint64_t totalSamples() const noexcept
+    {
+        std::uint64_t total = 0;
+        for (const auto count : samples) total += count;
+        return total;
+    }
+
+    bool hasAlternatingMaskAndBlendRegions() const noexcept
+    {
+        std::size_t maskRichBands = 0, blendRichBands = 0, transitions = 0;
+        int previous = 0;
+        for (std::size_t i = 0; i < mask.size(); ++i)
+        {
+            if (samples[i] == 0) continue;
+            const auto maskCoverage = static_cast<double>(mask[i]) / static_cast<double>(samples[i]);
+            const auto blendCoverage = static_cast<double>(blend[i]) / static_cast<double>(samples[i]);
+            const int current = maskCoverage >= 0.025 && maskCoverage >= blendCoverage * 2.0 ? 1
+                : blendCoverage >= 0.025 && blendCoverage >= maskCoverage * 2.0 ? -1 : 0;
+            if (current == 1) ++maskRichBands;
+            if (current == -1) ++blendRichBands;
+            if (current != 0 && current != previous) ++transitions;
+            if (current != 0) previous = current;
+        }
+        return maskRichBands >= 2 && blendRichBands >= 2 && transitions >= 3;
+    }
+
+    std::string describe() const
+    {
+        std::string result;
+        for (std::size_t i = 0; i < mask.size(); ++i)
+        {
+            if (mask[i] == 0 && blend[i] == 0) continue;
+            if (!result.empty()) result += ',';
+            result += std::to_string(i) + ':' + std::to_string(mask[i]) + '/' + std::to_string(blend[i]);
+        }
+        return result;
+    }
+};
+
+SmokeSceneViewAlphaSpatialCounts smokeScreenshotSceneViewAlphaSpatialCounts(
+    const std::filesystem::path& file, const std::array<float, 4>& normalizedSceneViewRect)
+{
+    SmokeSceneViewAlphaSpatialCounts counts;
+    std::ifstream input(file, std::ios::binary);
+    std::array<std::uint8_t, 18> header{};
+    if (!input.read(reinterpret_cast<char*>(header.data()), header.size()) || header[2] != 2 || header[16] != 32)
+        return counts;
+    const auto width = std::uint32_t(header[12]) | (std::uint32_t(header[13]) << 8);
+    const auto height = std::uint32_t(header[14]) | (std::uint32_t(header[15]) << 8);
+    if (!width || !height || std::uint64_t(width) * height > 100'000'000
+        || normalizedSceneViewRect[0] < 0.0f || normalizedSceneViewRect[1] < 0.0f
+        || normalizedSceneViewRect[2] > 1.0f || normalizedSceneViewRect[3] > 1.0f
+        || normalizedSceneViewRect[0] >= normalizedSceneViewRect[2]
+        || normalizedSceneViewRect[1] >= normalizedSceneViewRect[3]) return counts;
+    input.seekg(18u + header[0], std::ios::beg);
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(std::uint64_t(width) * height * 4));
+    if (!input.read(reinterpret_cast<char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()))) return counts;
+    const auto x0 = static_cast<std::uint32_t>(normalizedSceneViewRect[0] * float(width));
+    const auto y0 = static_cast<std::uint32_t>(normalizedSceneViewRect[1] * float(height));
+    const auto x1 = std::min(width, static_cast<std::uint32_t>(std::ceil(normalizedSceneViewRect[2] * float(width))));
+    const auto y1 = std::min(height, static_cast<std::uint32_t>(std::ceil(normalizedSceneViewRect[3] * float(height))));
+    if (x0 >= x1 || y0 >= y1) return counts;
+    const bool topOrigin = (header[17] & 0x20u) != 0, rightOrigin = (header[17] & 0x10u) != 0;
+    const auto rectWidth = x1 - x0;
+    for (std::uint32_t y = y0; y < y1; ++y)
+    {
+        const auto storedY = topOrigin ? y : height - 1u - y;
+        for (std::uint32_t x = x0; x < x1; ++x)
+        {
+            const auto storedX = rightOrigin ? width - 1u - x : x;
+            const auto offset = (std::size_t(storedY) * width + storedX) * 4;
+            const auto blue = pixels[offset], green = pixels[offset + 1], red = pixels[offset + 2];
+            const auto band = std::min<std::size_t>(63, (std::uint64_t(x - x0) * 64) / rectWidth);
+            ++counts.samples[band];
+            if (red >= 100 && blue >= 100 && green <= 80) ++counts.mask[band];
+            if (red >= 45 && red <= 80 && green >= 120 && green <= 155
+                && blue >= 155 && blue <= 200 && blue > green && green > red) ++counts.blend[band];
+        }
+    }
+    return counts;
 }
 
 #if defined(ASTRO_EDITOR_METADATA_VALIDATOR_DLL) && defined(ASTRO_EDITOR_DOTNET_ROOT)
@@ -1035,24 +2937,153 @@ bool hasChildren(const Scene& scene, const EntityId id)
     });
 }
 
+using HierarchyReparentHandler = std::function<bool(const std::vector<EntityId>&, std::optional<EntityId>)>;
+using HierarchyRowObserver = std::function<void(EntityId, ImVec2, ImVec2)>;
+
+constexpr const char* hierarchyEntityDragPayload = "ASTRO_ENGINE_HIERARCHY_IDS";
+
+bool hierarchySelectionContains(const std::vector<EntityId>& selection, const EntityId id)
+{
+    return std::find(selection.begin(), selection.end(), id) != selection.end();
+}
+
+std::vector<EntityId> hierarchyTopLevelSelection(const Scene& scene, std::vector<EntityId> selection)
+{
+    std::erase_if(selection, [&scene](const EntityId id) { return scene.find(id) == nullptr; });
+    std::sort(selection.begin(), selection.end());
+    selection.erase(std::unique(selection.begin(), selection.end()), selection.end());
+    std::vector<EntityId> roots;
+    roots.reserve(selection.size());
+    for (const auto id : selection)
+    {
+        const auto* entity = scene.find(id);
+        auto ancestor = entity ? entity->parent : std::nullopt;
+        bool selectedAncestor = false;
+        while (ancestor)
+        {
+            if (std::binary_search(selection.begin(), selection.end(), *ancestor))
+            {
+                selectedAncestor = true;
+                break;
+            }
+            const auto* parent = scene.find(*ancestor);
+            ancestor = parent ? parent->parent : std::nullopt;
+        }
+        if (!selectedAncestor) roots.push_back(id);
+    }
+    return roots;
+}
+
+void selectHierarchyEntity(std::optional<EntityId>& primary, std::vector<EntityId>& selection,
+    std::optional<EntityId>& pendingPlainClick, const EntityId id, const bool extend)
+{
+    const auto found = std::find(selection.begin(), selection.end(), id);
+    if (!extend && found != selection.end() && selection.size() > 1)
+    {
+        pendingPlainClick = id;
+        return;
+    }
+    pendingPlainClick.reset();
+    if (!extend)
+    {
+        selection.assign(1, id);
+        primary = id;
+        return;
+    }
+    if (found == selection.end())
+    {
+        selection.push_back(id);
+        primary = id;
+        return;
+    }
+    selection.erase(found);
+    if (primary == id)
+        primary = selection.empty() ? std::nullopt : std::optional<EntityId>{selection.back()};
+    if (!primary && !selection.empty()) primary = selection.back();
+}
+
+void drawHierarchyDropTarget(const Scene& scene, const std::optional<EntityId> newParent,
+    const HierarchyReparentHandler& reparent)
+{
+    if (!ImGui::BeginDragDropTarget()) return;
+    if (const auto* payload = ImGui::AcceptDragDropPayload(hierarchyEntityDragPayload))
+    {
+        const auto count = payload->DataSize > 0
+            ? static_cast<std::size_t>(payload->DataSize) / sizeof(EntityId) : 0;
+        if (payload->DataSize > 0 && payload->DataSize % static_cast<int>(sizeof(EntityId)) == 0
+            && count > 0 && count <= scene.entities().size() && payload->IsDelivery())
+        {
+            std::vector<EntityId> movingEntities(count);
+            std::memcpy(movingEntities.data(), payload->Data, count * sizeof(EntityId));
+            reparent(movingEntities, newParent);
+        }
+    }
+    ImGui::EndDragDropTarget();
+}
+
 void drawHierarchyBranch(const Scene& scene, const std::optional<EntityId> parent,
-    std::optional<EntityId>& selected)
+    std::optional<EntityId>& selected, std::vector<EntityId>& selection,
+    std::optional<EntityId>& pendingPlainClick,
+    const std::vector<EntityId>& forceOpenAncestors,
+    std::optional<EntityId>& focusEntity, bool& focusApplied, bool& selectedRowVisible,
+    const HierarchyReparentHandler& reparent, const HierarchyRowObserver& observeRow)
 {
     for (const auto& entity : scene.entities())
     {
         if (entity.parent != parent) continue;
         const bool children = hasChildren(scene, entity.id);
+        if (std::find(forceOpenAncestors.begin(), forceOpenAncestors.end(), entity.id) != forceOpenAncestors.end())
+            ImGui::SetNextItemOpen(true, ImGuiCond_Always);
         const std::string label = entity.name + "##" + std::to_string(entity.id);
         const auto flags = (children ? ImGuiTreeNodeFlags_OpenOnArrow : ImGuiTreeNodeFlags_Leaf)
+            | (children ? 0 : ImGuiTreeNodeFlags_NoTreePushOnOpen)
             | ImGuiTreeNodeFlags_SpanAvailWidth
-            | (selected == entity.id ? ImGuiTreeNodeFlags_Selected : 0);
-        if (ImGui::TreeNodeEx(label.c_str(), flags))
+            | (hierarchySelectionContains(selection, entity.id) ? ImGuiTreeNodeFlags_Selected : 0);
+        const bool opened = ImGui::TreeNodeEx(label.c_str(), flags);
+        if (opened)
         {
-            if (ImGui::IsItemClicked()) selected = entity.id;
-            if (children) drawHierarchyBranch(scene, entity.id, selected);
-            if (children) ImGui::TreePop();
+            if (ImGui::IsItemClicked())
+                selectHierarchyEntity(selected, selection, pendingPlainClick, entity.id, ImGui::GetIO().KeyCtrl);
+            if (selected == entity.id) selectedRowVisible = true;
+            if (selected == entity.id && focusEntity == entity.id)
+            {
+                ImGui::SetScrollHereY();
+                focusApplied = true;
+                focusEntity.reset();
+            }
         }
-        else if (ImGui::IsItemClicked()) selected = entity.id;
+        else
+        {
+            if (ImGui::IsItemClicked())
+                selectHierarchyEntity(selected, selection, pendingPlainClick, entity.id, ImGui::GetIO().KeyCtrl);
+            if (selected == entity.id) selectedRowVisible = true;
+            if (selected == entity.id && focusEntity == entity.id)
+            {
+                ImGui::SetScrollHereY();
+                focusApplied = true;
+                focusEntity.reset();
+            }
+        }
+        if (pendingPlainClick == entity.id && ImGui::IsItemDeactivated() && !ImGui::IsDragDropActive())
+            selectHierarchyEntity(selected, selection, pendingPlainClick, entity.id, false);
+        if (observeRow) observeRow(entity.id, ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+        if (ImGui::BeginDragDropSource())
+        {
+            std::vector<EntityId> draggedEntities = hierarchySelectionContains(selection, entity.id)
+                ? hierarchyTopLevelSelection(scene, selection) : std::vector<EntityId>{entity.id};
+            ImGui::SetDragDropPayload(hierarchyEntityDragPayload, draggedEntities.data(),
+                draggedEntities.size() * sizeof(EntityId));
+            if (draggedEntities.size() == 1) ImGui::TextUnformatted(entity.name.c_str());
+            else ImGui::Text(tr("%zu entities"), draggedEntities.size());
+            ImGui::EndDragDropSource();
+        }
+        drawHierarchyDropTarget(scene, entity.id, reparent);
+        if (opened && children)
+        {
+            drawHierarchyBranch(scene, entity.id, selected, selection, pendingPlainClick, forceOpenAncestors,
+                focusEntity, focusApplied, selectedRowVisible, reparent, observeRow);
+            ImGui::TreePop();
+        }
     }
 }
 
@@ -1955,14 +3986,1205 @@ struct SceneNodeLayout
     int row;
 };
 
-void drawInspector(Scene& scene, std::optional<EntityId>& selected, astro::core::CommandRegistry& commands,
+struct MeshMaterialInspectorState
+{
+    bool initialized = false;
+    astro::scene::SceneId scene = 0;
+    EntityId entity = 0;
+    astro::scene::ComponentId component = 0;
+    astro::assets::AssetId model{};
+    astro::assets::AssetId materialOverride{};
+    std::uint32_t meshIndex = 0;
+    std::uint32_t primitiveIndex = 0;
+    std::filesystem::path projectRoot;
+    std::string modelSourcePath;
+    std::optional<std::uint32_t> sourceMaterialIndex;
+    std::string sourceError;
+    std::string overrideError;
+    std::optional<astro::assets::MaterialAssetData> materialDraft;
+    bool materialDraftDirty = false;
+    bool sourceMaterialValid = false;
+    bool overrideValid = false;
+
+    bool panelDrawn = false;
+    bool sourceSlotShown = false;
+    bool materialChoicesShown = false;
+    bool projectOverrideChoiceShown = false;
+    bool sourceMaterialChoiceShown = false;
+    bool previewLimitsShown = false;
+    bool samplingControlsShown = false;
+};
+
+struct Camera3DInspectorState
+{
+    bool initialized = false;
+    astro::scene::SceneId scene = 0;
+    EntityId entity = 0;
+    astro::scene::ComponentId component = 0;
+    double verticalFovDegrees = 60.0;
+    double nearPlane = 0.1;
+    double farPlane = 1000.0;
+    bool panelDrawn = false;
+    bool lensControlsShown = false;
+    bool activeControlShown = false;
+};
+
+struct PrimitiveRendererInspectorState
+{
+    bool panelDrawn = false;
+    bool shapeControlShown = false;
+    bool visibilityControlShown = false;
+    astro::scene::Primitive3D primitive = astro::scene::Primitive3D::Cube;
+    bool visible = true;
+    EntityId entity = 0;
+    bool materialPanelDrawn = false;
+    bool materialChoiceShown = false;
+    EntityId materialEntity = 0;
+};
+
+struct PointLightInspectorState
+{
+    bool initialized = false;
+    astro::scene::SceneId scene = 0;
+    EntityId entity = 0;
+    astro::scene::ComponentId component = 0;
+    std::array<float, 3> color{1.0f, 1.0f, 1.0f};
+    float intensity = 1.0f;
+    float range = 10.0f;
+    bool enabled = true;
+    bool panelDrawn = false;
+    bool addButtonShown = false;
+    bool colorControlShown = false;
+    std::array<std::array<ImVec2, 2>, 3> colorSliderTrack{};
+    std::array<bool, 3> smokeColorChannelPointerEdited{};
+    bool intensityControlShown = false;
+    bool rangeControlShown = false;
+    bool enabledControlShown = false;
+    bool smokeEnabledPointerEdited = false;
+    bool keyboardEnabledFocused = false;
+    bool keyboardColorFocused = false;
+    bool keyboardIntensityFocused = false;
+    bool keyboardIntensityValueFocused = false;
+    bool keyboardIntensityValueActive = false;
+    ImVec2 keyboardIntensityValueCenter{};
+    bool keyboardIntensityActive = false;
+    bool keyboardIntensityWantsTextInput = false;
+    bool keyboardIntensityNavVisible = false;
+    bool smokeTestDraw = false;
+    bool smokeKeyboardEnabledFocused = false;
+    bool smokeKeyboardIntensityValueFocused = false;
+    bool smokeKeyboardIntensityValueActive = false;
+    ImVec2 smokeKeyboardIntensityValueCenter{};
+    bool smokeKeyboardIntensityWantsTextInput = false;
+    bool smokeKeyboardIntensityNavVisible = false;
+    bool smokeKeyboardEnabledEdited = false;
+    bool smokeKeyboardIntensityEdited = false;
+    ImVec2 enabledControlCenter{};
+    ImVec2 intensitySliderStart{};
+    ImVec2 intensitySliderEnd{};
+    bool smokeIntensityPointerEdited = false;
+    bool applyButtonShown = false;
+    bool applyButtonFocused = false;
+    bool applyButtonClicked = false;
+    bool applyButtonHovered = false;
+    ImVec2 applyButtonCenter{};
+    bool removeButtonShown = false;
+    bool smokeCommandsPassed = false;
+};
+
+struct DirectionalLightInspectorState
+{
+    bool initialized = false;
+    astro::scene::SceneId scene = 0;
+    EntityId entity = 0;
+    astro::scene::ComponentId component = 0;
+    std::array<float, 3> color{1.0f, 1.0f, 1.0f};
+    float intensity = 1.0f;
+    bool enabled = true;
+    bool panelDrawn = false;
+    bool addButtonShown = false;
+    bool colorControlShown = false;
+    std::array<std::array<ImVec2, 2>, 3> colorSliderTrack{};
+    std::array<bool, 3> smokeColorChannelPointerEdited{};
+    bool intensityControlShown = false;
+    bool enabledControlShown = false;
+    bool smokeEnabledPointerEdited = false;
+    bool keyboardEnabledFocused = false;
+    bool keyboardColorFocused = false;
+    bool keyboardIntensityFocused = false;
+    bool keyboardIntensityValueFocused = false;
+    bool keyboardIntensityValueActive = false;
+    ImVec2 keyboardIntensityValueCenter{};
+    bool keyboardIntensityActive = false;
+    bool keyboardIntensityWantsTextInput = false;
+    bool keyboardIntensityNavVisible = false;
+    bool smokeTestDraw = false;
+    bool smokeKeyboardEnabledFocused = false;
+    bool smokeKeyboardIntensityValueFocused = false;
+    bool smokeKeyboardIntensityValueActive = false;
+    ImVec2 smokeKeyboardIntensityValueCenter{};
+    bool smokeKeyboardIntensityWantsTextInput = false;
+    bool smokeKeyboardIntensityNavVisible = false;
+    bool smokeKeyboardEnabledEdited = false;
+    bool smokeKeyboardIntensityEdited = false;
+    ImVec2 enabledControlCenter{};
+    ImVec2 intensitySliderStart{};
+    ImVec2 intensitySliderEnd{};
+    bool smokeIntensityPointerEdited = false;
+    bool applyButtonShown = false;
+    bool applyButtonFocused = false;
+    bool applyButtonClicked = false;
+    bool applyButtonHovered = false;
+    ImVec2 applyButtonCenter{};
+    bool removeButtonShown = false;
+    bool smokeCommandsPassed = false;
+};
+
+struct MultiTransformInspectorTarget
+{
+    EntityId entity = 0;
+    astro::scene::ComponentId component = 0;
+    astro::scene::Transform before{};
+};
+
+struct MultiTransformInspectorState
+{
+    bool initialized = false;
+    astro::scene::SceneId scene = 0;
+    std::vector<EntityId> entities;
+    std::vector<MultiTransformInspectorTarget> targets;
+    std::array<std::optional<double>, 9> overrides{};
+    std::array<bool, 9> mixed{};
+    std::array<bool, 9> inputActive{};
+    std::array<bool, 9> inputHovered{};
+    std::array<ImVec2, 9> inputCenters{};
+    bool stale = false;
+    bool applyEnabled = false;
+    bool discardedForSelectionChange = false;
+    bool selectionDraftDiscardedMessageShown = false;
+    bool panelDrawn = false;
+};
+
+std::array<double, 9> transformFields(const astro::scene::Transform& value)
+{
+    return {value.position.x, value.position.y, value.position.z,
+        value.rotationDegrees.x, value.rotationDegrees.y, value.rotationDegrees.z,
+        value.scale.x, value.scale.y, value.scale.z};
+}
+
+void setTransformField(astro::scene::Transform& value, const std::size_t field, const double next)
+{
+    switch (field)
+    {
+    case 0: value.position.x = next; break;
+    case 1: value.position.y = next; break;
+    case 2: value.position.z = next; break;
+    case 3: value.rotationDegrees.x = next; break;
+    case 4: value.rotationDegrees.y = next; break;
+    case 5: value.rotationDegrees.z = next; break;
+    case 6: value.scale.x = next; break;
+    case 7: value.scale.y = next; break;
+    case 8: value.scale.z = next; break;
+    default: break;
+    }
+}
+
+void resetMultiTransformDraft(const Scene& scene, const std::vector<EntityId>& entities,
+    MultiTransformInspectorState& state)
+{
+    state.initialized = true;
+    state.scene = scene.id();
+    state.entities = entities;
+    state.targets.clear();
+    state.targets.reserve(entities.size());
+    state.overrides.fill(std::nullopt);
+    state.mixed.fill(false);
+    state.inputActive.fill(false);
+    state.inputHovered.fill(false);
+    state.inputCenters.fill(ImVec2{});
+    state.stale = false;
+    state.applyEnabled = false;
+    state.panelDrawn = false;
+    for (const auto id : entities)
+    {
+        const auto* transform = scene.transform(id);
+        if (!transform) continue;
+        state.targets.push_back({id, transform->id, transform->value});
+    }
+}
+
+bool applyMultiTransformDraft(Scene& scene, const std::vector<EntityId>& selectedEntities,
+    astro::core::CommandRegistry& commands, bool& sceneDirty, std::string& message,
+    MultiTransformInspectorState& state, const std::function<void(const std::string&)>& reportError)
+{
+    astro::scene::SetEntityTransformsPayload payload;
+    payload.assignments.reserve(state.targets.size());
+    for (const auto& target : state.targets)
+    {
+        auto next = target.before;
+        for (std::size_t field = 0; field < state.overrides.size(); ++field)
+            if (state.overrides[field]) setTransformField(next, field, *state.overrides[field]);
+        payload.assignments.push_back({target.entity, next});
+    }
+    const auto applied = commands.execute<astro::scene::SetEntityTransformsPayload, void>(
+        "entity.set_transforms", 1, payload);
+    if (!applied)
+    {
+        reportError(applied.error().message);
+        return false;
+    }
+    sceneDirty = true;
+    message = tr("Local Transform applied to selected entities");
+    resetMultiTransformDraft(scene, selectedEntities, state);
+    return true;
+}
+
+const char* primitive3DName(const astro::scene::Primitive3D primitive)
+{
+    switch (primitive)
+    {
+    case astro::scene::Primitive3D::Cube: return tr("Cube");
+    case astro::scene::Primitive3D::Plane: return tr("Plane");
+    case astro::scene::Primitive3D::Sphere: return tr("Sphere");
+    case astro::scene::Primitive3D::Cylinder: return tr("Cylinder");
+    }
+    return tr("Cube");
+}
+
+void drawPrimitiveRendererInspector(Scene& scene, const EntityId entityId,
+    astro::core::CommandRegistry& commands, bool& sceneDirty, std::string& message,
+    PrimitiveRendererInspectorState& state,
+    const std::function<void(const std::string&)>& reportError)
+{
+    const auto* component = scene.primitiveRenderer(entityId);
+    if (!component) return;
+
+    ImGui::SeparatorText(tr("PrimitiveRenderer"));
+    state.panelDrawn = true;
+    state.entity = entityId;
+    auto selectedPrimitive = component->primitive;
+    bool selectedVisible = component->visible;
+    state.primitive = component->primitive;
+    state.visible = component->visible;
+    const auto kinds = std::array{astro::scene::Primitive3D::Cube, astro::scene::Primitive3D::Plane,
+        astro::scene::Primitive3D::Sphere, astro::scene::Primitive3D::Cylinder};
+
+    state.shapeControlShown = true;
+    if (ImGui::BeginCombo(tr("Primitive shape"), primitive3DName(selectedPrimitive)))
+    {
+        for (const auto kind : kinds)
+        {
+            const bool isSelected = selectedPrimitive == kind;
+            if (ImGui::Selectable(primitive3DName(kind), isSelected)) selectedPrimitive = kind;
+            if (isSelected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    state.visibilityControlShown = true;
+    ImGui::Checkbox(tr("Visible"), &selectedVisible);
+
+    if (selectedPrimitive == component->primitive && selectedVisible == component->visible) return;
+    const astro::scene::SetPrimitiveRendererPayload payload{entityId, selectedPrimitive, selectedVisible};
+    const auto applied = commands.execute<astro::scene::SetPrimitiveRendererPayload, void>(
+        "entity.set_primitive_renderer", 1, payload);
+    if (!applied) reportError(applied.error().message);
+    else
+    {
+        sceneDirty = true;
+        message = tr("Primitive settings applied");
+        state.primitive = selectedPrimitive;
+        state.visible = selectedVisible;
+    }
+}
+
+void drawPrimitiveMaterialInspector(Scene& scene, const EntityId entityId,
+    astro::core::CommandRegistry& commands, bool& sceneDirty, std::string& message,
+    astro::assets::AssetRegistry* assets, PrimitiveRendererInspectorState& state,
+    const std::function<void(const std::string&)>& reportError)
+{
+    const auto* component = scene.primitiveRenderer(entityId);
+    if (!component) return;
+    ImGui::SeparatorText(tr("Primitive material"));
+    state.materialPanelDrawn = true;
+    state.materialEntity = entityId;
+    if (!assets)
+    {
+        ImGui::TextDisabled(tr("Open a project to assign a project material."));
+        return;
+    }
+    const auto* selected = component->materialOverride.value
+        ? assets->findMaterial(component->materialOverride) : nullptr;
+    if (component->materialOverride.value && !selected)
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+            tr("Primitive material reference is missing or stale."));
+        if (ImGui::Button(tr("Clear primitive material")))
+        {
+            const auto applied = commands.execute<astro::scene::SetPrimitiveMaterialOverridePayload, void>(
+                "entity.set_primitive_material_override", 1, {entityId, {}});
+            if (!applied) reportError(applied.error().message);
+            else { sceneDirty = true; message = tr("Primitive material cleared"); }
+        }
+    }
+    else if (selected)
+        ImGui::TextWrapped(tr("Assigned project material: %llu — %s"),
+            static_cast<unsigned long long>(component->materialOverride.value),
+            selected->sourceRelativePath.c_str());
+    else ImGui::TextDisabled(tr("No project material assigned; built-in vertex color is used."));
+
+    if (assets->materialEntries().empty())
+    {
+        ImGui::TextDisabled(tr("No registered project materials."));
+        return;
+    }
+    state.materialChoiceShown = true;
+    const std::string preview = selected ? selected->sourceRelativePath : std::string(tr("Select project material"));
+    if (ImGui::BeginCombo(tr("Project material"), preview.c_str()))
+    {
+        for (const auto& [materialId, reference] : assets->materialEntries())
+        {
+            const bool isSelected = materialId == component->materialOverride;
+            const std::string label = "#" + std::to_string(materialId.value) + "  " + reference.sourceRelativePath;
+            if (ImGui::Selectable(label.c_str(), isSelected) && !isSelected)
+            {
+                const auto resolved = assets->resolveMaterial(materialId);
+                if (!resolved) reportError(resolved.error().message);
+                else
+                {
+                    const auto applied = commands.execute<astro::scene::SetPrimitiveMaterialOverridePayload, void>(
+                        "entity.set_primitive_material_override", 1, {entityId, materialId});
+                    if (!applied) reportError(applied.error().message);
+                    else { sceneDirty = true; message = tr("Primitive material assigned"); }
+                }
+            }
+            if (isSelected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    if (component->materialOverride.value && selected && ImGui::Button(tr("Clear primitive material")))
+    {
+        const auto applied = commands.execute<astro::scene::SetPrimitiveMaterialOverridePayload, void>(
+            "entity.set_primitive_material_override", 1, {entityId, {}});
+        if (!applied) reportError(applied.error().message);
+        else { sceneDirty = true; message = tr("Primitive material cleared"); }
+    }
+    ImGui::TextDisabled(tr("Preview uses the project's base-color factor and UV0 texture."));
+}
+
+void drawPointLightInspector(Scene& scene, const EntityId entityId,
+    astro::core::CommandRegistry& commands, bool& sceneDirty, std::string& message,
+    PointLightInspectorState& state, const std::function<void(const std::string&)>& reportError)
+{
+    state.panelDrawn = false;
+    state.addButtonShown = false;
+    state.colorControlShown = false;
+    state.intensityControlShown = false;
+    state.rangeControlShown = false;
+    state.enabledControlShown = false;
+    state.applyButtonShown = false;
+    state.applyButtonClicked = false;
+    state.applyButtonHovered = false;
+    state.removeButtonShown = false;
+    ImGui::SeparatorText(tr("PointLight3D"));
+    state.panelDrawn = true;
+    const auto* component = scene.pointLight3D(entityId);
+    if (!component)
+    {
+        state.entity = entityId;
+        ImGui::TextDisabled(tr("This entity has no point light."));
+        if (ImGui::Button(tr("Add PointLight3D")))
+        {
+            const auto applied = commands.execute<astro::scene::AddPointLight3DPayload, void>(
+                "light3d.add_point", 1, {entityId});
+            if (!applied) reportError(applied.error().message);
+            else
+            {
+                sceneDirty = true;
+                message = tr("Point light added");
+                state.initialized = false;
+            }
+        }
+        state.addButtonShown = true;
+        return;
+    }
+
+    if (!state.initialized || state.scene != scene.id() || state.entity != entityId
+        || state.component != component->id)
+    {
+        state.scene = scene.id();
+        state.entity = entityId;
+        state.component = component->id;
+        state.color = component->color;
+        state.intensity = component->intensity;
+        state.range = component->range;
+        state.enabled = component->enabled;
+        state.initialized = true;
+    }
+    state.entity = entityId;
+
+    ImGui::TextDisabled(tr("Point light position follows the entity Transform."));
+    state.enabledControlShown = true;
+    const bool previousEnabled = state.enabled;
+    ImGui::Checkbox(tr("Enabled"), &state.enabled);
+    if (state.smokeTestDraw) state.smokeKeyboardEnabledFocused = ImGui::IsItemFocused();
+    else state.keyboardEnabledFocused = ImGui::IsItemFocused();
+    state.smokeEnabledPointerEdited = state.smokeEnabledPointerEdited || state.enabled != previousEnabled;
+    state.smokeKeyboardEnabledEdited = state.smokeKeyboardEnabledEdited || state.enabled != previousEnabled;
+    const auto enabledMinimum = ImGui::GetItemRectMin();
+    const auto enabledMaximum = ImGui::GetItemRectMax();
+    state.enabledControlCenter = ImVec2((enabledMinimum.x + enabledMaximum.x) * 0.5f,
+        (enabledMinimum.y + enabledMaximum.y) * 0.5f);
+    state.colorControlShown = true;
+    const ImVec2 colorSliderOrigin = ImGui::GetCursorScreenPos();
+    const float colorSliderFullWidth = ImGui::CalcItemWidth();
+    const float colorSliderSpacing = ImGui::GetStyle().ItemInnerSpacing.x;
+    const float colorSliderTotalWidth = colorSliderFullWidth - colorSliderSpacing * 2.0f;
+    const float firstChannelWidth = std::trunc(colorSliderTotalWidth / 3.0f);
+    const float secondChannelBoundary = std::trunc(colorSliderTotalWidth * 2.0f / 3.0f);
+    const std::array<float, 3> colorSliderWidths{
+        firstChannelWidth,
+        secondChannelBoundary - firstChannelWidth,
+        colorSliderTotalWidth - secondChannelBoundary};
+    const float colorSliderY = colorSliderOrigin.y + ImGui::GetFrameHeight() * 0.5f;
+    const auto previousColor = state.color;
+    ImGui::SliderFloat3(tr("Linear color (RGB)"), state.color.data(), 0.0f, 1.0f, "%.3f");
+    state.keyboardColorFocused = ImGui::IsItemFocused();
+    float channelX = colorSliderOrigin.x;
+    for (std::size_t channel = 0; channel < state.color.size(); ++channel)
+    {
+        state.smokeColorChannelPointerEdited[channel] = state.smokeColorChannelPointerEdited[channel]
+            || state.color[channel] != previousColor[channel];
+        state.colorSliderTrack[channel][0] = ImVec2(channelX + colorSliderWidths[channel] * 0.25f, colorSliderY);
+        state.colorSliderTrack[channel][1] = ImVec2(channelX + colorSliderWidths[channel] * 0.75f, colorSliderY);
+        channelX += colorSliderWidths[channel] + colorSliderSpacing;
+    }
+    state.intensityControlShown = true;
+    const float intensitySliderWidth = ImGui::CalcItemWidth();
+    const float previousIntensity = state.intensity;
+    ImGui::SliderFloat(tr("Intensity"), &state.intensity, 0.0f, 64.0f, "%.2f");
+    state.keyboardIntensityFocused = ImGui::IsItemFocused();
+    state.keyboardIntensityActive = ImGui::IsItemActive();
+    const auto intensityMinimum = ImGui::GetItemRectMin();
+    const auto intensityMaximum = ImGui::GetItemRectMax();
+    const float intensitySliderY = (intensityMinimum.y + intensityMaximum.y) * 0.5f;
+    state.intensitySliderStart = ImVec2(intensityMinimum.x + intensitySliderWidth * 0.25f, intensitySliderY);
+    state.intensitySliderEnd = ImVec2(intensityMinimum.x + intensitySliderWidth * 0.75f, intensitySliderY);
+    ImGui::InputFloat(tr("Intensity value"), &state.intensity, 0.1f, 1.0f, "%.2f",
+        ImGuiInputTextFlags_AutoSelectAll);
+    if (state.smokeTestDraw)
+    {
+        state.smokeKeyboardIntensityValueFocused = ImGui::IsItemFocused();
+        state.smokeKeyboardIntensityValueActive = ImGui::IsItemActive();
+    }
+    else
+    {
+        state.keyboardIntensityValueFocused = ImGui::IsItemFocused();
+        state.keyboardIntensityValueActive = ImGui::IsItemActive();
+    }
+    {
+        const auto minimum = ImGui::GetItemRectMin();
+        const auto maximum = ImGui::GetItemRectMax();
+        const ImVec2 center((minimum.x + maximum.x) * 0.5f, (minimum.y + maximum.y) * 0.5f);
+        if (state.smokeTestDraw) state.smokeKeyboardIntensityValueCenter = center;
+        else state.keyboardIntensityValueCenter = center;
+    }
+    if (state.smokeTestDraw)
+    {
+        state.smokeKeyboardIntensityWantsTextInput = ImGui::GetIO().WantTextInput;
+        state.smokeKeyboardIntensityNavVisible = ImGui::GetIO().NavVisible;
+    }
+    else
+    {
+        state.keyboardIntensityWantsTextInput = ImGui::GetIO().WantTextInput;
+        state.keyboardIntensityNavVisible = ImGui::GetIO().NavVisible;
+    }
+    state.smokeKeyboardIntensityEdited = state.smokeKeyboardIntensityEdited || state.intensity != previousIntensity;
+    state.smokeIntensityPointerEdited = state.smokeIntensityPointerEdited || state.intensity != previousIntensity;
+    state.rangeControlShown = true;
+    ImGui::InputFloat(tr("Range (scene units)"), &state.range, 0.1f, 1.0f, "%.2f");
+    ImGui::TextDisabled(tr("Range must be between 0.1 and 10000 scene units."));
+
+    const bool changed = state.color != component->color || state.intensity != component->intensity
+        || state.range != component->range || state.enabled != component->enabled;
+    ImGui::BeginDisabled(!changed);
+    const bool applyClicked = ImGui::Button(tr("Apply point light"));
+    state.applyButtonHovered = ImGui::IsItemHovered();
+    const auto applyMinimum = ImGui::GetItemRectMin();
+    const auto applyMaximum = ImGui::GetItemRectMax();
+    const ImVec2 applyCenter((applyMinimum.x + applyMaximum.x) * 0.5f,
+        (applyMinimum.y + applyMaximum.y) * 0.5f);
+    state.applyButtonCenter = applyCenter;
+    state.applyButtonClicked = applyClicked;
+    state.applyButtonFocused = ImGui::IsItemFocused();
+    if (applyClicked)
+    {
+        const astro::scene::SetPointLight3DPayload payload{
+            entityId, state.color, state.intensity, state.range, state.enabled};
+        const auto applied = commands.execute<astro::scene::SetPointLight3DPayload, void>(
+            "light3d.set_point", 1, payload);
+        if (!applied) reportError(applied.error().message);
+        else
+        {
+            sceneDirty = true;
+            message = tr("Point light settings applied");
+            state.initialized = false;
+        }
+    }
+    ImGui::EndDisabled();
+    state.applyButtonShown = true;
+
+    if (ImGui::Button(tr("Remove PointLight3D")))
+    {
+        const auto applied = commands.execute<astro::scene::RemovePointLight3DPayload, void>(
+            "light3d.remove_point", 1, {entityId});
+        if (!applied) reportError(applied.error().message);
+        else
+        {
+            sceneDirty = true;
+            message = tr("Point light removed");
+            state.initialized = false;
+        }
+    }
+    state.removeButtonShown = true;
+}
+
+void drawDirectionalLightInspector(Scene& scene, const EntityId entityId,
+    astro::core::CommandRegistry& commands, bool& sceneDirty, std::string& message,
+    DirectionalLightInspectorState& state, const std::function<void(const std::string&)>& reportError)
+{
+    state.panelDrawn = false;
+    state.addButtonShown = false;
+    state.colorControlShown = false;
+    state.intensityControlShown = false;
+    state.enabledControlShown = false;
+    state.applyButtonShown = false;
+    state.applyButtonClicked = false;
+    state.applyButtonHovered = false;
+    state.removeButtonShown = false;
+    ImGui::SeparatorText(tr("DirectionalLight3D"));
+    state.panelDrawn = true;
+    const auto* component = scene.directionalLight3D(entityId);
+    if (!component)
+    {
+        state.entity = entityId;
+        ImGui::TextDisabled(tr("This entity has no directional light."));
+        if (ImGui::Button(tr("Add DirectionalLight3D")))
+        {
+            const auto applied = commands.execute<astro::scene::AddDirectionalLight3DPayload, void>(
+                "light3d.add_directional", 1, {entityId});
+            if (!applied) reportError(applied.error().message);
+            else
+            {
+                sceneDirty = true;
+                message = tr("Directional light added");
+                state.initialized = false;
+            }
+        }
+        state.addButtonShown = true;
+        return;
+    }
+
+    if (!state.initialized || state.scene != scene.id() || state.entity != entityId
+        || state.component != component->id)
+    {
+        state.scene = scene.id();
+        state.entity = entityId;
+        state.component = component->id;
+        state.color = component->color;
+        state.intensity = component->intensity;
+        state.enabled = component->enabled;
+        state.initialized = true;
+    }
+    state.entity = entityId;
+
+    ImGui::TextDisabled(tr("Directional light follows local -Z and parent rotations."));
+    const auto direction = astro::render3d::resolveSceneDirectionalLightDirection(scene, entityId);
+    if (direction)
+        ImGui::Text(tr("Direction (world): %.2f, %.2f, %.2f"),
+            direction.value().x, direction.value().y, direction.value().z);
+    else
+        ImGui::TextDisabled(tr("World direction is unavailable for this Transform."));
+
+    state.enabledControlShown = true;
+    const bool previousEnabled = state.enabled;
+    ImGui::Checkbox(tr("Enabled"), &state.enabled);
+    if (state.smokeTestDraw) state.smokeKeyboardEnabledFocused = ImGui::IsItemFocused();
+    else state.keyboardEnabledFocused = ImGui::IsItemFocused();
+    state.smokeEnabledPointerEdited = state.smokeEnabledPointerEdited || state.enabled != previousEnabled;
+    state.smokeKeyboardEnabledEdited = state.smokeKeyboardEnabledEdited || state.enabled != previousEnabled;
+    const auto enabledMinimum = ImGui::GetItemRectMin();
+    const auto enabledMaximum = ImGui::GetItemRectMax();
+    state.enabledControlCenter = ImVec2((enabledMinimum.x + enabledMaximum.x) * 0.5f,
+        (enabledMinimum.y + enabledMaximum.y) * 0.5f);
+    state.colorControlShown = true;
+    const ImVec2 colorSliderOrigin = ImGui::GetCursorScreenPos();
+    const float colorSliderFullWidth = ImGui::CalcItemWidth();
+    const float colorSliderSpacing = ImGui::GetStyle().ItemInnerSpacing.x;
+    const float colorSliderTotalWidth = colorSliderFullWidth - colorSliderSpacing * 2.0f;
+    const float firstChannelWidth = std::trunc(colorSliderTotalWidth / 3.0f);
+    const float secondChannelBoundary = std::trunc(colorSliderTotalWidth * 2.0f / 3.0f);
+    const std::array<float, 3> colorSliderWidths{
+        firstChannelWidth,
+        secondChannelBoundary - firstChannelWidth,
+        colorSliderTotalWidth - secondChannelBoundary};
+    const float colorSliderY = colorSliderOrigin.y + ImGui::GetFrameHeight() * 0.5f;
+    const auto previousColor = state.color;
+    ImGui::SliderFloat3(tr("Linear color (RGB)"), state.color.data(), 0.0f, 1.0f, "%.3f");
+    state.keyboardColorFocused = ImGui::IsItemFocused();
+    float channelX = colorSliderOrigin.x;
+    for (std::size_t channel = 0; channel < state.color.size(); ++channel)
+    {
+        state.smokeColorChannelPointerEdited[channel] = state.smokeColorChannelPointerEdited[channel]
+            || state.color[channel] != previousColor[channel];
+        state.colorSliderTrack[channel][0] = ImVec2(channelX + colorSliderWidths[channel] * 0.25f, colorSliderY);
+        state.colorSliderTrack[channel][1] = ImVec2(channelX + colorSliderWidths[channel] * 0.75f, colorSliderY);
+        channelX += colorSliderWidths[channel] + colorSliderSpacing;
+    }
+    state.intensityControlShown = true;
+    const float intensitySliderWidth = ImGui::CalcItemWidth();
+    const float previousIntensity = state.intensity;
+    ImGui::SliderFloat(tr("Intensity"), &state.intensity, 0.0f, 64.0f, "%.2f");
+    state.keyboardIntensityFocused = ImGui::IsItemFocused();
+    state.keyboardIntensityActive = ImGui::IsItemActive();
+    const auto intensityMinimum = ImGui::GetItemRectMin();
+    const auto intensityMaximum = ImGui::GetItemRectMax();
+    const float intensitySliderY = (intensityMinimum.y + intensityMaximum.y) * 0.5f;
+    state.intensitySliderStart = ImVec2(intensityMinimum.x + intensitySliderWidth * 0.25f, intensitySliderY);
+    state.intensitySliderEnd = ImVec2(intensityMinimum.x + intensitySliderWidth * 0.75f, intensitySliderY);
+    ImGui::InputFloat(tr("Intensity value"), &state.intensity, 0.1f, 1.0f, "%.2f",
+        ImGuiInputTextFlags_AutoSelectAll);
+    if (state.smokeTestDraw)
+    {
+        state.smokeKeyboardIntensityValueFocused = ImGui::IsItemFocused();
+        state.smokeKeyboardIntensityValueActive = ImGui::IsItemActive();
+    }
+    else
+    {
+        state.keyboardIntensityValueFocused = ImGui::IsItemFocused();
+        state.keyboardIntensityValueActive = ImGui::IsItemActive();
+    }
+    {
+        const auto minimum = ImGui::GetItemRectMin();
+        const auto maximum = ImGui::GetItemRectMax();
+        const ImVec2 center((minimum.x + maximum.x) * 0.5f, (minimum.y + maximum.y) * 0.5f);
+        if (state.smokeTestDraw) state.smokeKeyboardIntensityValueCenter = center;
+        else state.keyboardIntensityValueCenter = center;
+    }
+    if (state.smokeTestDraw)
+    {
+        state.smokeKeyboardIntensityWantsTextInput = ImGui::GetIO().WantTextInput;
+        state.smokeKeyboardIntensityNavVisible = ImGui::GetIO().NavVisible;
+    }
+    else
+    {
+        state.keyboardIntensityWantsTextInput = ImGui::GetIO().WantTextInput;
+        state.keyboardIntensityNavVisible = ImGui::GetIO().NavVisible;
+    }
+    state.smokeKeyboardIntensityEdited = state.smokeKeyboardIntensityEdited || state.intensity != previousIntensity;
+    state.smokeIntensityPointerEdited = state.smokeIntensityPointerEdited || state.intensity != previousIntensity;
+
+    const bool changed = state.color != component->color || state.intensity != component->intensity
+        || state.enabled != component->enabled;
+    ImGui::BeginDisabled(!changed);
+    const bool applyClicked = ImGui::Button(tr("Apply directional light"));
+    state.applyButtonHovered = ImGui::IsItemHovered();
+    const auto applyMinimum = ImGui::GetItemRectMin();
+    const auto applyMaximum = ImGui::GetItemRectMax();
+    const ImVec2 applyCenter((applyMinimum.x + applyMaximum.x) * 0.5f,
+        (applyMinimum.y + applyMaximum.y) * 0.5f);
+    state.applyButtonCenter = applyCenter;
+    state.applyButtonClicked = applyClicked;
+    state.applyButtonFocused = ImGui::IsItemFocused();
+    if (applyClicked)
+    {
+        const astro::scene::SetDirectionalLight3DPayload payload{
+            entityId, state.color, state.intensity, state.enabled};
+        const auto applied = commands.execute<astro::scene::SetDirectionalLight3DPayload, void>(
+            "light3d.set_directional", 1, payload);
+        if (!applied) reportError(applied.error().message);
+        else
+        {
+            sceneDirty = true;
+            message = tr("Directional light settings applied");
+            state.initialized = false;
+        }
+    }
+    ImGui::EndDisabled();
+    state.applyButtonShown = true;
+
+    if (ImGui::Button(tr("Remove DirectionalLight3D")))
+    {
+        const auto applied = commands.execute<astro::scene::RemoveDirectionalLight3DPayload, void>(
+            "light3d.remove_directional", 1, {entityId});
+        if (!applied) reportError(applied.error().message);
+        else
+        {
+            sceneDirty = true;
+            message = tr("Directional light removed");
+            state.initialized = false;
+        }
+    }
+    state.removeButtonShown = true;
+}
+
+void drawCamera3DInspector(Scene& scene, const EntityId entityId,
+    astro::core::CommandRegistry& commands, bool& sceneDirty, std::string& message,
+    Camera3DInspectorState& state, const std::function<void(const std::string&)>& reportError)
+{
+    ImGui::SeparatorText(tr("Camera3D"));
+    state.panelDrawn = true;
+    const auto* camera = scene.camera3D(entityId);
+    if (!camera)
+    {
+        if (ImGui::Button(tr("Add 3D camera")))
+        {
+            const auto applied = commands.execute<astro::scene::AddCamera3DPayload, void>(
+                "camera3d.add", 1, {entityId});
+            if (!applied) reportError(applied.error().message);
+            else { sceneDirty = true; message = tr("Camera added"); state.initialized = false; }
+        }
+        return;
+    }
+
+    if (!state.initialized || state.scene != scene.id() || state.entity != entityId || state.component != camera->id)
+    {
+        state.scene = scene.id();
+        state.entity = entityId;
+        state.component = camera->id;
+        state.verticalFovDegrees = camera->verticalFovDegrees;
+        state.nearPlane = camera->nearPlane;
+        state.farPlane = camera->farPlane;
+        state.initialized = true;
+    }
+    state.lensControlsShown = true;
+    ImGui::TextDisabled(tr("Perspective lens; pose uses the entity Transform."));
+    ImGui::InputDouble(tr("Vertical FOV (degrees)"), &state.verticalFovDegrees, 1.0, 5.0, "%.2f");
+    ImGui::InputDouble(tr("Near plane"), &state.nearPlane, 0.01, 0.1, "%.4f");
+    ImGui::InputDouble(tr("Far plane"), &state.farPlane, 10.0, 100.0, "%.2f");
+    const bool lensChanged = state.verticalFovDegrees != camera->verticalFovDegrees
+        || state.nearPlane != camera->nearPlane || state.farPlane != camera->farPlane;
+    ImGui::BeginDisabled(!lensChanged);
+    if (ImGui::Button(tr("Apply camera lens")))
+    {
+        const astro::scene::SetCamera3DLensPayload payload{
+            entityId, state.verticalFovDegrees, state.nearPlane, state.farPlane};
+        const auto applied = commands.execute<astro::scene::SetCamera3DLensPayload, void>(
+            "camera3d.set_lens", 1, payload);
+        if (!applied) reportError(applied.error().message);
+        else { sceneDirty = true; message = tr("Camera lens applied"); state.initialized = false; }
+    }
+    ImGui::EndDisabled();
+    state.activeControlShown = true;
+    bool active = camera->active;
+    if (ImGui::Checkbox(tr("Active camera"), &active))
+    {
+        const auto applied = commands.execute<astro::scene::SetActiveCamera3DPayload, void>(
+            "camera3d.set_active", 1, {active ? entityId : 0});
+        if (!applied) reportError(applied.error().message);
+        else { sceneDirty = true; message = active ? tr("Active camera selected") : tr("Active camera cleared"); }
+    }
+    if (ImGui::Button(tr("Remove camera")))
+    {
+        const auto applied = commands.execute<astro::scene::RemoveCamera3DPayload, void>(
+            "camera3d.remove", 1, {entityId});
+        if (!applied) reportError(applied.error().message);
+        else { sceneDirty = true; message = tr("Camera removed"); state.initialized = false; }
+    }
+}
+
+void drawMeshMaterialInspector(Scene& scene, const EntityId entityId,
+    astro::core::CommandRegistry& commands, bool& sceneDirty, std::string& message,
+    astro::assets::AssetRegistry* assets, MeshMaterialInspectorState& state,
+    const std::function<void(const std::string&)>& reportError)
+{
+    ImGui::SeparatorText(tr("MeshRenderer material"));
+    state.panelDrawn = true;
+    const auto* component = scene.meshRenderer(entityId);
+    if (!component)
+    {
+        ImGui::TextDisabled(tr("This entity has no MeshRenderer component."));
+        return;
+    }
+
+    const auto projectRoot = assets ? assets->projectRoot() : std::filesystem::path{};
+    const auto* modelReference = assets ? assets->findModel(component->model) : nullptr;
+    const std::string modelSourcePath = modelReference ? modelReference->sourceRelativePath : std::string{};
+    const bool sameSelection = state.initialized && state.scene == scene.id() && state.entity == entityId
+        && state.component == component->id && state.model == component->model
+        && state.materialOverride == component->materialOverride && state.meshIndex == component->meshIndex
+        && state.primitiveIndex == component->primitiveIndex && state.projectRoot == projectRoot
+        && state.modelSourcePath == modelSourcePath;
+    if (ImGui::Button(tr("Refresh material slot"))) state.initialized = false;
+    if (!state.initialized || !sameSelection)
+    {
+        state.initialized = true;
+        state.scene = scene.id();
+        state.entity = entityId;
+        state.component = component->id;
+        state.model = component->model;
+        state.materialOverride = component->materialOverride;
+        state.meshIndex = component->meshIndex;
+        state.primitiveIndex = component->primitiveIndex;
+        state.projectRoot = projectRoot;
+        state.modelSourcePath = modelSourcePath;
+        state.sourceMaterialIndex.reset();
+        state.sourceError.clear();
+        state.overrideError.clear();
+        state.sourceMaterialValid = false;
+        state.overrideValid = false;
+        state.materialDraft.reset();
+        state.materialDraftDirty = false;
+
+        if (!assets)
+            state.sourceError = "Open a project to inspect imported material slots";
+        else if (component->materialOverride.value != 0)
+        {
+            if (!assets->findMaterial(component->materialOverride))
+                state.overrideError = "Material AssetId is not registered in this project";
+            else
+            {
+                const auto resolvedMaterial = assets->resolveMaterial(component->materialOverride);
+                if (!resolvedMaterial) state.overrideError = resolvedMaterial.error().message;
+                else
+                {
+                    state.overrideValid = true;
+                    state.materialDraft = resolvedMaterial.value().material;
+                }
+            }
+        }
+
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+        if (assets && modelReference)
+        {
+            const auto currentModel = assets->resolveModel(component->model);
+            if (!currentModel) state.sourceError = currentModel.error().message;
+            else
+            {
+                const auto sourceRelative = std::filesystem::path(std::u8string(u8"Assets"))
+                    / pathFromUtf8(modelReference->sourceRelativePath.c_str());
+                const auto imported = astro::render3d::GltfImporter::importFile(assets->projectRoot(), sourceRelative);
+                if (!imported) state.sourceError = imported.error().message;
+                else if (imported.value().contentHash != currentModel.value().importContentHash)
+                    state.sourceError = "Model changed; reimport and refresh the material slot";
+                else if (component->meshIndex >= imported.value().meshes.size())
+                    state.sourceError = "Mesh index is outside the imported model";
+                else
+                {
+                    const auto& mesh = imported.value().meshes[component->meshIndex];
+                    if (component->primitiveIndex >= mesh.primitives.size())
+                        state.sourceError = "Primitive index is outside the selected mesh";
+                    else if (component->primitiveIndex < mesh.primitiveMaterialIndices.size())
+                    {
+                        state.sourceMaterialIndex = mesh.primitiveMaterialIndices[component->primitiveIndex];
+                        if (state.sourceMaterialIndex
+                            && *state.sourceMaterialIndex >= imported.value().materials.size())
+                            state.sourceError = "Source material index is outside the imported material table";
+                        else state.sourceMaterialValid = true;
+                    }
+                    else state.sourceMaterialValid = true;
+                }
+            }
+        }
+        else if (assets && !modelReference)
+            state.sourceError = "Model AssetId is not registered in this project";
+#else
+        if (assets) state.sourceError = "The optional glTF importer is disabled in this Editor build";
+#endif
+    }
+
+    ImGui::Text(tr("Mesh: %u, primitive: %u"), component->meshIndex, component->primitiveIndex);
+    if (state.sourceMaterialValid)
+    {
+        state.sourceSlotShown = true;
+        if (state.sourceMaterialIndex)
+            ImGui::Text(tr("Source glTF material index: %u"), *state.sourceMaterialIndex);
+        else
+            ImGui::TextDisabled(tr("Source primitive has no glTF material."));
+    }
+    else
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "%s",
+            tr("Could not resolve the source material slot."));
+        ImGui::TextWrapped(tr("Details: %s"),
+            astro::editor::translateEditorDiagnostic(state.sourceError, gEditorLanguage).c_str());
+    }
+
+    if (component->materialOverride.value == 0)
+        ImGui::TextDisabled(tr("No project override; the source material is used."));
+    else if (!state.overrideValid)
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.35f, 1.0f), tr("Material reference is missing or stale."));
+        ImGui::TextWrapped(tr("Material AssetId: %llu"),
+            static_cast<unsigned long long>(component->materialOverride.value));
+        if (!state.overrideError.empty())
+            ImGui::TextWrapped(tr("Details: %s"),
+                astro::editor::translateEditorDiagnostic(state.overrideError, gEditorLanguage).c_str());
+    }
+    else
+    {
+        const auto* material = assets->findMaterial(component->materialOverride);
+        ImGui::TextWrapped(tr("Project material override: %llu — %s"),
+            static_cast<unsigned long long>(component->materialOverride.value),
+            material ? material->sourceRelativePath.c_str() : "");
+    }
+
+    if (component->materialOverride.value != 0)
+    {
+        if (state.overrideValid)
+        {
+            ImGui::Text(tr("Scene View preview source: project material override"));
+            state.projectOverrideChoiceShown = true;
+            if (state.sourceMaterialValid && state.sourceMaterialIndex)
+            {
+                ImGui::TextDisabled(tr("Clear the override to preview the glTF source material."));
+                state.sourceMaterialChoiceShown = true;
+            }
+        }
+        else
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f),
+                tr("Scene View preview: unresolved override; vertex-color fallback"));
+        }
+    }
+    else if (state.sourceMaterialValid && state.sourceMaterialIndex)
+    {
+        ImGui::Text(tr("Scene View preview source: glTF source material"));
+        state.sourceMaterialChoiceShown = true;
+    }
+    else
+    {
+        ImGui::TextDisabled(tr("Scene View preview source: imported vertex colors"));
+    }
+    ImGui::TextDisabled(tr("Scene View preview renders base-color factor and a local UV0 texture."));
+    ImGui::TextDisabled(tr("Source glTF sampler and UV transform apply on UV0; mip filters use generated mip levels."));
+    ImGui::TextDisabled(tr("Alpha and non-base-color PBR properties are not rendered by this preview."));
+    state.previewLimitsShown = true;
+
+    if (assets && component->materialOverride.value != 0 && state.overrideValid && state.materialDraft)
+    {
+        ImGui::SeparatorText(tr("Base-color sampling"));
+        state.samplingControlsShown = true;
+        auto& draft = *state.materialDraft;
+        bool changed = false;
+        const char* wrapLabels[]{tr("Repeat"), tr("Mirrored repeat"), tr("Clamp to edge")};
+        int wrapU = static_cast<int>(draft.baseColorWrapU);
+        int wrapV = static_cast<int>(draft.baseColorWrapV);
+        if (ImGui::Combo(tr("Wrap U"), &wrapU, wrapLabels, 3))
+        { draft.baseColorWrapU = static_cast<astro::assets::MaterialTextureWrapMode>(wrapU); changed = true; }
+        if (ImGui::Combo(tr("Wrap V"), &wrapV, wrapLabels, 3))
+        { draft.baseColorWrapV = static_cast<astro::assets::MaterialTextureWrapMode>(wrapV); changed = true; }
+        const char* minLabels[]{tr("Nearest"), tr("Linear"), tr("Nearest mip nearest"),
+            tr("Linear mip nearest"), tr("Nearest mip linear"), tr("Linear mip linear")};
+        int minFilter = static_cast<int>(draft.baseColorMinFilter);
+        if (ImGui::Combo(tr("Minification filter"), &minFilter, minLabels, 6))
+        { draft.baseColorMinFilter = static_cast<astro::assets::MaterialTextureMinFilter>(minFilter); changed = true; }
+        const char* magLabels[]{tr("Nearest"), tr("Linear")};
+        int magFilter = static_cast<int>(draft.baseColorMagFilter);
+        if (ImGui::Combo(tr("Magnification filter"), &magFilter, magLabels, 2))
+        { draft.baseColorMagFilter = static_cast<astro::assets::MaterialTextureMagFilter>(magFilter); changed = true; }
+        changed |= ImGui::InputFloat(tr("UV offset U"), &draft.baseColorUvTransform.offsetU, 0.1f, 1.0f, "%.3f");
+        changed |= ImGui::InputFloat(tr("UV offset V"), &draft.baseColorUvTransform.offsetV, 0.1f, 1.0f, "%.3f");
+        float rotationDegrees = draft.baseColorUvTransform.rotationRadians * (180.0f / 3.14159265358979323846f);
+        if (ImGui::InputFloat(tr("UV rotation degrees"), &rotationDegrees, 1.0f, 15.0f, "%.2f"))
+        { draft.baseColorUvTransform.rotationRadians = rotationDegrees * (3.14159265358979323846f / 180.0f); changed = true; }
+        changed |= ImGui::InputFloat(tr("UV scale U"), &draft.baseColorUvTransform.scaleU, 0.1f, 1.0f, "%.3f");
+        changed |= ImGui::InputFloat(tr("UV scale V"), &draft.baseColorUvTransform.scaleV, 0.1f, 1.0f, "%.3f");
+        if (changed)
+        {
+            draft.schemaVersion = 2;
+            state.materialDraftDirty = true;
+        }
+        if (state.materialDraftDirty) ImGui::TextDisabled(tr("Unsaved material edits"));
+        if (ImGui::Button(tr("Save material settings")) && state.materialDraftDirty)
+        {
+            const auto saved = assets->saveMaterial(component->materialOverride, draft);
+            if (!saved) reportError(saved.error().message);
+            else
+            {
+                state.materialDraftDirty = false;
+                message = tr("Material settings saved");
+                state.initialized = false;
+            }
+        }
+        if (draft.baseColorMinFilter != astro::assets::MaterialTextureMinFilter::Nearest
+            && draft.baseColorMinFilter != astro::assets::MaterialTextureMinFilter::Linear)
+            ImGui::TextDisabled(tr("Mipmaps are generated in linear space; oversized chains use vertex-color fallback."));
+    }
+
+    if (!assets)
+    {
+        ImGui::TextDisabled(tr("Material choices require an open project."));
+        return;
+    }
+    if (!assets->materialEntries().empty()) state.materialChoicesShown = true;
+    const auto currentLabel = [&]() {
+        if (component->materialOverride.value == 0) return std::string(tr("Use source material"));
+        const auto* material = assets->findMaterial(component->materialOverride);
+        if (!material)
+            return std::string(tr("Missing material")) + " — "
+                + std::to_string(component->materialOverride.value);
+        return std::to_string(component->materialOverride.value) + " — " + material->sourceRelativePath;
+    }();
+    if (ImGui::BeginCombo(tr("Project material"), currentLabel.c_str()))
+    {
+        const bool sourceSelected = component->materialOverride.value == 0;
+        if (ImGui::Selectable(tr("Use source material"), sourceSelected) && !sourceSelected)
+        {
+            const astro::scene::SetMeshMaterialOverridePayload payload{entityId, {}};
+            const auto applied = commands.execute<astro::scene::SetMeshMaterialOverridePayload, void>(
+                "entity.set_mesh_material_override", 1, payload);
+            if (!applied) reportError(applied.error().message);
+            else { sceneDirty = true; message = tr("Material override cleared"); state.initialized = false; }
+        }
+        for (const auto& [materialId, reference] : assets->materialEntries())
+        {
+            const auto label = std::to_string(materialId.value) + " — " + reference.sourceRelativePath;
+            const bool selectedMaterial = materialId == component->materialOverride;
+            if (ImGui::Selectable(label.c_str(), selectedMaterial) && !selectedMaterial)
+            {
+                const auto current = assets->resolveMaterial(materialId);
+                if (!current) reportError(current.error().message);
+                else
+                {
+                    const astro::scene::SetMeshMaterialOverridePayload payload{entityId, materialId};
+                    const auto applied = commands.execute<astro::scene::SetMeshMaterialOverridePayload, void>(
+                        "entity.set_mesh_material_override", 1, payload);
+                    if (!applied) reportError(applied.error().message);
+                    else { sceneDirty = true; message = tr("Material override applied"); state.initialized = false; }
+                }
+            }
+            if (selectedMaterial) ImGui::SetItemDefaultFocus();
+        }
+        if (assets->materialEntries().empty()) ImGui::TextDisabled(tr("No registered project materials."));
+        ImGui::EndCombo();
+    }
+}
+
+void drawMultiTransformInspector(Scene& scene, const std::vector<EntityId>& selectedEntities,
+    astro::core::CommandRegistry& commands, bool& sceneDirty, std::string& message,
+    MultiTransformInspectorState& state, const std::function<void(const std::string&)>& reportError)
+{
+    ImGui::Text(tr("%zu entities selected"), selectedEntities.size());
+    ImGui::SeparatorText(tr("Transform (Local)"));
+    ImGui::TextDisabled(tr("Local values are relative to each entity's parent."));
+
+    const bool selectionChanged = !state.initialized || state.scene != scene.id()
+        || state.entities != selectedEntities;
+    const bool hadPendingEdits = std::any_of(state.overrides.begin(), state.overrides.end(),
+        [](const auto& value) { return value.has_value(); });
+    if (selectionChanged)
+    {
+        resetMultiTransformDraft(scene, selectedEntities, state);
+        state.discardedForSelectionChange = hadPendingEdits;
+    }
+    state.panelDrawn = true;
+    state.selectionDraftDiscardedMessageShown = false;
+    if (state.discardedForSelectionChange)
+    {
+        ImGui::TextDisabled(tr("Selection changed; unapplied Transform edits were discarded."));
+        state.selectionDraftDiscardedMessageShown = true;
+        state.discardedForSelectionChange = false;
+    }
+
+    bool stale = state.targets.size() != state.entities.size();
+    for (const auto& target : state.targets)
+    {
+        const auto* current = scene.transform(target.entity);
+        if (!current || current->id != target.component || current->value != target.before)
+        {
+            stale = true;
+            break;
+        }
+    }
+
+    static constexpr std::array<const char*, 9> labels{
+        "Position X", "Position Y", "Position Z",
+        "Rotation X", "Rotation Y", "Rotation Z",
+        "Scale X", "Scale Y", "Scale Z"};
+    for (std::size_t field = 0; field < labels.size(); ++field)
+    {
+        double displayed = 0.0;
+        bool mixed = false;
+        if (!state.overrides[field] && !state.targets.empty())
+        {
+            displayed = transformFields(state.targets.front().before)[field];
+            for (std::size_t index = 1; index < state.targets.size(); ++index)
+                mixed = mixed || transformFields(state.targets[index].before)[field] != displayed;
+        }
+        else if (state.overrides[field]) displayed = *state.overrides[field];
+        state.mixed[field] = mixed;
+        if (mixed) ImGui::TextDisabled(tr("Mixed values: %s"), tr(labels[field]));
+        ImGui::PushID(static_cast<int>(field));
+        if (ImGui::InputDouble(mixed ? tr("Set value") : tr(labels[field]),
+                &displayed, 0.1, 1.0, "%.3f"))
+            state.overrides[field] = displayed;
+        state.inputActive[field] = ImGui::IsItemActive();
+        state.inputHovered[field] = ImGui::IsItemHovered();
+        const auto inputMin = ImGui::GetItemRectMin();
+        const auto inputMax = ImGui::GetItemRectMax();
+        state.inputCenters[field] = ImVec2((inputMin.x + inputMax.x) * 0.5f,
+            (inputMin.y + inputMax.y) * 0.5f);
+        ImGui::PopID();
+    }
+
+    bool hasChange = false;
+    for (std::size_t field = 0; field < state.overrides.size(); ++field)
+    {
+        if (!state.overrides[field]) continue;
+        for (const auto& target : state.targets)
+            hasChange = hasChange || transformFields(target.before)[field] != *state.overrides[field];
+    }
+    state.stale = stale;
+    state.applyEnabled = !stale && hasChange;
+    if (stale) ImGui::TextDisabled(tr("Scene Transform changed; reload this selection before applying."));
+    ImGui::BeginDisabled(stale || !hasChange);
+    const bool applyPressed = ImGui::Button(tr("Apply to selected"));
+    if (applyPressed)
+    {
+        (void)applyMultiTransformDraft(scene, selectedEntities, commands, sceneDirty, message,
+            state, reportError);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button(tr("Reload selection")))
+    {
+        resetMultiTransformDraft(scene, selectedEntities, state);
+        message = tr("Transform draft reloaded from the current Scene");
+    }
+}
+
+void drawInspector(Scene& scene, std::optional<EntityId>& selected, const std::vector<EntityId>& hierarchySelection,
+    MultiTransformInspectorState& multiTransformState, astro::core::CommandRegistry& commands,
     std::array<char, 256>& textDraft, std::optional<EntityId>& draftEntity,
     std::optional<astro::scene::SceneId>& draftScene, bool& sceneDirty, std::string& message,
-    const astro::assets::AssetRegistry* assets, astro::assets::ScriptBuildReport& csharpBuildReport,
+    astro::assets::AssetRegistry* assets, astro::assets::ScriptBuildReport& csharpBuildReport,
     std::uint64_t& selectedScriptAsset, bool& scriptAuthoringPanelDrawn,
+    MeshMaterialInspectorState& meshMaterialInspectorState,
+    Camera3DInspectorState& camera3DInspectorState,
+    PrimitiveRendererInspectorState& primitiveRendererInspectorState,
+    PointLightInspectorState& pointLightInspectorState,
+    DirectionalLightInspectorState& directionalLightInspectorState,
     const std::map<std::uint64_t, bgfx::TextureHandle>& textures,
     const std::function<void(const std::string&)>& reportError)
 {
+    std::vector<EntityId> selectedEntities;
+    selectedEntities.reserve(hierarchySelection.size() + (selected ? 1u : 0u));
+    for (const auto id : hierarchySelection)
+        if (scene.find(id)) selectedEntities.push_back(id);
+    if (selected && scene.find(*selected)) selectedEntities.push_back(*selected);
+    std::sort(selectedEntities.begin(), selectedEntities.end());
+    selectedEntities.erase(std::unique(selectedEntities.begin(), selectedEntities.end()), selectedEntities.end());
+    if (selectedEntities.size() > 1)
+    {
+        draftEntity.reset();
+        draftScene.reset();
+        drawMultiTransformInspector(scene, selectedEntities, commands, sceneDirty, message,
+            multiTransformState, reportError);
+        if (!selected || !scene.find(*selected)) return;
+        ImGui::SeparatorText(tr("Primary entity details"));
+        ImGui::TextDisabled(tr("Component editors below apply to the primary selected entity only."));
+    }
+    else multiTransformState.initialized = false;
     if (!selected || !scene.find(*selected))
     {
         draftEntity.reset();
@@ -1974,6 +5196,10 @@ void drawInspector(Scene& scene, std::optional<EntityId>& selected, astro::core:
     const auto entityId = *selected;
     ImGui::Text(tr("Entity %llu"), static_cast<unsigned long long>(entityId));
     ImGui::Separator();
+    drawPointLightInspector(scene, entityId, commands, sceneDirty, message,
+        pointLightInspectorState, reportError);
+    drawDirectionalLightInspector(scene, entityId, commands, sceneDirty, message,
+        directionalLightInspectorState, reportError);
     for (const auto& property : astro::scene::entityPropertySchema())
     {
         const auto value = scene.getProperty(entityId, property.id);
@@ -2018,6 +5244,13 @@ void drawInspector(Scene& scene, std::optional<EntityId>& selected, astro::core:
         ImGui::SameLine();
         ImGui::TextDisabled(tr("UTF-8, max %zu bytes"), property.maxLengthBytes);
     }
+    drawPrimitiveRendererInspector(scene, entityId, commands, sceneDirty, message,
+        primitiveRendererInspectorState, reportError);
+    drawPrimitiveMaterialInspector(scene, entityId, commands, sceneDirty, message, assets,
+        primitiveRendererInspectorState, reportError);
+    drawCamera3DInspector(scene, entityId, commands, sceneDirty, message, camera3DInspectorState, reportError);
+    drawMeshMaterialInspector(scene, entityId, commands, sceneDirty, message, assets,
+        meshMaterialInspectorState, reportError);
     ImGui::SeparatorText(tr("C# ScriptBehavior"));
     scriptAuthoringPanelDrawn = true;
     const auto scriptIsCurrent = [&](const astro::assets::AssetId assetId, const std::string_view managedType) {
@@ -2287,14 +5520,134 @@ class Editor
 {
     SDL_Window* window = nullptr;
     bool sdl = false, graphics = false, gui = false, platform = false;
+    int initialLogicalWidth_ = 1100, initialLogicalHeight_ = 720;
+    bool requestedHighPixelDensity_ = false;
+    bool clampGameViewWindowNextFrame_ = false;
+    bool windowGeometryEventPending_ = false;
+    bool windowGeometryEventObserved_ = false;
+    bool windowGeometrySmokePassed_ = false;
+    SDL_DisplayID monitorSourceDisplay_ = 0;
+    SDL_DisplayID monitorTargetDisplay_ = 0;
+    float monitorSourceScale_ = 1.0f;
+    float monitorTargetScale_ = 1.0f;
+    unsigned monitorTransitionEvents_ = 0;
+    int monitorTransitionPhase_ = 0;
+    bool monitorTransitionSmokePassed_ = false;
+    std::optional<astro::editor::EditorUiScalePolicy> uiScalePolicy_;
+    astro::editor::EditorWorkspaceLayoutPlan workspaceLayout_{};
     bgfx::ProgramHandle program = BGFX_INVALID_HANDLE;
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
-    bgfx::ProgramHandle program3d = BGFX_INVALID_HANDLE;
+    bgfx::ProgramHandle program3d = BGFX_INVALID_HANDLE, texturedProgram3d = BGFX_INVALID_HANDLE;
+    bgfx::ProgramHandle runtimeLitProgram3d = BGFX_INVALID_HANDLE, runtimeLitTexturedProgram3d = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle baseColorSampler3d = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle sceneAlphaParams3d = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle runtimeNormalMatrix3d = BGFX_INVALID_HANDLE, runtimeLightParams3d = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle runtimeLightDirections3d = BGFX_INVALID_HANDLE, runtimeLightColors3d = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle runtimePointPositions3d = BGFX_INVALID_HANDLE, runtimePointColors3d = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle runtimePointRanges3d = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle runtimeBaseColorFactor3d = BGFX_INVALID_HANDLE;
 #endif
     bgfx::TextureHandle font = BGFX_INVALID_HANDLE;
+    bgfx::TextureHandle sceneViewReadback = BGFX_INVALID_HANDLE;
+    bgfx::TextureHandle gameViewReadback = BGFX_INVALID_HANDLE;
+    bgfx::TextureHandle vulkanColorChartTexture = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle sampler = BGFX_INVALID_HANDLE, outputMode = BGFX_INVALID_HANDLE;
     bgfx::VertexLayout layout;
     std::map<std::uint64_t, bgfx::TextureHandle> spriteTextures;
+
+    void updateUiDisplayScale()
+    {
+        if (!uiScalePolicy_) return;
+        const auto displayScale = SDL_GetWindowDisplayScale(window);
+        auto& style = ImGui::GetStyle();
+        if (uiScalePolicy_->apply(displayScale, style))
+            std::cout << "[editor] uiScaleChanged=" << uiScalePolicy_->appliedScale()
+                      << " fontScale=" << style.FontScaleMain
+                      << " windowPadding=" << style.WindowPadding.x << 'x' << style.WindowPadding.y << '\n';
+    }
+
+    bool currentDisplayWorkArea(SDL_Rect& workArea) const
+    {
+        auto display = SDL_GetDisplayForWindow(window);
+        if (!display) display = SDL_GetPrimaryDisplay();
+        return display && SDL_GetDisplayUsableBounds(display, &workArea)
+            && workArea.w > 0 && workArea.h > 0;
+    }
+
+    void constrainWindowToCurrentDisplay()
+    {
+        SDL_Rect workArea{};
+        if (!currentDisplayWorkArea(workArea)) return;
+        int x = 0, y = 0, width = 0, height = 0;
+        if (!SDL_GetWindowPosition(window, &x, &y) || !SDL_GetWindowSize(window, &width, &height)) return;
+        const auto bounded = astro::editor::EditorWorkspaceLayoutPolicy::constrainWindow(
+            workArea.x, workArea.y, workArea.w, workArea.h, x, y, width, height);
+        workspaceLayout_ = astro::editor::EditorWorkspaceLayoutPolicy::calculate(
+            workArea.w, workArea.h, bounded.width, bounded.height);
+        if (bounded.width != width || bounded.height != height)
+            SDL_SetWindowSize(window, bounded.width, bounded.height);
+        if (bounded.x != x || bounded.y != y) SDL_SetWindowPosition(window, bounded.x, bounded.y);
+        clampGameViewWindowNextFrame_ = true;
+    }
+
+    bool configureMixedDpiTransitionSmoke()
+    {
+        int count = 0;
+        SDL_DisplayID* displays = SDL_GetDisplays(&count);
+        if (!displays || count < 2)
+        {
+            if (displays) SDL_free(displays);
+            std::cout << "[editor] mixedDpiTransition=skipped reason=requires-two-displays\n";
+            return false;
+        }
+
+        monitorSourceDisplay_ = SDL_GetDisplayForWindow(window);
+        if (!monitorSourceDisplay_) monitorSourceDisplay_ = SDL_GetPrimaryDisplay();
+        monitorSourceScale_ = SDL_GetWindowDisplayScale(window);
+        if (!std::isfinite(monitorSourceScale_) || monitorSourceScale_ <= 0.0f)
+            monitorSourceScale_ = SDL_GetDisplayContentScale(monitorSourceDisplay_);
+
+        for (int index = 0; index < count; ++index)
+        {
+            const auto display = displays[index];
+            SDL_Rect bounds{};
+            const auto scale = SDL_GetDisplayContentScale(display);
+            if (SDL_GetDisplayBounds(display, &bounds))
+                std::cout << "[editor] monitor id=" << display << " bounds=" << bounds.x << ',' << bounds.y
+                          << ',' << bounds.w << 'x' << bounds.h << " contentScale=" << scale << '\n';
+            if (display != monitorSourceDisplay_ && std::isfinite(scale) && scale > 0.0f
+                && std::abs(scale - monitorSourceScale_) >= 0.01f && !monitorTargetDisplay_)
+            {
+                monitorTargetDisplay_ = display;
+                monitorTargetScale_ = scale;
+            }
+        }
+        SDL_free(displays);
+        if (!monitorSourceDisplay_ || !monitorTargetDisplay_)
+        {
+            std::cout << "[editor] mixedDpiTransition=skipped reason=no-distinct-content-scales"
+                      << " sourceScale=" << monitorSourceScale_ << '\n';
+            return false;
+        }
+        std::cout << "[editor] mixedDpiPair source=" << monitorSourceDisplay_ << '@' << monitorSourceScale_
+                  << " target=" << monitorTargetDisplay_ << '@' << monitorTargetScale_ << '\n';
+        return true;
+    }
+
+    bool positionWindowOnDisplay(const SDL_DisplayID display)
+    {
+        SDL_Rect workArea{};
+        if (!SDL_GetDisplayUsableBounds(display, &workArea) || workArea.w <= 0 || workArea.h <= 0)
+            return false;
+        int width = 0, height = 0;
+        if (!SDL_GetWindowSize(window, &width, &height)) return false;
+        const auto plan = astro::editor::EditorWorkspaceLayoutPolicy::calculate(
+            workArea.w, workArea.h, width, height);
+        SDL_SetWindowSize(window, plan.windowWidth, plan.windowHeight);
+        SDL_SetWindowPosition(window, workArea.x + (workArea.w - plan.windowWidth) / 2,
+            workArea.y + (workArea.h - plan.windowHeight) / 2);
+        return SDL_SyncWindow(window);
+    }
 
 public:
     ~Editor()
@@ -2306,9 +5659,25 @@ public:
             for (const auto& [id, texture] : spriteTextures)
                 if (bgfx::isValid(texture)) bgfx::destroy(texture);
             if (bgfx::isValid(font)) bgfx::destroy(font);
+            if (bgfx::isValid(sceneViewReadback)) bgfx::destroy(sceneViewReadback);
+            if (bgfx::isValid(gameViewReadback)) bgfx::destroy(gameViewReadback);
+            if (bgfx::isValid(vulkanColorChartTexture)) bgfx::destroy(vulkanColorChartTexture);
             if (bgfx::isValid(program)) bgfx::destroy(program);
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
             if (bgfx::isValid(program3d)) bgfx::destroy(program3d);
+            if (bgfx::isValid(texturedProgram3d)) bgfx::destroy(texturedProgram3d);
+            if (bgfx::isValid(runtimeLitProgram3d)) bgfx::destroy(runtimeLitProgram3d);
+            if (bgfx::isValid(runtimeLitTexturedProgram3d)) bgfx::destroy(runtimeLitTexturedProgram3d);
+            if (bgfx::isValid(baseColorSampler3d)) bgfx::destroy(baseColorSampler3d);
+            if (bgfx::isValid(sceneAlphaParams3d)) bgfx::destroy(sceneAlphaParams3d);
+            if (bgfx::isValid(runtimeNormalMatrix3d)) bgfx::destroy(runtimeNormalMatrix3d);
+            if (bgfx::isValid(runtimeLightParams3d)) bgfx::destroy(runtimeLightParams3d);
+            if (bgfx::isValid(runtimeLightDirections3d)) bgfx::destroy(runtimeLightDirections3d);
+            if (bgfx::isValid(runtimeLightColors3d)) bgfx::destroy(runtimeLightColors3d);
+            if (bgfx::isValid(runtimePointPositions3d)) bgfx::destroy(runtimePointPositions3d);
+            if (bgfx::isValid(runtimePointColors3d)) bgfx::destroy(runtimePointColors3d);
+            if (bgfx::isValid(runtimePointRanges3d)) bgfx::destroy(runtimePointRanges3d);
+            if (bgfx::isValid(runtimeBaseColorFactor3d)) bgfx::destroy(runtimeBaseColorFactor3d);
 #endif
             if (bgfx::isValid(sampler)) bgfx::destroy(sampler);
             if (bgfx::isValid(outputMode)) bgfx::destroy(outputMode);
@@ -2343,24 +5712,71 @@ public:
             return BGFX_INVALID_HANDLE;
         const auto* memory = bgfx::copy(pixels.data(), static_cast<std::uint32_t>(pixels.size()));
         return bgfx::createTexture2D(static_cast<std::uint16_t>(width), static_cast<std::uint16_t>(height),
-            false, 1, bgfx::TextureFormat::BGRA8, BGFX_TEXTURE_NONE, memory);
+            false, 1, bgfx::TextureFormat::BGRA8,
+            bgfxSupportsSrgbBgra8Target() ? BGFX_TEXTURE_SRGB_MUTABLE : BGFX_TEXTURE_NONE, memory);
     }
 
-    void init()
+    void init(const int logicalWidth = 1100, const int logicalHeight = 720,
+        const bool requestHighPixelDensity = false, const bool requestVulkanBackend = false)
     {
+#if !defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+        if (requestVulkanBackend)
+            throw std::runtime_error("Vulkan renderer smoke requires the Editor 3D shader target");
+#endif
         if (!SDL_Init(SDL_INIT_VIDEO)) throw std::runtime_error(SDL_GetError());
         sdl = true;
-        window = SDL_CreateWindow("AstroEngine Editor", 1100, 720, SDL_WINDOW_RESIZABLE);
+        auto primaryDisplay = SDL_GetPrimaryDisplay();
+        SDL_Rect workArea{};
+        if (!primaryDisplay || !SDL_GetDisplayUsableBounds(primaryDisplay, &workArea)
+            || workArea.w <= 0 || workArea.h <= 0)
+        {
+            workArea = SDL_Rect{0, 0, logicalWidth, logicalHeight};
+            primaryDisplay = 0;
+        }
+        workspaceLayout_ = astro::editor::EditorWorkspaceLayoutPolicy::calculate(
+            workArea.w, workArea.h, logicalWidth, logicalHeight);
+        initialLogicalWidth_ = workspaceLayout_.windowWidth;
+        initialLogicalHeight_ = workspaceLayout_.windowHeight;
+        requestedHighPixelDensity_ = requestHighPixelDensity;
+        const auto windowFlags = SDL_WINDOW_RESIZABLE
+            | (requestHighPixelDensity ? SDL_WINDOW_HIGH_PIXEL_DENSITY : 0);
+        window = SDL_CreateWindow("AstroEngine Editor", initialLogicalWidth_, initialLogicalHeight_, windowFlags);
         if (!window) throw std::runtime_error(SDL_GetError());
+        if (primaryDisplay) SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED_DISPLAY(primaryDisplay),
+            SDL_WINDOWPOS_CENTERED_DISPLAY(primaryDisplay));
+        int pixelWidth = 0, pixelHeight = 0;
+        if (!SDL_GetWindowSizeInPixels(window, &pixelWidth, &pixelHeight)
+            || pixelWidth <= 0 || pixelHeight <= 0)
+            throw std::runtime_error("SDL did not report valid initial Editor window pixels");
         bgfx::Init config;
-        config.type = bgfx::RendererType::Direct3D11;
+        config.type = requestVulkanBackend ? bgfx::RendererType::Vulkan : bgfx::RendererType::Direct3D11;
         config.fallback = false;
         config.swapChain.nwh = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
-        config.swapChain.width = 1100;
-        config.swapChain.height = 720;
+        config.swapChain.width = static_cast<std::uint32_t>(pixelWidth);
+        config.swapChain.height = static_cast<std::uint32_t>(pixelHeight);
         config.reset = BGFX_RESET_VSYNC;
-        if (!config.swapChain.nwh || !bgfx::init(config)) throw std::runtime_error("bgfx D3D11 initialization failed");
+        if (!config.swapChain.nwh || !bgfx::init(config))
+            throw std::runtime_error(requestVulkanBackend ? "bgfx Vulkan initialization failed" : "bgfx D3D11 initialization failed");
         graphics = true;
+        if (requestVulkanBackend && bgfx::getCaps())
+        {
+            std::string formatProbeError;
+            const auto surfaceFormat = astro::editor::inspectVulkanSurfaceFormat(
+                window, bgfx::getCaps()->vendorId, bgfx::getCaps()->deviceId, formatProbeError);
+            if (!surfaceFormat)
+                throw std::runtime_error("Could not inspect the selected Vulkan surface format: " + formatProbeError);
+            std::cout << "[editor-vulkan-surface] device=" << surfaceFormat->deviceName
+                << " availableSrgbNonlinear=" << surfaceFormat->availableFormats
+                << " bgfxRequested=BGRA8 srgbBackbuffer=0 selected=" << surfaceFormat->selectedVkFormat
+                << " bgfxColor=" << surfaceFormat->selectedBgfxFormat
+                << " colorSpace=" << surfaceFormat->colorSpace << '\n';
+            std::cout << "[editor-renderer-caps] BGRA8=" << bgfx::getCaps()->formats[bgfx::TextureFormat::BGRA8]
+                << " D24S8=" << bgfx::getCaps()->formats[bgfx::TextureFormat::D24S8]
+                << " D32F=" << bgfx::getCaps()->formats[bgfx::TextureFormat::D32F]
+                << " D24=" << bgfx::getCaps()->formats[bgfx::TextureFormat::D24]
+                << " D16=" << bgfx::getCaps()->formats[bgfx::TextureFormat::D16]
+                << " srgbTarget=" << bgfxSupportsSrgbBgra8Target() << '\n';
+        }
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
         gui = true;
@@ -2368,7 +5784,8 @@ public:
         io.ConfigFlags |= ImGuiConfigFlags_DockingEnable | ImGuiConfigFlags_NavEnableKeyboard;
         io.IniFilename = nullptr; // No changes to user layout or project files.
         io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
-        if (!ImGui_ImplSDL3_InitForD3D(window)) throw std::runtime_error("ImGui SDL3 backend failed");
+        if (!(requestVulkanBackend ? ImGui_ImplSDL3_InitForOther(window) : ImGui_ImplSDL3_InitForD3D(window)))
+            throw std::runtime_error("ImGui SDL3 backend failed");
         platform = true;
         std::array<wchar_t, MAX_PATH> windowsDirectory{};
         const auto windowsLength = GetWindowsDirectoryW(windowsDirectory.data(), static_cast<UINT>(windowsDirectory.size()));
@@ -2393,14 +5810,15 @@ public:
         if (!cyrillicFontLoaded)
             throw std::runtime_error("Could not load Segoe UI or Arial with Cyrillic glyphs");
         ImGui::StyleColorsDark();
+        uiScalePolicy_.emplace(ImGui::GetStyle());
+        updateUiDisplayScale();
         layout.begin().add(bgfx::Attrib::Position, 2, bgfx::AttribType::Float)
             .add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float)
             .add(bgfx::Attrib::Color0, 4, bgfx::AttribType::Uint8, true).end();
         static_assert(sizeof(ImDrawVert) == 20);
-        program = bgfx::createProgram(
-            bgfx::createShader(bgfx::copy(vs_ocornut_imgui_dxbc, sizeof(vs_ocornut_imgui_dxbc))),
-            bgfx::createShader(bgfx::copy(fs_ocornut_imgui_dxbc, sizeof(fs_ocornut_imgui_dxbc))), true);
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+        const auto shaderDirectory = std::filesystem::path(ASTRO_EDITOR_3D_SHADER_DIR)
+            / (requestVulkanBackend ? "vulkan" : "");
         const auto readShader = [](const std::filesystem::path& path) {
             std::ifstream input(path, std::ios::binary);
             if (!input) throw std::runtime_error("Cannot read 3D Scene View shader: " + path.string());
@@ -2409,11 +5827,54 @@ public:
                 throw std::runtime_error("Invalid 3D Scene View shader size: " + path.string());
             return data;
         };
-        const auto vertexBytes = readShader(std::filesystem::path(ASTRO_EDITOR_3D_SHADER_DIR) / "vs_cubes.bin");
-        const auto fragmentBytes = readShader(std::filesystem::path(ASTRO_EDITOR_3D_SHADER_DIR) / "fs_cubes.bin");
+        if (requestVulkanBackend)
+        {
+            const auto imguiVertexBytes = readShader(shaderDirectory / "vs_ocornut_imgui.bin");
+            const auto imguiFragmentBytes = readShader(shaderDirectory / "fs_ocornut_imgui.bin");
+            program = bgfx::createProgram(
+                bgfx::createShader(bgfx::copy(imguiVertexBytes.data(), static_cast<std::uint32_t>(imguiVertexBytes.size()))),
+                bgfx::createShader(bgfx::copy(imguiFragmentBytes.data(), static_cast<std::uint32_t>(imguiFragmentBytes.size()))), true);
+        }
+        else
+        {
+            program = bgfx::createProgram(
+                bgfx::createShader(bgfx::copy(vs_ocornut_imgui_dxbc, sizeof(vs_ocornut_imgui_dxbc))),
+                bgfx::createShader(bgfx::copy(fs_ocornut_imgui_dxbc, sizeof(fs_ocornut_imgui_dxbc))), true);
+        }
+        const auto vertexBytes = readShader(shaderDirectory / "vs_cubes.bin");
+        const auto fragmentBytes = readShader(shaderDirectory / "fs_scene_color.bin");
         program3d = bgfx::createProgram(
             bgfx::createShader(bgfx::copy(vertexBytes.data(), static_cast<std::uint32_t>(vertexBytes.size()))),
             bgfx::createShader(bgfx::copy(fragmentBytes.data(), static_cast<std::uint32_t>(fragmentBytes.size()))), true);
+        const auto texturedVertexBytes = readShader(shaderDirectory / "vs_stencil_texture.bin");
+        const auto texturedFragmentBytes = readShader(shaderDirectory / "fs_scene_textured.bin");
+        texturedProgram3d = bgfx::createProgram(
+            bgfx::createShader(bgfx::copy(texturedVertexBytes.data(), static_cast<std::uint32_t>(texturedVertexBytes.size()))),
+            bgfx::createShader(bgfx::copy(texturedFragmentBytes.data(), static_cast<std::uint32_t>(texturedFragmentBytes.size()))), true);
+        baseColorSampler3d = bgfx::createUniform("s_texColor", bgfx::UniformType::Sampler);
+        sceneAlphaParams3d = bgfx::createUniform("u_alphaParams", bgfx::UniformType::Vec4);
+        const auto runtimeLitColorVertex = readShader(shaderDirectory / "vs_scene_lit_color.bin");
+        const auto runtimeLitColorFragment = readShader(shaderDirectory / "fs_scene_lit_color.bin");
+        runtimeLitProgram3d = bgfx::createProgram(
+            bgfx::createShader(bgfx::copy(runtimeLitColorVertex.data(), static_cast<std::uint32_t>(runtimeLitColorVertex.size()))),
+            bgfx::createShader(bgfx::copy(runtimeLitColorFragment.data(), static_cast<std::uint32_t>(runtimeLitColorFragment.size()))), true);
+        const auto runtimeLitTexturedVertex = readShader(shaderDirectory / "vs_scene_lit_textured.bin");
+        const auto runtimeLitTexturedFragment = readShader(shaderDirectory / "fs_scene_lit_textured.bin");
+        runtimeLitTexturedProgram3d = bgfx::createProgram(
+            bgfx::createShader(bgfx::copy(runtimeLitTexturedVertex.data(), static_cast<std::uint32_t>(runtimeLitTexturedVertex.size()))),
+            bgfx::createShader(bgfx::copy(runtimeLitTexturedFragment.data(), static_cast<std::uint32_t>(runtimeLitTexturedFragment.size()))), true);
+        runtimeNormalMatrix3d = bgfx::createUniform("u_normalMatrix", bgfx::UniformType::Mat3);
+        runtimeLightParams3d = bgfx::createUniform("u_lightParams", bgfx::UniformType::Vec4);
+        runtimeLightDirections3d = bgfx::createUniform("u_lightDirection", bgfx::UniformType::Vec4, 4);
+        runtimeLightColors3d = bgfx::createUniform("u_lightColor", bgfx::UniformType::Vec4, 4);
+        runtimePointPositions3d = bgfx::createUniform("u_pointPosition", bgfx::UniformType::Vec4, 4);
+        runtimePointColors3d = bgfx::createUniform("u_pointColor", bgfx::UniformType::Vec4, 4);
+        runtimePointRanges3d = bgfx::createUniform("u_pointRange", bgfx::UniformType::Vec4, 4);
+        runtimeBaseColorFactor3d = bgfx::createUniform("u_baseColorFactor", bgfx::UniformType::Vec4);
+#else
+        program = bgfx::createProgram(
+            bgfx::createShader(bgfx::copy(vs_ocornut_imgui_dxbc, sizeof(vs_ocornut_imgui_dxbc))),
+            bgfx::createShader(bgfx::copy(fs_ocornut_imgui_dxbc, sizeof(fs_ocornut_imgui_dxbc))), true);
 #endif
         sampler = bgfx::createUniform("s_tex", bgfx::UniformType::Sampler);
         outputMode = bgfx::createUniform("u_imguiOutput", bgfx::UniformFreq::Frame, bgfx::UniformType::Vec4);
@@ -2424,7 +5885,14 @@ public:
             bgfx::TextureFormat::RGBA8, 0, bgfx::copy(pixels, width * height * 4));
         if (!bgfx::isValid(program) || !bgfx::isValid(font) || !bgfx::isValid(sampler) || !bgfx::isValid(outputMode)
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
-            || !bgfx::isValid(program3d)
+            || !bgfx::isValid(program3d) || !bgfx::isValid(texturedProgram3d)
+            || !bgfx::isValid(baseColorSampler3d) || !bgfx::isValid(sceneAlphaParams3d)
+            || !bgfx::isValid(runtimeLitProgram3d) || !bgfx::isValid(runtimeLitTexturedProgram3d)
+            || !bgfx::isValid(runtimeNormalMatrix3d) || !bgfx::isValid(runtimeLightParams3d)
+            || !bgfx::isValid(runtimeLightDirections3d) || !bgfx::isValid(runtimeLightColors3d)
+            || !bgfx::isValid(runtimePointPositions3d) || !bgfx::isValid(runtimePointColors3d)
+            || !bgfx::isValid(runtimePointRanges3d)
+            || !bgfx::isValid(runtimeBaseColorFactor3d)
 #endif
             )
             throw std::runtime_error("Renderer resource creation failed");
@@ -2436,7 +5904,9 @@ public:
     void draw(ImDrawData* data, int width, int height)
     {
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
-        constexpr bgfx::ViewId renderOrder[] = {1, 3, 2, 0};
+        // Render each target's clear/2D pass before its 3D pass; otherwise Game View's
+        // color clear would erase the Runtime BGFX submissions before ImGui samples it.
+        constexpr bgfx::ViewId renderOrder[] = {1, 2, 3, 4, 5, 7, 0};
 #else
         constexpr bgfx::ViewId renderOrder[] = {1, 2, 0};
 #endif
@@ -2477,7 +5947,7 @@ public:
                 bgfx::setScissor(uint16_t(x), uint16_t(y), uint16_t(right - x), uint16_t(bottom - y));
                 bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_MSAA |
                     BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_SRC_ALPHA, BGFX_STATE_BLEND_INV_SRC_ALPHA));
-                bgfx::setTexture(0, sampler, bgfx::TextureHandle{uint16_t(command.GetTexID() - 1)});
+                bgfx::setTexture(0, sampler, bgfx::TextureHandle{uint16_t(command.GetTexID() - 1)}, BGFX_SAMPLER_NONE);
                 bgfx::setVertexBuffer(0, &vertices, command.VtxOffset, list->VtxBuffer.Size - command.VtxOffset);
                 bgfx::setIndexBuffer(&indices, command.IdxOffset, command.ElemCount);
                 bgfx::submit(0, program);
@@ -2485,8 +5955,67 @@ public:
         }
     }
 
-    int run(bool smoke, bool benchmark, bool benchmark3d, bool inspectCopyDialog)
+    int run(bool smoke, bool benchmark, bool benchmark3d, bool inspectCopyDialog, bool windowGeometrySmoke,
+        bool monitorDpiSmoke,
+        const int alphaMaskBoundaryCase, const int maskMipUvScale, const SmokeMaskMipPattern maskMipPattern,
+        const float maskMipAlphaCutoff, const int gameViewCameraDiagnosticCase, const bool assetBrowserSmoke,
+        const bool assetBrowserModelPreviewSmoke, const bool primitiveMaterialSmoke,
+        const bool runtimeBgfxGameViewSmoke, const bool runtimeBgfxGameViewFallbackSmoke,
+        const bool runtimeBgfxGameViewTextureSmoke, const bool runtimeBgfxDirectionalLightSmoke,
+        const bool runtimeBgfxPointLightSmoke,
+        const bool directionalLightNoLightSmoke, const bool directionalLightZeroShaderSmoke,
+        const bool rendererBackendSmoke, const bool expectVulkanRenderer, const bool vulkanSceneViewOnlySmoke,
+        const bool codexChangeReviewSmoke, const bool codexSpriteVisibilitySmoke,
+        const bool codexPrimitiveCreationSmoke, const bool codexCameraAdditionSmoke,
+        const bool codexCameraLensSmoke, const bool codexCameraActivationSmoke,
+        const bool codexCameraClearSmoke, const bool codexTransformReviewSmoke,
+        const bool codexReparentReviewSmoke, const bool hierarchyReparentSmoke,
+        const bool hierarchyReparentManySmoke, const bool multiTransformInspectorSmoke)
     {
+        const bool codexReviewSmoke = codexChangeReviewSmoke || codexSpriteVisibilitySmoke
+            || codexPrimitiveCreationSmoke || codexCameraAdditionSmoke || codexCameraLensSmoke
+            || codexCameraActivationSmoke || codexCameraClearSmoke || codexTransformReviewSmoke
+            || codexReparentReviewSmoke;
+        const bool maskMipSmoke = maskMipUvScale > 0;
+        const bool genericAlphaCompositionSmoke = smoke && alphaMaskBoundaryCase < 0
+            && maskMipUvScale == 0 && gameViewCameraDiagnosticCase == 0
+            && !assetBrowserSmoke && !assetBrowserModelPreviewSmoke && !primitiveMaterialSmoke
+            && !multiTransformInspectorSmoke
+            && !codexReviewSmoke
+            && !runtimeBgfxGameViewSmoke && !runtimeBgfxGameViewFallbackSmoke
+            && !runtimeBgfxGameViewTextureSmoke && !runtimeBgfxDirectionalLightSmoke
+            && !windowGeometrySmoke && !monitorDpiSmoke;
+        const bool runtimeBgfxVulkanGameViewTextureSmoke = runtimeBgfxGameViewTextureSmoke && expectVulkanRenderer;
+        const bool vulkanGameViewTapSmoke = runtimeBgfxVulkanGameViewTextureSmoke
+            && SDL_getenv("ASTRO_VULKAN_GAME_VIEW_TAP_SMOKE") != nullptr;
+        const bool vulkanGameViewResizeTrace = vulkanGameViewTapSmoke
+            && SDL_getenv("ASTRO_VULKAN_GAME_VIEW_RESIZE_TRACE") != nullptr;
+        int vulkanGameViewResizeCycles = 1;
+        if (vulkanGameViewResizeTrace)
+        {
+            if (const char* cyclesText = SDL_getenv("ASTRO_VULKAN_GAME_VIEW_RESIZE_CYCLES"))
+            {
+                const std::string_view cyclesValue(cyclesText);
+                const auto [end, error] = std::from_chars(cyclesValue.data(),
+                    cyclesValue.data() + cyclesValue.size(), vulkanGameViewResizeCycles);
+                if (error != std::errc{} || end != cyclesValue.data() + cyclesValue.size()
+                    || vulkanGameViewResizeCycles < 1 || vulkanGameViewResizeCycles > 2)
+                    throw std::runtime_error("Vulkan resize trace cycles must be between 1 and 2");
+            }
+        }
+        const int tapResizeTraceCapturesPerTransition = vulkanGameViewResizeCycles > 1 ? 2 : 4;
+        int tapCaptureWindowWidth = 0, tapCaptureWindowHeight = 0;
+        int tapCaptureBackbufferWidth = 0, tapCaptureBackbufferHeight = 0;
+        int tapCaptureResetWidth = 0, tapCaptureResetHeight = 0;
+        int tapResizeTraceFramesRemaining = 0;
+        int tapResizeTraceWidth = 0, tapResizeTraceHeight = 0;
+        std::optional<astro::editor::VulkanSurfaceFormatReport> tapSurfaceAtCapture;
+        const bool vulkanColorChartSmoke = runtimeBgfxVulkanGameViewTextureSmoke
+            && SDL_getenv("ASTRO_VULKAN_COLOR_CHART_SMOKE") != nullptr;
+        const bool framebufferReadbackSmoke = directionalLightNoLightSmoke
+            || (runtimeBgfxGameViewTextureSmoke && !vulkanColorChartSmoke)
+            || alphaMaskBoundaryCase == 1 || genericAlphaCompositionSmoke;
+        if (monitorDpiSmoke && !configureMixedDpiTransitionSmoke()) return 77;
         std::filesystem::path languageSettingsPath;
         bool languageSettingsReadable = true;
         if (smoke) gEditorLanguage = EditorLanguage::Russian;
@@ -2503,25 +6032,82 @@ public:
             }
             else languageSettingsReadable = false;
         }
-        int width = 1100, height = 720, frames = 0;
+        int width = 0, height = 0, frames = 0;
+        EntityId primitiveInspectorSmokeEntity = 0;
+        astro::assets::AssetId primitiveMaterialSmokeAsset{};
+        std::optional<astro::assets::AssetId> runtimeBgfxSmokeModelAsset;
+        std::optional<astro::assets::AssetId> runtimeBgfxSmokeTextureAsset;
+        if (!SDL_GetWindowSizeInPixels(window, &width, &height) || width <= 0 || height <= 0)
+            throw std::runtime_error("SDL did not report valid initial Editor framebuffer pixels");
+        if (vulkanColorChartSmoke)
+        {
+            constexpr std::array<std::uint8_t, 16> chartBgra{
+                0, 0, 0, 255, 64, 128, 192, 255, 200, 100, 30, 255, 255, 255, 255, 255
+            };
+            vulkanColorChartTexture = bgfx::createTexture2D(4, 1, false, 1,
+                bgfx::TextureFormat::BGRA8, BGFX_TEXTURE_SRGB_MUTABLE
+                    | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
+                bgfx::copy(chartBgra.data(), static_cast<std::uint32_t>(chartBgra.size())));
+            if (!bgfx::isValid(vulkanColorChartTexture))
+                throw std::runtime_error("Vulkan color chart texture allocation failed");
+        }
         bool running = true, resetLayout = true, docked = false;
         bool showProject = true, showDiagnostics = true, showVisualLogic = true, showGameView = true;
+        bool showAIChangeReview = codexReviewSmoke;
         bool showCodeWorkspace = true;
-        bool showEditorSettings = smoke;
+        bool showEditorSettings = smoke && !hierarchyReparentSmoke && !hierarchyReparentManySmoke;
         auto pendingEditorLanguage = gEditorLanguage;
         bool editorSettingsWindowDrawn = false;
         SceneViewTarget sceneTarget{1}, gameTarget{2};
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
-        sceneTarget.configure3d(program3d);
+        SceneViewTarget assetModelPreviewTarget{5};
+        sceneTarget.forceZeroLightLambert(directionalLightZeroShaderSmoke);
+        sceneTarget.configure3d(program3d, texturedProgram3d, baseColorSampler3d, sceneAlphaParams3d,
+            runtimeLitProgram3d, runtimeLitTexturedProgram3d, runtimeNormalMatrix3d, runtimeLightParams3d,
+            runtimeLightDirections3d, runtimeLightColors3d, runtimeBaseColorFactor3d,
+            runtimePointPositions3d, runtimePointColors3d, runtimePointRanges3d);
+        gameTarget.configure3d(program3d, texturedProgram3d, baseColorSampler3d, sceneAlphaParams3d,
+            runtimeLitProgram3d, runtimeLitTexturedProgram3d, runtimeNormalMatrix3d, runtimeLightParams3d,
+            runtimeLightDirections3d, runtimeLightColors3d, runtimeBaseColorFactor3d,
+            runtimePointPositions3d, runtimePointColors3d, runtimePointRanges3d);
+        assetModelPreviewTarget.configure3d(program3d, texturedProgram3d, baseColorSampler3d, sceneAlphaParams3d);
         std::array<float, 4> sceneViewRectNormalized{};
         bool sceneViewRectValid = false;
+        std::array<float, 4> gameViewRectNormalized{};
+        bool gameViewRectValid = false;
+        bool vulkanColorChartWindowShown = false;
+        std::uint64_t runtimeBgfxGameViewTexturePixels = 0;
+        std::uint64_t runtimeBgfxGameViewSourceTexturePixels = 0;
+        std::uint64_t runtimeBgfxDirectionalLightPixels = 0;
+        std::uint64_t runtimeBgfxPointLightPixels = 0;
+        std::vector<std::uint8_t> sceneViewReadbackPixels, gameViewReadbackPixels;
+        std::uint32_t sceneViewReadbackReadyFrame = 0, gameViewReadbackReadyFrame = 0;
+        int sceneViewReadbackWidth = 0, sceneViewReadbackHeight = 0;
+        int gameViewReadbackWidth = 0, gameViewReadbackHeight = 0;
+        std::uint64_t sceneViewDirectionalLightPixels = 0;
+        std::uint64_t sceneViewPointLightPixels = 0;
+        std::uint64_t sceneViewFrontLitPixels = 0;
+        std::uint64_t sceneViewBackLitPixels = 0;
+        std::array<float, 4> sceneViewInputRect{};
+        bool sceneViewInputRectValid = false;
+        std::array<float, 4> projectModelPreviewRectNormalized{};
+        bool projectModelPreviewRectValid = false;
+        std::uint64_t projectModelPreviewVisiblePixels = 0;
+        bool sceneViewSpatialZoomApplied = false;
         std::uint64_t sceneViewWhitePixels = 0;
+    std::uint64_t sceneViewBaseColorPixels = 0;
+        std::uint64_t sceneViewPrimitiveMaterialPixels = 0;
+    std::uint64_t sceneViewBlendPixels = 0;
+    std::uint64_t sceneViewMaskPixels = 0;
+        SmokeSceneViewAlphaSpatialCounts sceneViewAlphaSpatialCounts;
 #endif
         std::vector<Scene> benchmarkScenes;
         std::vector<std::string> benchmarkSceneNames;
         std::vector<double> meshSceneBuildMs;
         double meshModelImportMs = 0.0;
         astro::runtime::RuntimeSession playSession;
+        std::optional<Scene> runtimeBgfxGameViewAuthoringScene;
+        std::optional<Scene> directionalLightSmokeScene;
         int sceneViewFrames = 0, gameViewFrames = 0;
 #if defined(ASTRO_EDITOR_HAS_PUZZLE_RUNTIME)
         std::optional<astro::runtime::PuzzleGame> gameViewPuzzle;
@@ -2620,18 +6206,235 @@ public:
         int uiPreviewPreset = 0;
         bool uiBindingErrorReported = false;
         char path[1024] = "";
+        std::shared_ptr<ProjectPathDialogResult> projectPathDialogRequest;
         char scenePathInput[1024] = "";
         char assetPathInput[512] = "";
+        std::array<char, 512> assetBrowserQuery{};
+        if (assetBrowserSmoke)
+            std::copy_n("smoke-red.png", sizeof("smoke-red.png"), assetBrowserQuery.data());
+        auto assetBrowserTypeFilter = astro::editor::AssetBrowserTypeFilter::All;
+        std::vector<astro::editor::AssetBrowserEntry> assetBrowserCatalog;
+        std::vector<std::size_t> assetBrowserVisible;
+        std::filesystem::path assetBrowserCatalogRoot;
+        std::array<std::size_t, 4> assetBrowserCatalogCounts{};
+        bool assetBrowserCatalogDirty = true;
+        bool assetBrowserPanelDrawn = false;
+        bool assetBrowserSearchDrawn = false;
+        bool assetBrowserTypeFilterDrawn = false;
+        bool assetBrowserSelectionActivated = false;
+        bool projectAssetImagePreviewShown = false;
+        bool projectAssetModelPreviewShown = false;
+        bool projectAssetModelViewportShown = false;
+        bool projectModelPreviewViewportFullyVisible = false;
+        bool projectModelPreviewCameraControlsSmokePassed = false;
+        bool projectAssetPreviewRightDragActive = false;
+        bool projectAssetPreviewMiddleDragActive = false;
+        bool projectModelPreviewRightDragSmokePassed = false;
+        bool projectModelPreviewMiddleDragSmokePassed = false;
+        bool projectModelPreviewOutsidePressIgnoredSmokePassed = false;
+        bool sceneViewRightDragActive = false;
+        bool sceneViewMiddleDragActive = false;
+        bool sceneViewPointerHoveringViewport = false;
+        bool sceneViewRightPressStartedInside = false;
+        bool sceneViewMiddlePressStartedInside = false;
+        bool sceneViewOutsideRightPressEventSeen = false;
+        bool sceneViewOutsideMiddlePressEventSeen = false;
+        bool sceneViewRightDragSmokePassed = false;
+        bool sceneViewMiddleDragSmokePassed = false;
+        bool sceneViewOutsidePressIgnoredSmokePassed = false;
+        bool sceneViewOutsideRightPressIgnoredSmokePassed = false;
+        int sceneViewMouseEventPhase = 0;
+        float sceneViewMouseStartYaw = 0.0f;
+        std::array<float, 3> sceneViewMouseStartFocus{};
+        bool projectAssetPreviewScrollRequested = false;
+        ImVec2 projectAssetPreviewLastWindowSize{-1.0f, -1.0f};
+        int projectModelPreviewMouseEventPhase = 0;
+        float projectModelPreviewMouseStartYaw = 0.0f;
+        std::array<float, 3> projectModelPreviewMouseStartFocus{};
+        std::optional<astro::assets::AssetId> projectAssetPreviewSelection;
+        std::filesystem::path projectAssetPreviewRoot;
+        std::optional<astro::assets::AssetId> projectModelPreviewId;
+        std::size_t projectModelPreviewMeshCount = 0;
+        std::size_t projectModelPreviewPrimitiveCount = 0;
+        std::size_t projectModelPreviewVertexCount = 0;
+        std::size_t projectModelPreviewIndexCount = 0;
+        std::string projectModelPreviewDiagnostic;
+        std::size_t assetBrowserVisibleCount = 0;
+        std::optional<astro::assets::AssetId> assetBrowserExpectedSelection;
         char name[256] = "My Game";
         std::string activeProject, message = tr("Create or open a project using File.");
         Scene scene(1, "Main Scene");
+        Scene projectAssetPreviewScene(0xFFFF'FFF0u, "Project Model Preview");
         astro::core::EngineContext commandContext;
         astro::core::CommandRegistry commands(commandContext);
         const auto commandRegistration = astro::scene::registerSceneCommands(commands, scene);
         if (!commandRegistration) throw std::runtime_error(commandRegistration.error().message);
+        astro::core::AIEditorApi aiEditorApi(commands);
+        astro::ai::CodexProjectAdapter codexProjectAdapter(aiEditorApi);
+        astro::ai::CodexChangeReviewModel codexChangeReview;
+        std::array<char, 241> aiProposedName{};
+        std::optional<EntityId> aiProposedNameEntity;
+        bool aiProposedSpriteVisible = true;
+        std::optional<EntityId> aiProposedSpriteEntity;
+        std::array<char, 241> aiProposedPrimitiveName{};
+        std::optional<EntityId> aiProposedPrimitiveNameEntity;
+        int aiProposedPrimitiveKind = 0;
+        bool aiProposedPrimitiveUseParent = true;
+        bool aiProposedPrimitiveVisible = !codexPrimitiveCreationSmoke;
+        std::optional<EntityId> codexPrimitiveReviewSmokeParent;
+        astro::scene::ComponentId codexCameraReviewSmokeComponentId = 0;
+        bool codexCameraReviewSmokePreviewWasReadOnly = false;
+        std::optional<EntityId> aiProposedCameraLensEntity;
+        double aiProposedCameraFovDegrees = 60.0;
+        double aiProposedCameraNearPlane = 0.1;
+        double aiProposedCameraFarPlane = 1000.0;
+        astro::scene::Transform aiProposedTransform{};
+        std::optional<EntityId> aiProposedTransformEntity;
+        astro::scene::ComponentId codexTransformReviewSmokeComponentId = 0;
+        astro::scene::Transform codexTransformReviewSmokeOriginal{};
+        astro::scene::Transform codexTransformReviewSmokeExpected{};
+        bool codexTransformReviewSmokePreviewWasReadOnly = false;
+        std::optional<EntityId> aiProposedParent;
+        std::optional<EntityId> aiProposedParentEntity;
+        EntityId codexReparentReviewSmokeEntity = 0;
+        EntityId codexReparentReviewSmokeParent = 0;
+        EntityId codexReparentReviewSmokeDescendant = 0;
+        std::optional<EntityId> codexReparentReviewSmokePreviousParent;
+        astro::scene::ComponentId codexReparentReviewSmokeComponentId = 0;
+        astro::scene::Transform codexReparentReviewSmokeLocal{};
+        bool codexReparentReviewSmokePreviewWasReadOnly = false;
+        bool codexReparentReviewSmokeWorldPoseChanged = false;
+        astro::scene::ComponentId codexCameraLensSmokeComponentId = 0;
+        bool codexCameraLensSmokeWasActive = false;
+        std::optional<EntityId> codexCameraSelectionSmokePrevious;
+        std::optional<EntityId> codexCameraSelectionSmokeTarget;
+        astro::scene::ComponentId codexCameraSelectionSmokePreviousComponentId = 0;
+        astro::scene::ComponentId codexCameraSelectionSmokeTargetComponentId = 0;
+        astro::assets::AssetId codexSpriteReviewSmokeTexture{};
+        bool aiChangeReviewPanelDrawn = false;
+        bool aiChangeReviewDiffShown = false;
+        int codexChangeReviewSmokePhase = 0;
+        EntityId codexChangeReviewSmokeEntity = 0;
         std::optional<EntityId> selectedEntity;
+        std::vector<EntityId> hierarchySelection;
+        std::optional<EntityId> pendingHierarchyPlainClick;
+        std::vector<EntityId> hierarchyForceOpenAncestors;
+        std::optional<EntityId> hierarchyFocusEntity;
+        bool hierarchySelectionVisible = false;
+        bool hierarchyFocusApplied = false;
+        EntityId hierarchyReparentSmokeEntity = 0;
+        EntityId hierarchyReparentSmokeTarget = 0;
+        EntityId hierarchyReparentSmokeDescendant = 0;
+        std::optional<EntityId> hierarchyReparentSmokeOriginalParent;
+        astro::scene::ComponentId hierarchyReparentSmokeTransformId = 0;
+        astro::scene::Transform hierarchyReparentSmokeLocal{};
+        int hierarchyReparentSmokePhase = 0;
+        bool hierarchyReparentSmokeEntityDrop = false;
+        bool hierarchyReparentSmokeRootDrop = false;
+        bool hierarchyReparentSmokeUndoRedo = false;
+        bool hierarchyReparentSmokeSourceRowSeen = false;
+        bool hierarchyReparentSmokeTargetRowSeen = false;
+        ImVec2 hierarchyReparentSmokeSourceCenter{};
+        ImVec2 hierarchyReparentSmokeTargetCenter{};
+        ImVec2 hierarchyReparentSmokeRootCenter{};
+        EntityId hierarchyReparentManyPeer = 0;
+        std::optional<EntityId> hierarchyReparentManyPeerOriginalParent;
+        astro::scene::ComponentId hierarchyReparentManyPeerTransformId = 0;
+        astro::scene::Transform hierarchyReparentManyPeerLocal{};
+        EntityId multiTransformSmokeEntity = 0;
+        EntityId multiTransformSmokePrimaryEntity = 0;
+        std::array<astro::scene::ComponentId, 2> multiTransformSmokeComponentIds{};
+        std::array<astro::scene::Transform, 2> multiTransformSmokeOriginals{};
+        int multiTransformInspectorSmokePhase = 0;
+        int multiTransformKeyboardAttempts = 0;
+        bool multiTransformInspectorSmokeWindowFocused = false;
+        bool multiTransformKeyboardTextEventAccepted = false;
+        bool multiTransformKeyboardDraftOnly = false;
+        bool multiTransformStaleDraftBlocked = false;
+        bool multiTransformSelectionDraftDiscarded = false;
+        bool multiTransformSelectionDiscardMessageShown = false;
+        std::size_t multiTransformSmokeUndoCount = 0;
+        bool multiTransformSmokeApplied = false;
+        bool multiTransformSmokeUndoRedo = false;
+        int hierarchyReparentManySmokePhase = 0;
+        bool hierarchyReparentManyDescendantRowSeen = false;
+        bool hierarchyReparentManyPeerRowSeen = false;
+        bool hierarchyReparentManySelectionVerified = false;
+        bool hierarchyReparentManyDrop = false;
+        bool hierarchyReparentManyUndoRedo = false;
+        ImVec2 hierarchyReparentManyDescendantCenter{};
+        ImVec2 hierarchyReparentManyPeerCenter{};
+        auto observeHierarchyRow = [&](const EntityId id, const ImVec2 rowMin, const ImVec2 rowMax) {
+            if (!hierarchyReparentSmoke && !hierarchyReparentManySmoke) return;
+            const ImVec2 center{(rowMin.x + rowMax.x) * 0.5f, (rowMin.y + rowMax.y) * 0.5f};
+            if (id == hierarchyReparentSmokeEntity)
+            {
+                hierarchyReparentSmokeSourceCenter = center;
+                hierarchyReparentSmokeSourceRowSeen = true;
+            }
+            if (id == hierarchyReparentSmokeTarget)
+            {
+                hierarchyReparentSmokeTargetCenter = center;
+                hierarchyReparentSmokeTargetRowSeen = true;
+            }
+            if (id == hierarchyReparentSmokeDescendant)
+            {
+                hierarchyReparentManyDescendantCenter = center;
+                hierarchyReparentManyDescendantRowSeen = true;
+            }
+            if (id == hierarchyReparentManyPeer)
+            {
+                hierarchyReparentManyPeerCenter = center;
+                hierarchyReparentManyPeerRowSeen = true;
+            }
+        };
+        auto selectEntityInHierarchy = [&](const EntityId id) {
+            const Entity* current = scene.find(id);
+            if (!current) return false;
+            selectedEntity = id;
+            hierarchySelection.assign(1, id);
+            hierarchyForceOpenAncestors.clear();
+            while (current->parent)
+            {
+                const auto parentId = *current->parent;
+                hierarchyForceOpenAncestors.push_back(parentId);
+                current = scene.find(parentId);
+                if (!current) return false;
+            }
+            hierarchyFocusEntity = id;
+            return true;
+        };
         std::uint64_t selectedScriptAsset = 0;
         bool scriptAuthoringPanelDrawn = false;
+        MeshMaterialInspectorState meshMaterialInspectorState;
+        Camera3DInspectorState camera3DInspectorState;
+        PrimitiveRendererInspectorState primitiveRendererInspectorState;
+        PointLightInspectorState pointLightInspectorState;
+        DirectionalLightInspectorState directionalLightInspectorState;
+        MultiTransformInspectorState multiTransformInspectorState;
+        MultiTransformInspectorState multiTransformInspectorSmokeState;
+        bool projectSelectedAssetShown = false;
+        std::optional<astro::assets::AssetId> selectedProjectAsset;
+        std::filesystem::path selectedProjectAssetRoot;
+        std::string selectedProjectAssetDisplayPath;
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+        EntityId smokeSourceMaterialEntity = 0;
+        std::optional<EntityId> smokeDiagnosticExpectedEntity;
+        bool smokeMaterialOverrideCommandPassed = false;
+        bool gameViewDiagnosticsShown = false;
+        std::string gameViewDiagnosticText;
+        bool gameViewDiagnosticsConsoleShown = false;
+        bool gameViewDiagnosticLinkShown = false;
+        bool gameViewDiagnosticLinkActivated = false;
+        bool gameViewDiagnosticAssetLinkShown = false;
+        bool gameViewDiagnosticAssetLinkActivated = false;
+        bool gameViewMissingAssetLinkSuppressed = false;
+        std::optional<std::string> gameViewConsoleDiagnostic;
+        std::vector<SceneViewTarget::DiagnosticEntry> gameViewConsoleDiagnostics;
+        std::optional<std::filesystem::path> gameViewConsoleDiagnosticProjectRoot;
+        std::optional<astro::assets::AssetId> smokeDiagnosticExpectedAsset;
+        std::string smokeDiagnosticExpectedAssetPath;
+#endif
         std::array<char, 256> inspectorDraft{};
         std::optional<EntityId> inspectorDraftEntity;
         std::optional<astro::scene::SceneId> inspectorDraftScene;
@@ -2692,6 +6495,83 @@ public:
             message = astro::editor::translateEditorDiagnostic(error, gEditorLanguage);
             diagnostics.push_back(message);
             if (diagnostics.size() > 32) diagnostics.erase(diagnostics.begin());
+        };
+        auto reparentFromHierarchy = [&](const std::vector<EntityId>& movingEntities,
+            const std::optional<EntityId> newParent) {
+            if (movingEntities.empty()) return false;
+            if (movingEntities.size() == 1)
+            {
+                const auto moving = movingEntities.front();
+                const auto* entity = scene.find(moving);
+                if (!entity || entity->parent == newParent) return false;
+                const auto changed = commands.execute<astro::scene::SetEntityParentPayload, void>(
+                    "entity.reparent", 1, {moving, newParent});
+                if (!changed)
+                {
+                    reportError(changed.error().message);
+                    return false;
+                }
+                selectedEntity = moving;
+                hierarchySelection.assign(1, moving);
+                hierarchyForceOpenAncestors.clear();
+                auto* ancestor = newParent ? scene.find(*newParent) : nullptr;
+                while (ancestor)
+                {
+                    hierarchyForceOpenAncestors.push_back(ancestor->id);
+                    ancestor = ancestor->parent ? scene.find(*ancestor->parent) : nullptr;
+                }
+                hierarchyFocusEntity = moving;
+                sceneDirty = true;
+                message = tr("Entity reparented");
+                if (hierarchyReparentSmoke && moving == hierarchyReparentSmokeEntity)
+                {
+                    if (newParent == std::optional<EntityId>{hierarchyReparentSmokeTarget})
+                        hierarchyReparentSmokeEntityDrop = true;
+                    else if (!newParent)
+                        hierarchyReparentSmokeRootDrop = true;
+                }
+                return true;
+            }
+
+            const auto undoCount = commands.undoCount();
+            const auto changed = commands.execute<astro::scene::SetEntityParentsPayload, void>(
+                "entity.reparent_many", 1, {movingEntities, newParent});
+            if (!changed)
+            {
+                reportError(changed.error().message);
+                return false;
+            }
+            if (commands.undoCount() == undoCount)
+            {
+                message = tr("Selected entities already have this parent");
+                return false;
+            }
+            hierarchySelection.erase(std::remove_if(hierarchySelection.begin(), hierarchySelection.end(),
+                [&](const EntityId id) { return scene.find(id) == nullptr; }), hierarchySelection.end());
+            if (!selectedEntity || !scene.find(*selectedEntity))
+                selectedEntity = hierarchySelection.empty() ? std::optional<EntityId>{}
+                    : std::optional<EntityId>{hierarchySelection.front()};
+            hierarchyForceOpenAncestors.clear();
+            auto* ancestor = newParent ? scene.find(*newParent) : nullptr;
+            while (ancestor)
+            {
+                hierarchyForceOpenAncestors.push_back(ancestor->id);
+                ancestor = ancestor->parent ? scene.find(*ancestor->parent) : nullptr;
+            }
+            hierarchyFocusEntity = selectedEntity;
+            sceneDirty = true;
+            std::array<char, 128> reparentMessage{};
+            std::snprintf(reparentMessage.data(), reparentMessage.size(),
+                tr("Entities reparented: %zu"), movingEntities.size());
+            message = reparentMessage.data();
+            if (hierarchyReparentManySmoke && movingEntities.size() == 2
+                && hierarchyReparentManySelectionVerified
+                && scene.find(hierarchyReparentSmokeEntity)
+                && scene.find(hierarchyReparentManyPeer)
+                && scene.find(hierarchyReparentSmokeEntity)->parent == newParent
+                && scene.find(hierarchyReparentManyPeer)->parent == newParent)
+                hierarchyReparentManyDrop = true;
+            return true;
         };
         auto stopPlaySession = [&] {
             const auto stopped = playSession.stopChecked();
@@ -4420,6 +8300,10 @@ public:
                 if (bgfx::isValid(texture)) bgfx::destroy(texture);
             spriteTextures.clear();
             assetRegistry = std::move(registry).value();
+            assetBrowserCatalogDirty = true;
+            selectedProjectAsset.reset();
+            selectedProjectAssetRoot.clear();
+            selectedProjectAssetDisplayPath.clear();
             csharpBuildReport = assetRegistry->inspectScriptBuild();
             startNewScene();
             message = tr("Project opened: ") + result.value().name;
@@ -4460,9 +8344,28 @@ public:
                 if (bgfx::isValid(texture)) bgfx::destroy(texture);
             spriteTextures.clear();
             assetRegistry = std::move(registry).value();
+            assetBrowserCatalogDirty = true;
+            selectedProjectAsset.reset();
+            selectedProjectAssetRoot.clear();
+            selectedProjectAssetDisplayPath.clear();
             csharpBuildReport = assetRegistry->inspectScriptBuild();
             startNewScene();
             message = tr("Project created: ") + result.value().name;
+        };
+        auto startProjectPathDialog = [&](const bool chooseProjectFile) {
+            if (projectPathDialogRequest) return;
+            auto request = std::make_shared<ProjectPathDialogResult>();
+            auto callbackOwner = std::make_unique<std::shared_ptr<ProjectPathDialogResult>>(request);
+            projectPathDialogRequest = request;
+            if (chooseProjectFile)
+            {
+                static constexpr SDL_DialogFileFilter projectFilter{"AstroEngine project", "astro"};
+                SDL_ShowOpenFileDialog(completeProjectPathDialog, callbackOwner.get(), window,
+                    &projectFilter, 1, nullptr, false);
+            }
+            else
+                SDL_ShowOpenFolderDialog(completeProjectPathDialog, callbackOwner.get(), window, nullptr, false);
+            callbackOwner.release();
         };
         auto undoSceneEdit = [&] {
             if (!commands.canUndo()) { message = tr("Nothing to undo"); return false; }
@@ -4494,6 +8397,131 @@ public:
             event.key.down = false;
             return SDL_PushEvent(&event);
         };
+        struct SmokeMouseEvent final { SDL_EventType type; Uint8 button; float x; float y; };
+        enum class LightPointerTarget : std::uint8_t { Point, Directional };
+        enum class LightPointerWidget : std::uint8_t { Enabled, Intensity, Color, Apply };
+        struct LightPointerAction final
+        {
+            LightPointerTarget target;
+            LightPointerWidget widget;
+            std::uint8_t channel = 0;
+        };
+        enum class LightKeyboardPhase : std::uint8_t
+        {
+            FocusEnabled, ToggleEnabled, WaitEnabled,
+            FocusIntensityValue, ActivateIntensityValue, ReleaseIntensityClick, SelectIntensityText,
+            InputIntensityValue, CommitIntensityValue,
+            VerifyDraft, Done
+        };
+        enum class MultiTransformKeyboardPhase : std::uint8_t
+        {
+            WaitForField, ActivateField, ReleaseFieldClick, SelectText,
+            EnterText, CommitText, VerifyDraft, VerifyStale,
+            VerifySelectionDiscard, VerifySelectionRestored, Done
+        };
+        MultiTransformKeyboardPhase multiTransformKeyboardPhase = MultiTransformKeyboardPhase::WaitForField;
+        constexpr std::array lightPointerActions{
+            LightPointerAction{LightPointerTarget::Point, LightPointerWidget::Enabled},
+            LightPointerAction{LightPointerTarget::Point, LightPointerWidget::Intensity},
+            LightPointerAction{LightPointerTarget::Point, LightPointerWidget::Color, 0},
+            LightPointerAction{LightPointerTarget::Point, LightPointerWidget::Color, 1},
+            LightPointerAction{LightPointerTarget::Point, LightPointerWidget::Color, 2},
+            LightPointerAction{LightPointerTarget::Point, LightPointerWidget::Apply},
+            LightPointerAction{LightPointerTarget::Directional, LightPointerWidget::Enabled},
+            LightPointerAction{LightPointerTarget::Directional, LightPointerWidget::Intensity},
+            LightPointerAction{LightPointerTarget::Directional, LightPointerWidget::Color, 0},
+            LightPointerAction{LightPointerTarget::Directional, LightPointerWidget::Color, 1},
+            LightPointerAction{LightPointerTarget::Directional, LightPointerWidget::Color, 2},
+            LightPointerAction{LightPointerTarget::Directional, LightPointerWidget::Apply}};
+        std::vector<SmokeMouseEvent> pendingSmokeMouseEvents;
+        SDL_Keycode lightInspectorKeyboardKeyToRelease = SDLK_UNKNOWN;
+        SDL_Keymod lightInspectorKeyboardModifierToRelease = SDL_KMOD_NONE;
+        auto queueKeyboardTap = [this, &lightInspectorKeyboardKeyToRelease,
+            &lightInspectorKeyboardModifierToRelease](const SDL_Keycode key, const SDL_Keymod modifiers = SDL_KMOD_NONE) {
+            SDL_Event event{};
+            event.type = SDL_EVENT_KEY_DOWN;
+            event.key.windowID = SDL_GetWindowID(window);
+            event.key.key = key;
+            event.key.scancode = SDL_GetScancodeFromKey(key, nullptr);
+            event.key.mod = modifiers;
+            event.key.down = true;
+            if (!SDL_PushEvent(&event)) return false;
+            lightInspectorKeyboardKeyToRelease = key;
+            lightInspectorKeyboardModifierToRelease = modifiers;
+            return true;
+        };
+        auto queueKeyboardRelease = [this, &lightInspectorKeyboardKeyToRelease,
+            &lightInspectorKeyboardModifierToRelease] {
+            if (lightInspectorKeyboardKeyToRelease == SDLK_UNKNOWN) return true;
+            SDL_Event event{};
+            event.type = SDL_EVENT_KEY_UP;
+            event.key.windowID = SDL_GetWindowID(window);
+            event.key.key = lightInspectorKeyboardKeyToRelease;
+            event.key.scancode = SDL_GetScancodeFromKey(lightInspectorKeyboardKeyToRelease, nullptr);
+            event.key.mod = SDL_KMOD_NONE;
+            event.key.down = false;
+            const bool queued = SDL_PushEvent(&event);
+            lightInspectorKeyboardKeyToRelease = SDLK_UNKNOWN;
+            lightInspectorKeyboardModifierToRelease = SDL_KMOD_NONE;
+            if (!queued) return false;
+            return true;
+        };
+        auto queueKeyboardText = [this](const char* text) {
+            SDL_Event event{};
+            event.type = SDL_EVENT_TEXT_INPUT;
+            event.text.windowID = SDL_GetWindowID(window);
+            event.text.text = text;
+            return SDL_PushEvent(&event);
+        };
+        auto queueKeyboardFieldClick = [&pendingSmokeMouseEvents](const ImVec2 center) {
+            const auto* viewport = ImGui::GetMainViewport();
+            if (!viewport) throw std::runtime_error("Keyboard smoke could not resolve the main ImGui viewport");
+            const bool desktopCoordinates = (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0;
+            const float localX = center.x - (desktopCoordinates ? viewport->Pos.x : 0.0f);
+            const float localY = center.y - (desktopCoordinates ? viewport->Pos.y : 0.0f);
+            pendingSmokeMouseEvents.push_back({SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_LEFT, localX, localY});
+        };
+        auto queueKeyboardFieldRelease = [&pendingSmokeMouseEvents](const ImVec2 center) {
+            const auto* viewport = ImGui::GetMainViewport();
+            if (!viewport) throw std::runtime_error("Keyboard smoke could not resolve the main ImGui viewport");
+            const bool desktopCoordinates = (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0;
+            const float localX = center.x - (desktopCoordinates ? viewport->Pos.x : 0.0f);
+            const float localY = center.y - (desktopCoordinates ? viewport->Pos.y : 0.0f);
+            pendingSmokeMouseEvents.push_back({SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_LEFT, localX, localY});
+        };
+        std::size_t lightInspectorPointerActionIndex = runtimeBgfxPointLightSmoke ? 0 : 6;
+        int lightInspectorPointerActionPhase = 0;
+        bool pointInspectorPointerDraftSeeded = false;
+        bool directionalInspectorPointerDraftSeeded = false;
+        std::array<float, 3> pointInspectorPointerOriginalColor{};
+        std::array<float, 3> directionalInspectorPointerOriginalColor{};
+        bool pointInspectorPointerApplyPassed = false;
+        bool directionalInspectorPointerApplyPassed = false;
+        bool lightInspectorPointerCommandsPassed = false;
+        LightKeyboardPhase lightInspectorKeyboardPhase = LightKeyboardPhase::FocusEnabled;
+        std::size_t lightInspectorKeyboardFocusAttempts = 0;
+        bool lightInspectorKeyboardPassed = false;
+        bool lightInspectorKeyboardDraftSeeded = false;
+        bool lightInspectorSmokeWindowFocused = false;
+        bool lightInspectorKeyboardValueFieldFocusPassed = false;
+        bool lightInspectorKeyboardValueFieldWasActive = false;
+        bool lightInspectorKeyboardRequestedTextInput = false;
+        bool lightInspectorKeyboardTextEventAccepted = false;
+        const bool lightInspectorPointerSmoke = runtimeBgfxPointLightSmoke
+            || (runtimeBgfxDirectionalLightSmoke && !directionalLightNoLightSmoke);
+        auto queuePreviewMouseEvent = [&pendingSmokeMouseEvents](const SDL_EventType type, const Uint8 button,
+            const float x, const float y, const SDL_MouseButtonFlags state = 0u) {
+            (void)state;
+            pendingSmokeMouseEvents.push_back({type, button, x, y});
+        };
+        auto queueCodexReviewMouseEvent = [&](const SDL_EventType type, const ImVec2 position) {
+            auto* viewport = ImGui::GetMainViewport();
+            if (!viewport) throw std::runtime_error("Codex review smoke could not resolve the ImGui viewport");
+            const bool desktopCoordinates = (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0;
+            queuePreviewMouseEvent(type, SDL_BUTTON_LEFT,
+                position.x - (desktopCoordinates ? viewport->Pos.x : 0.0f),
+                position.y - (desktopCoordinates ? viewport->Pos.y : 0.0f));
+        };
         std::filesystem::path smokeScreenshot;
         std::array<astro::assets::AssetId, 3> smokeSpriteAssets{};
         if (smoke || benchmark)
@@ -4506,8 +8534,12 @@ public:
             if (!evaluated || !finalTrace || !finalTrace->output
                 || !std::holds_alternative<bool>(*finalTrace->output) || !std::get<bool>(*finalTrace->output))
                 throw std::runtime_error("Visual Logic editor smoke evaluation failed");
-            smokeDirectory = std::filesystem::temp_directory_path() /
-                ("AstroEditor-" + std::to_string(SDL_GetTicksNS()));
+            const auto smokeProjectName = "AstroEditor-" + std::to_string(SDL_GetTicksNS());
+            const auto smokeProjectDirectory = astro::editor::resolveNewProjectDirectory(
+                std::filesystem::temp_directory_path(), smokeProjectName);
+            if (!smokeProjectDirectory)
+                throw std::runtime_error("Editor smoke could not resolve a new project directory");
+            smokeDirectory = smokeProjectDirectory.value();
             createProject(smokeDirectory, "Smoke project Ω");
 #if defined(ASTRO_EDITOR_HAS_PUZZLE_SAVE)
             if (smoke)
@@ -4642,6 +8674,7 @@ public:
                 benchmarkSpriteAssets.push_back(imported.value().id);
             }
             smokeSpriteAsset = smokeSpriteAssets[0];
+            if (assetBrowserSmoke) assetBrowserExpectedSelection = smokeSpriteAssets[0];
             if (benchmark)
             {
                 const std::array<std::array<std::uint8_t, 4>, 5> palette{{
@@ -4696,10 +8729,235 @@ public:
                     / L"Assets" / L"Models" / L"triangle.gltf";
                 std::filesystem::copy_file(fixture, activeProjectRoot / L"Assets" / L"Models" / L"triangle.gltf",
                     std::filesystem::copy_options::overwrite_existing);
+                const auto smokeModelPath = activeProjectRoot / L"Assets" / L"Models" / L"triangle.gltf";
+                std::ifstream smokeModelInput(smokeModelPath, std::ios::binary);
+                if (!smokeModelInput) throw std::runtime_error("Editor material Inspector smoke could not read its temporary glTF fixture");
+                std::string smokeModelText{std::istreambuf_iterator<char>(smokeModelInput),
+                    std::istreambuf_iterator<char>()};
+                const auto meshMarker = smokeModelText.find("\"meshes\"");
+                const auto modeMarker = smokeModelText.find("\"mode\": 4");
+                if (meshMarker == std::string::npos || modeMarker == std::string::npos)
+                    throw std::runtime_error("Editor material Inspector smoke could not prepare a temporary glTF material slot");
+                const auto sourceImagePath = activeProjectRoot / L"Assets" / L"Models" / L"source-base-color.png";
+                const auto sourceImageBytes = runtimeBgfxGameViewTextureSmoke
+                    ? makeSmokePng({48, 180, 224, 255}, 64, 64, true, runtimeBgfxSmokeAlphaMask())
+                    : makeSmokePng({48, 180, 224, 255}, 2, 2);
+                { std::ofstream imageOutput(sourceImagePath, std::ios::binary | std::ios::trunc);
+                  imageOutput.write(reinterpret_cast<const char*>(sourceImageBytes.data()),
+                      static_cast<std::streamsize>(sourceImageBytes.size()));
+                  if (!imageOutput) throw std::runtime_error("Editor Scene View smoke could not write its glTF source image"); }
+                const std::string sourceTextureMaterial = runtimeBgfxGameViewTextureSmoke
+                    ? "\"images\":[{\"uri\":\"source-base-color.png\"}],\n  "
+                      "\"samplers\":[{\"magFilter\":9728,\"minFilter\":9728,\"wrapS\":33648,\"wrapT\":33071},{"
+                      "\"magFilter\":9728,\"minFilter\":" + std::to_string(runtimeBgfxSmokeMipFilter())
+                      + ",\"wrapS\":33648,\"wrapT\":33071}],\n  "
+                      "\"textures\":[{\"source\":0,\"sampler\":0},{\"source\":0,\"sampler\":1}],\n  "
+                      "\"extensionsUsed\":[\"KHR_texture_transform\"],\n  "
+                      "\"materials\":[{\"name\":\"Inspector Source\",\"alphaMode\":\"BLEND\",\"doubleSided\":true,\"pbrMetallicRoughness\":{"
+                      "\"baseColorFactor\":[0.8,0.9,1,0.5],\"baseColorTexture\":{\"index\":0,"
+                      "\"extensions\":{\"KHR_texture_transform\":{\"offset\":[0.2,0.1],"
+                      "\"rotation\":0.2,\"scale\":[1.5,0.75],\"texCoord\":0}}},"
+                      "\"metallicFactor\":0,\"roughnessFactor\":1}},{\"name\":\"Runtime Source\","
+                      "\"alphaMode\":\"" + std::string(runtimeBgfxSmokeAlphaMask() ? "MASK" : "OPAQUE")
+                      + "\",\"alphaCutoff\":0.5,\"pbrMetallicRoughness\":{\"baseColorFactor\":[1,1,1,1],"
+                      "\"baseColorTexture\":{\"index\":1},\"metallicFactor\":0,\"roughnessFactor\":1}}],\n  "
+                    : "\"images\":[{\"uri\":\"source-base-color.png\"}],\n  "
+                      "\"samplers\":[{\"magFilter\":9728,\"minFilter\":9728,\"wrapS\":33648,\"wrapT\":33071}],\n  "
+                      "\"textures\":[{\"source\":0,\"sampler\":0}],\n  "
+                      "\"extensionsUsed\":[\"KHR_texture_transform\"],\n  "
+                      "\"materials\":[{\"name\":\"Inspector Source\",\"alphaMode\":\"BLEND\",\"doubleSided\":true,\"pbrMetallicRoughness\":{"
+                      "\"baseColorFactor\":[0.8,0.9,1,0.5],\"baseColorTexture\":{\"index\":0,"
+                      "\"extensions\":{\"KHR_texture_transform\":{\"offset\":[0.2,0.1],"
+                      "\"rotation\":0.2,\"scale\":[1.5,0.75],\"texCoord\":0}}},"
+                      "\"metallicFactor\":0,\"roughnessFactor\":1}}],\n  ";
+                smokeModelText.insert(meshMarker, sourceTextureMaterial);
+                const auto shiftedModeMarker = smokeModelText.find("\"mode\": 4");
+                smokeModelText.insert(shiftedModeMarker, "\"material\": 0, ");
+                if (assetBrowserModelPreviewSmoke || runtimeBgfxGameViewTextureSmoke)
+                {
+                    const auto primitiveMode = smokeModelText.find("\"mode\": 4");
+                    const auto primitiveEnd = primitiveMode == std::string::npos
+                        ? std::string::npos : smokeModelText.find('}', primitiveMode);
+                    if (primitiveEnd == std::string::npos)
+                        throw std::runtime_error("Editor multi-primitive model preview smoke could not locate its source primitive");
+                    smokeModelText.insert(primitiveEnd + 1, runtimeBgfxGameViewTextureSmoke
+                        ? ", {\"attributes\":{\"POSITION\":0,\"TEXCOORD_0\":1},\"indices\":2,\"mode\":4,\"material\":1}"
+                        : ", {\"attributes\":{\"POSITION\":0,\"TEXCOORD_0\":1},\"indices\":2,\"mode\":4}");
+                }
+                { std::ofstream smokeModelOutput(smokeModelPath, std::ios::binary | std::ios::trunc);
+                  smokeModelOutput.write(smokeModelText.data(), static_cast<std::streamsize>(smokeModelText.size()));
+                  if (!smokeModelOutput) throw std::runtime_error("Editor material Inspector smoke could not write its temporary glTF fixture"); }
                 auto imported = astro::render3d::GltfImporter::importAndRegister(*assetRegistry,
                     std::filesystem::path(std::u8string(u8"Assets/Models/triangle.gltf")));
                 if (!imported)
                     throw std::runtime_error("Editor Scene View 3D smoke import failed: " + imported.error().message);
+                if (runtimeBgfxGameViewTextureSmoke)
+                    runtimeBgfxSmokeModelAsset = imported.value().modelAssetId;
+                if (assetBrowserModelPreviewSmoke)
+                {
+                    std::copy_n("triangle.gltf", sizeof("triangle.gltf"), assetBrowserQuery.data());
+                    assetBrowserTypeFilter = astro::editor::AssetBrowserTypeFilter::Models;
+                    assetBrowserExpectedSelection = imported.value().modelAssetId;
+                }
+                std::filesystem::create_directories(activeProjectRoot / L"Assets" / L"Materials");
+                const auto materialText = astro::assets::serializeMaterialAsset(astro::assets::MaterialAssetData{});
+                if (!materialText)
+                    throw std::runtime_error("Editor material Inspector smoke could not serialize a material fixture");
+                const auto materialPath = activeProjectRoot / L"Assets" / L"Materials" / L"inspector.astro-material";
+                { std::ofstream materialOutput(materialPath, std::ios::binary | std::ios::trunc);
+                  materialOutput.write(materialText.value().data(),
+                      static_cast<std::streamsize>(materialText.value().size()));
+                  if (!materialOutput) throw std::runtime_error("Editor material Inspector smoke could not write its material fixture"); }
+                const auto registeredMaterial = assetRegistry->registerMaterial(
+                    std::filesystem::path("Materials/inspector.astro-material"));
+                if (!registeredMaterial)
+                    throw std::runtime_error("Editor material Inspector smoke could not register its material fixture: "
+                        + registeredMaterial.error().message);
+                std::filesystem::create_directories(activeProjectRoot / L"Assets" / L"Textures");
+                const auto smokeTexturePath = activeProjectRoot / L"Assets" / L"Textures" / L"base-color.png";
+                const auto smokeTextureBytes = makeSmokePng({220, 96, 48, 255}, 2, 2);
+                { std::ofstream textureOutput(smokeTexturePath, std::ios::binary | std::ios::trunc);
+                  textureOutput.write(reinterpret_cast<const char*>(smokeTextureBytes.data()),
+                      static_cast<std::streamsize>(smokeTextureBytes.size()));
+                  if (!textureOutput) throw std::runtime_error("Editor Scene View smoke could not write its base-color fixture"); }
+                const auto importedTexture = assetRegistry->importImage(std::filesystem::path("Textures/base-color.png"));
+                if (!importedTexture)
+                    throw std::runtime_error("Editor Scene View smoke could not register its base-color fixture: "
+                        + importedTexture.error().message);
+                if (runtimeBgfxGameViewTextureSmoke)
+                {
+                    astro::assets::MaterialAssetData adapterTextureMaterial;
+                    adapterTextureMaterial.baseColorTexture = astro::assets::MaterialTextureBinding{
+                        importedTexture.value().id, 0};
+                    adapterTextureMaterial.baseColorWrapU = astro::assets::MaterialTextureWrapMode::ClampToEdge;
+                    adapterTextureMaterial.baseColorWrapV = astro::assets::MaterialTextureWrapMode::ClampToEdge;
+                    const auto adapterMaterialText = astro::assets::serializeMaterialAsset(adapterTextureMaterial);
+                    if (!adapterMaterialText)
+                        throw std::runtime_error("Runtime BGFX texture smoke could not serialize its material");
+                    const auto adapterMaterialPath = activeProjectRoot / L"Assets" / L"Materials"
+                        / L"runtime-bgfx-base-color.astro-material";
+                    { std::ofstream output(adapterMaterialPath, std::ios::binary | std::ios::trunc);
+                      output.write(adapterMaterialText.value().data(),
+                          static_cast<std::streamsize>(adapterMaterialText.value().size()));
+                      if (!output) throw std::runtime_error("Runtime BGFX texture smoke could not write its material"); }
+                    const auto registered = assetRegistry->registerMaterial(
+                        std::filesystem::path("Materials/runtime-bgfx-base-color.astro-material"));
+                    if (!registered)
+                        throw std::runtime_error("Runtime BGFX texture smoke could not register its material: "
+                            + registered.error().message);
+                    runtimeBgfxSmokeTextureAsset = registered.value().id;
+                }
+                std::optional<astro::assets::AssetId> maskMipTexture;
+                if (maskMipSmoke)
+                {
+                    const auto maskMipPath = activeProjectRoot / L"Assets" / L"Textures" / L"mask-alpha-mip.png";
+                    const auto maskMipBytes = makeSmokeMaskMipPng(maskMipPattern);
+                    { std::ofstream textureOutput(maskMipPath, std::ios::binary);
+                      textureOutput.write(reinterpret_cast<const char*>(maskMipBytes.data()),
+                          static_cast<std::streamsize>(maskMipBytes.size()));
+                      if (!textureOutput) throw std::runtime_error("Editor mask mip smoke could not write its temporary alpha image"); }
+                    const auto importedMaskMip = assetRegistry->importImage(std::filesystem::path("Textures/mask-alpha-mip.png"));
+                    if (!importedMaskMip)
+                        throw std::runtime_error("Editor mask mip smoke could not register its temporary alpha image: "
+                            + importedMaskMip.error().message);
+                    maskMipTexture = importedMaskMip.value().id;
+                }
+                astro::assets::MaterialAssetData texturedMaterialData;
+                texturedMaterialData.baseColorFactor = {0.65f, 0.60f, 0.80f, 0.5f};
+                texturedMaterialData.baseColorTexture = astro::assets::MaterialTextureBinding{importedTexture.value().id, 0};
+                texturedMaterialData.baseColorWrapU = astro::assets::MaterialTextureWrapMode::MirroredRepeat;
+                texturedMaterialData.baseColorWrapV = astro::assets::MaterialTextureWrapMode::Repeat;
+                texturedMaterialData.baseColorMinFilter = astro::assets::MaterialTextureMinFilter::LinearMipmapLinear;
+                texturedMaterialData.baseColorMagFilter = astro::assets::MaterialTextureMagFilter::Nearest;
+                texturedMaterialData.baseColorUvTransform = {0.1f, -0.1f, 0.15f, 1.2f, 0.8f};
+                const auto texturedMaterialText = astro::assets::serializeMaterialAsset(texturedMaterialData);
+                if (!texturedMaterialText)
+                    throw std::runtime_error("Editor Scene View smoke could not serialize its base-color material");
+                const auto texturedMaterialPath = activeProjectRoot / L"Assets" / L"Materials" / L"scene-view-texture.astro-material";
+                { std::ofstream materialOutput(texturedMaterialPath, std::ios::binary | std::ios::trunc);
+                  materialOutput.write(texturedMaterialText.value().data(),
+                      static_cast<std::streamsize>(texturedMaterialText.value().size()));
+                  if (!materialOutput) throw std::runtime_error("Editor Scene View smoke could not write its textured material"); }
+                const auto registeredTexturedMaterial = assetRegistry->registerMaterial(
+                    std::filesystem::path("Materials/scene-view-texture.astro-material"));
+                if (!registeredTexturedMaterial)
+                    throw std::runtime_error("Editor Scene View smoke could not register its base-color material: "
+                        + registeredTexturedMaterial.error().message);
+                if (primitiveMaterialSmoke)
+                {
+                    astro::assets::MaterialAssetData visiblePrimitiveMaterial;
+                    // Distinct from the smoke's red/green/blue sprite markers so the
+                    // screenshot check cannot pass on an unrelated 2D rectangle.
+                    visiblePrimitiveMaterial.baseColorFactor = {0.95f, 0.82f, 0.02f, 1.0f};
+                    const auto visiblePrimitiveMaterialText = astro::assets::serializeMaterialAsset(visiblePrimitiveMaterial);
+                    if (!visiblePrimitiveMaterialText)
+                        throw std::runtime_error("Primitive material pixel smoke could not serialize its red material");
+                    const auto visiblePrimitiveMaterialPath = activeProjectRoot / L"Assets" / L"Materials" / L"visible-primitive-red.astro-material";
+                    { std::ofstream output(visiblePrimitiveMaterialPath, std::ios::binary | std::ios::trunc);
+                      output.write(visiblePrimitiveMaterialText.value().data(),
+                          static_cast<std::streamsize>(visiblePrimitiveMaterialText.value().size()));
+                      if (!output) throw std::runtime_error("Primitive material pixel smoke could not write its fixture material"); }
+                    const auto registered = assetRegistry->registerMaterial(
+                        std::filesystem::path("Materials/visible-primitive-red.astro-material"));
+                    if (!registered)
+                        throw std::runtime_error("Primitive material pixel smoke could not register its material: "
+                            + registered.error().message);
+                    primitiveMaterialSmokeAsset = registered.value().id;
+                }
+                astro::assets::MaterialAssetData unsupportedUvMaterialData;
+                unsupportedUvMaterialData.baseColorTexture = astro::assets::MaterialTextureBinding{importedTexture.value().id, 1};
+                unsupportedUvMaterialData.alphaMode = astro::assets::MaterialAlphaMode::Mask;
+                unsupportedUvMaterialData.alphaCutoff = 0.5f;
+                const auto unsupportedUvMaterialText = astro::assets::serializeMaterialAsset(unsupportedUvMaterialData);
+                if (!unsupportedUvMaterialText)
+                    throw std::runtime_error("Editor Scene View smoke could not serialize its unsupported-UV material fixture");
+                const auto unsupportedUvMaterialPath = activeProjectRoot / L"Assets" / L"Materials" / L"scene-view-unsupported-uv.astro-material";
+                { std::ofstream materialOutput(unsupportedUvMaterialPath, std::ios::binary | std::ios::trunc);
+                  materialOutput.write(unsupportedUvMaterialText.value().data(),
+                      static_cast<std::streamsize>(unsupportedUvMaterialText.value().size()));
+                  if (!materialOutput) throw std::runtime_error("Editor Scene View smoke could not write its unsupported-UV material"); }
+                const auto registeredUnsupportedUvMaterial = assetRegistry->registerMaterial(
+                    std::filesystem::path("Materials/scene-view-unsupported-uv.astro-material"));
+                if (!registeredUnsupportedUvMaterial)
+                    throw std::runtime_error("Editor Scene View smoke could not register its unsupported-UV material: "
+                        + registeredUnsupportedUvMaterial.error().message);
+                if (gameViewCameraDiagnosticCase == 4)
+                {
+                    smokeDiagnosticExpectedAsset = registeredUnsupportedUvMaterial.value().id;
+                    smokeDiagnosticExpectedAssetPath = registeredUnsupportedUvMaterial.value().sourceRelativePath;
+                }
+                astro::assets::MaterialAssetData maskCoverageMaterialData;
+                maskCoverageMaterialData.baseColorFactor[0] = 1.0f;
+                maskCoverageMaterialData.baseColorFactor[1] = 0.0f;
+                maskCoverageMaterialData.baseColorFactor[2] = 1.0f;
+                maskCoverageMaterialData.baseColorFactor[3] = maskMipSmoke ? 1.0f
+                    : alphaMaskBoundaryCase < 0 ? 0.25f
+                    : alphaMaskBoundaryCase == 0 ? 0.49f
+                    : alphaMaskBoundaryCase == 1 ? 0.5f : 0.51f;
+                maskCoverageMaterialData.alphaMode = astro::assets::MaterialAlphaMode::Mask;
+                maskCoverageMaterialData.alphaCutoff = maskMipSmoke ? maskMipAlphaCutoff : 0.5f;
+                if (maskMipSmoke)
+                {
+                    maskCoverageMaterialData.baseColorTexture = astro::assets::MaterialTextureBinding{*maskMipTexture, 0};
+                    maskCoverageMaterialData.baseColorWrapU = astro::assets::MaterialTextureWrapMode::Repeat;
+                    maskCoverageMaterialData.baseColorWrapV = astro::assets::MaterialTextureWrapMode::Repeat;
+                    maskCoverageMaterialData.baseColorMinFilter = astro::assets::MaterialTextureMinFilter::LinearMipmapLinear;
+                    maskCoverageMaterialData.baseColorUvTransform = {0.0f, 0.0f, 0.0f,
+                        static_cast<float>(maskMipUvScale), 1.0f};
+                }
+                const auto maskCoverageMaterialText = astro::assets::serializeMaterialAsset(maskCoverageMaterialData);
+                if (!maskCoverageMaterialText)
+                    throw std::runtime_error("Editor Scene View smoke could not serialize its mask-coverage material");
+                const auto maskCoverageMaterialPath = activeProjectRoot / L"Assets" / L"Materials" / L"scene-view-mask-coverage.astro-material";
+                { std::ofstream materialOutput(maskCoverageMaterialPath, std::ios::binary | std::ios::trunc);
+                  materialOutput.write(maskCoverageMaterialText.value().data(),
+                      static_cast<std::streamsize>(maskCoverageMaterialText.value().size()));
+                  if (!materialOutput) throw std::runtime_error("Editor Scene View smoke could not write its mask-coverage material"); }
+                const auto registeredMaskCoverageMaterial = assetRegistry->registerMaterial(
+                    std::filesystem::path("Materials/scene-view-mask-coverage.astro-material"));
+                if (!registeredMaskCoverageMaterial)
+                    throw std::runtime_error("Editor Scene View smoke could not register its mask-coverage material: "
+                        + registeredMaskCoverageMaterial.error().message);
                 astro::scene::Transform parentTransform;
                 parentTransform.position.x = 0.25;
                 parentTransform.scale.x = 2.0;
@@ -4716,13 +8974,383 @@ public:
                 if (!secondAttached)
                     throw std::runtime_error("Editor Scene View 3D smoke could not attach the second MeshRenderer: "
                         + secondAttached.error().message);
+                const auto sourceMaterialEntity = scene.createEntity("glTF source material preview", root.value());
+                if (!sourceMaterialEntity
+                    || !scene.setMeshRenderer(sourceMaterialEntity.value(), imported.value().modelAssetId))
+                    throw std::runtime_error("Editor Scene View smoke could not attach a no-override source-material mesh");
+                smokeSourceMaterialEntity = sourceMaterialEntity.value();
+                astro::scene::Transform sourceMaterialTransform;
+                sourceMaterialTransform.position.x = 0.0;
+                sourceMaterialTransform.position.z = 0.5;
+                if (!scene.setTransform(sourceMaterialEntity.value(), sourceMaterialTransform))
+                    throw std::runtime_error("Editor Scene View smoke could not position the source-material mesh");
+                const auto maskCoverageEntity = scene.createEntity("Alpha mask coverage test", root.value());
+                if (!maskCoverageEntity
+                    || !scene.setMeshRenderer(maskCoverageEntity.value(), imported.value().modelAssetId)
+                    || !scene.setMeshMaterialOverride(maskCoverageEntity.value(), registeredMaskCoverageMaterial.value().id))
+                    throw std::runtime_error("Editor Scene View smoke could not configure its mask-coverage mesh");
+                astro::scene::Transform maskCoverageTransform;
+                maskCoverageTransform.position.z = 0.75;
+                if (!scene.setTransform(maskCoverageEntity.value(), maskCoverageTransform))
+                    throw std::runtime_error("Editor Scene View smoke could not position its mask-coverage mesh");
+                const astro::scene::SetMeshMaterialOverridePayload applySmokeOverride{
+                    sourceMaterialEntity.value(), registeredTexturedMaterial.value().id};
+                const astro::scene::SetMeshMaterialOverridePayload clearSmokeOverride{
+                    sourceMaterialEntity.value(), {}};
+                const auto assignedSmokeOverride = commands.execute<
+                    astro::scene::SetMeshMaterialOverridePayload, void>(
+                        "entity.set_mesh_material_override", 1, applySmokeOverride);
+                const bool assignmentObserved = assignedSmokeOverride
+                    && scene.meshRenderer(sourceMaterialEntity.value())->materialOverride
+                        == registeredTexturedMaterial.value().id;
+                const auto clearedSmokeOverride = assignmentObserved
+                    ? commands.execute<astro::scene::SetMeshMaterialOverridePayload, void>(
+                        "entity.set_mesh_material_override", 1, clearSmokeOverride)
+                    : astro::core::Result<void>::failure({astro::core::ErrorCode::InternalError,
+                        "Override assignment did not update the source-material test entity"});
+                smokeMaterialOverrideCommandPassed = assignmentObserved && clearedSmokeOverride
+                    && scene.meshRenderer(sourceMaterialEntity.value())->materialOverride.value == 0;
+                if (!smokeMaterialOverrideCommandPassed)
+                    throw std::runtime_error("Inspector override authoring command smoke could not assign and clear the project material");
+                commands.clearHistory();
+                const auto invalidOverrideEntity = scene.createEntity("Invalid material override fallback", root.value());
+                if (!invalidOverrideEntity
+                    || !scene.setMeshRenderer(invalidOverrideEntity.value(), imported.value().modelAssetId)
+                    || !scene.setMeshMaterialOverride(invalidOverrideEntity.value(), {999999999ull}))
+                    throw std::runtime_error("Editor Scene View smoke could not configure an unresolved material override");
+                astro::scene::Transform invalidOverrideTransform;
+                invalidOverrideTransform.position.x = -4.5;
+                if (!scene.setTransform(invalidOverrideEntity.value(), invalidOverrideTransform))
+                    throw std::runtime_error("Editor Scene View smoke could not position the invalid-override mesh");
                 const auto unresolvedAttached = scene.setMeshRenderer(root.value(), {900000001ull});
                 if (!unresolvedAttached)
                     throw std::runtime_error("Editor Scene View 3D smoke could not configure an unresolved AssetId diagnostic");
+                if (!scene.setMeshMaterialOverride(child.value(), registeredTexturedMaterial.value().id)
+                    || !scene.setMeshMaterialOverride(blueEntity.value(), registeredUnsupportedUvMaterial.value().id))
+                    throw std::runtime_error("Editor material Inspector smoke could not set registered material references");
+                const auto sharedTextureEntity = scene.createEntity("shared project texture preview", root.value());
+                if (!sharedTextureEntity
+                    || !scene.setMeshRenderer(sharedTextureEntity.value(), imported.value().modelAssetId)
+                    || !scene.setMeshMaterialOverride(sharedTextureEntity.value(), registeredTexturedMaterial.value().id))
+                    throw std::runtime_error("Editor Scene View smoke could not configure a shared texture reference");
+                astro::scene::Transform sharedTextureTransform;
+                sharedTextureTransform.position.x = 4.0;
+                if (!scene.setTransform(sharedTextureEntity.value(), sharedTextureTransform))
+                    throw std::runtime_error("Editor Scene View smoke could not position the shared texture mesh");
                 sceneTarget.requestFrameAll();
             }
 #endif
-            selectedEntity = root.value();
+            selectedEntity = child.value();
+            const auto addSmokeCamera = commands.execute<astro::scene::AddCamera3DPayload, void>(
+                "camera3d.add", 1, {child.value()});
+            if (!addSmokeCamera || !scene.camera3D(child.value()))
+                throw std::runtime_error("Camera3D Inspector smoke could not add a camera through the typed command");
+            if (multiTransformInspectorSmoke && multiTransformInspectorSmokePhase < 3)
+            {
+                const auto second = scene.createEntity("Group Transform smoke Ω", root.value());
+                if (!second) throw std::runtime_error("Multi-Transform Inspector could not create its second entity");
+                multiTransformSmokeEntity = second.value();
+                astro::scene::Transform firstTransform;
+                firstTransform.position = {1.0, 2.0, 3.0};
+                firstTransform.rotationDegrees = {4.0, 5.0, 6.0};
+                firstTransform.scale = {1.0, 1.5, 2.0};
+                astro::scene::Transform secondTransform;
+                secondTransform.position = {2.0, 7.0, 8.0};
+                secondTransform.rotationDegrees = {9.0, 10.0, 11.0};
+                secondTransform.scale = {2.0, 2.5, 3.0};
+                if (!scene.setTransform(child.value(), firstTransform)
+                    || !scene.setTransform(multiTransformSmokeEntity, secondTransform))
+                    throw std::runtime_error("Multi-Transform Inspector could not configure distinct local values");
+                const auto* firstComponent = scene.transform(child.value());
+                const auto* secondComponent = scene.transform(multiTransformSmokeEntity);
+                if (!firstComponent || !secondComponent)
+                    throw std::runtime_error("Multi-Transform Inspector fixture lacks a Transform");
+                multiTransformSmokeComponentIds = {firstComponent->id, secondComponent->id};
+                multiTransformSmokeOriginals = {firstComponent->value, secondComponent->value};
+                hierarchySelection = {child.value(), multiTransformSmokeEntity};
+            multiTransformSmokePrimaryEntity = child.value();
+            }
+            const auto primitiveInspectorEntity = scene.createEntity("Primitive Inspector smoke", root.value());
+            if (!primitiveInspectorEntity)
+                throw std::runtime_error("PrimitiveRenderer Inspector smoke could not create its fixture entity");
+            primitiveInspectorSmokeEntity = primitiveInspectorEntity.value();
+            if (codexCameraAdditionSmoke) selectedEntity = primitiveInspectorSmokeEntity;
+            if (hierarchyReparentSmoke || hierarchyReparentManySmoke)
+            {
+                const auto descendant = scene.createEntity("Hierarchy drag descendant Ω", child.value());
+                if (!descendant)
+                    throw std::runtime_error("Hierarchy reparent smoke could not create its descendant fixture");
+                hierarchyReparentSmokeEntity = child.value();
+                hierarchyReparentSmokeTarget = primitiveInspectorSmokeEntity;
+                hierarchyReparentSmokeDescendant = descendant.value();
+                hierarchyReparentSmokeOriginalParent = scene.find(child.value())->parent;
+                const auto* transform = scene.transform(child.value());
+                if (!transform || !hierarchyReparentSmokeOriginalParent)
+                    throw std::runtime_error("Hierarchy reparent smoke fixture is missing its initial parent or Transform");
+                hierarchyReparentSmokeTransformId = transform->id;
+                hierarchyReparentSmokeLocal = transform->value;
+                selectedEntity = child.value();
+                hierarchyForceOpenAncestors = {*hierarchyReparentSmokeOriginalParent};
+                if (hierarchyReparentManySmoke)
+                {
+                    const auto secondParent = scene.createEntity("Hierarchy second source Ω", root.value());
+                    const auto peer = secondParent
+                        ? scene.createEntity("Hierarchy group peer Ω", secondParent.value())
+                        : astro::core::Result<EntityId>::failure({astro::core::ErrorCode::InternalError,
+                            "Could not create the second source parent"});
+                    if (!secondParent || !peer)
+                        throw std::runtime_error("Hierarchy multi-reparent smoke could not create its independent source");
+                    hierarchyReparentManyPeer = peer.value();
+                    hierarchyReparentManyPeerOriginalParent = scene.find(peer.value())->parent;
+                    const auto* peerTransform = scene.transform(peer.value());
+                    if (!peerTransform || !hierarchyReparentManyPeerOriginalParent)
+                        throw std::runtime_error("Hierarchy multi-reparent peer is missing its parent or Transform");
+                    hierarchyReparentManyPeerTransformId = peerTransform->id;
+                    hierarchyReparentManyPeerLocal = peerTransform->value;
+                    hierarchyForceOpenAncestors.push_back(child.value());
+                    hierarchyForceOpenAncestors.push_back(secondParent.value());
+                }
+            }
+            if (codexReparentReviewSmoke)
+            {
+                selectedEntity = child.value();
+                codexReparentReviewSmokeParent = primitiveInspectorSmokeEntity;
+                astro::scene::Transform parentTransform;
+                parentTransform.position = {3.0, 1.0, 0.0};
+                parentTransform.rotationDegrees.y = 20.0;
+                if (!scene.setTransform(primitiveInspectorSmokeEntity, parentTransform))
+                    throw std::runtime_error("AI reparent review smoke could not position its destination parent");
+                const auto descendant = scene.createEntity("Reparent review descendant Ω", child.value());
+                if (!descendant)
+                    throw std::runtime_error("AI reparent review smoke could not create a descendant fixture");
+                codexReparentReviewSmokeDescendant = descendant.value();
+            }
+            const astro::scene::SetPrimitiveRendererPayload addSmokePrimitive{
+                primitiveInspectorSmokeEntity, astro::scene::Primitive3D::Cylinder, false};
+            if (!commands.execute<astro::scene::SetPrimitiveRendererPayload, void>(
+                    "entity.set_primitive_renderer", 1, addSmokePrimitive)
+                || !scene.primitiveRenderer(primitiveInspectorSmokeEntity)
+                || scene.primitiveRenderer(primitiveInspectorSmokeEntity)->primitive != astro::scene::Primitive3D::Cylinder
+                || scene.primitiveRenderer(primitiveInspectorSmokeEntity)->visible)
+                throw std::runtime_error("PrimitiveRenderer Inspector smoke could not add its hidden fixture component");
+            if (codexCameraActivationSmoke)
+            {
+                const auto targetCameraAdded = commands.execute<astro::scene::AddCamera3DPayload, void>(
+                    "camera3d.add", 1, {primitiveInspectorSmokeEntity});
+                if (!targetCameraAdded || !scene.camera3D(primitiveInspectorSmokeEntity))
+                    throw std::runtime_error("Camera3D activation review smoke could not create its target camera");
+                selectedEntity = primitiveInspectorSmokeEntity;
+            }
+            if (runtimeBgfxPointLightSmoke)
+            {
+                commands.clearHistory();
+                const bool added = commands.execute<astro::scene::AddPointLight3DPayload, void>(
+                    "light3d.add_point", 1, {primitiveInspectorSmokeEntity})
+                    && scene.pointLight3D(primitiveInspectorSmokeEntity);
+                const auto componentId = added ? scene.pointLight3D(primitiveInspectorSmokeEntity)->id : 0;
+                const astro::scene::SetPointLight3DPayload edit{
+                    primitiveInspectorSmokeEntity, {0.2f, 0.6f, 1.0f}, 4.0f, 32.0f, false};
+                const bool set = added && commands.execute<astro::scene::SetPointLight3DPayload, void>(
+                    "light3d.set_point", 1, edit);
+                const bool undoSet = set && commands.undo() && scene.pointLight3D(primitiveInspectorSmokeEntity)
+                    && scene.pointLight3D(primitiveInspectorSmokeEntity)->enabled
+                    && scene.pointLight3D(primitiveInspectorSmokeEntity)->color
+                        == std::array<float, 3>{1.0f, 1.0f, 1.0f}
+                    && scene.pointLight3D(primitiveInspectorSmokeEntity)->intensity == 1.0f
+                    && scene.pointLight3D(primitiveInspectorSmokeEntity)->range == 10.0f;
+                const bool redoSet = undoSet && commands.redo() && scene.pointLight3D(primitiveInspectorSmokeEntity)
+                    && scene.pointLight3D(primitiveInspectorSmokeEntity)->id == componentId
+                    && !scene.pointLight3D(primitiveInspectorSmokeEntity)->enabled
+                    && scene.pointLight3D(primitiveInspectorSmokeEntity)->color == edit.color
+                    && scene.pointLight3D(primitiveInspectorSmokeEntity)->intensity == edit.intensity
+                    && scene.pointLight3D(primitiveInspectorSmokeEntity)->range == edit.range;
+                const bool removed = redoSet
+                    && commands.execute<astro::scene::RemovePointLight3DPayload, void>(
+                        "light3d.remove_point", 1, {primitiveInspectorSmokeEntity})
+                    && !scene.pointLight3D(primitiveInspectorSmokeEntity);
+                const bool undoRemove = removed && commands.undo() && scene.pointLight3D(primitiveInspectorSmokeEntity)
+                    && scene.pointLight3D(primitiveInspectorSmokeEntity)->id == componentId
+                    && !scene.pointLight3D(primitiveInspectorSmokeEntity)->enabled
+                    && scene.pointLight3D(primitiveInspectorSmokeEntity)->color == edit.color
+                    && scene.pointLight3D(primitiveInspectorSmokeEntity)->intensity == edit.intensity
+                    && scene.pointLight3D(primitiveInspectorSmokeEntity)->range == edit.range;
+                pointLightInspectorState.smokeCommandsPassed = added && set && undoSet && redoSet && removed && undoRemove;
+                if (!pointLightInspectorState.smokeCommandsPassed)
+                    throw std::runtime_error("PointLight3D Inspector command fixture failed Add/Set/Remove Undo/Redo");
+                commands.clearHistory();
+            }
+            if (runtimeBgfxDirectionalLightSmoke && !directionalLightNoLightSmoke)
+            {
+                commands.clearHistory();
+                const bool added = commands.execute<astro::scene::AddDirectionalLight3DPayload, void>(
+                    "light3d.add_directional", 1, {primitiveInspectorSmokeEntity})
+                    && scene.directionalLight3D(primitiveInspectorSmokeEntity);
+                const auto componentId = added ? scene.directionalLight3D(primitiveInspectorSmokeEntity)->id : 0;
+                const astro::scene::SetDirectionalLight3DPayload edit{
+                    primitiveInspectorSmokeEntity, {0.1f, 0.4f, 0.8f}, 3.5f, false};
+                const bool set = added && commands.execute<astro::scene::SetDirectionalLight3DPayload, void>(
+                    "light3d.set_directional", 1, edit);
+                const bool undoSet = set && commands.undo() && scene.directionalLight3D(primitiveInspectorSmokeEntity)
+                    && scene.directionalLight3D(primitiveInspectorSmokeEntity)->enabled
+                    && scene.directionalLight3D(primitiveInspectorSmokeEntity)->color
+                        == std::array<float, 3>{1.0f, 1.0f, 1.0f}
+                    && scene.directionalLight3D(primitiveInspectorSmokeEntity)->intensity == 1.0f;
+                const bool redoSet = undoSet && commands.redo()
+                    && scene.directionalLight3D(primitiveInspectorSmokeEntity)
+                    && scene.directionalLight3D(primitiveInspectorSmokeEntity)->id == componentId
+                    && !scene.directionalLight3D(primitiveInspectorSmokeEntity)->enabled
+                    && scene.directionalLight3D(primitiveInspectorSmokeEntity)->color == edit.color
+                    && scene.directionalLight3D(primitiveInspectorSmokeEntity)->intensity == edit.intensity;
+                const bool removed = redoSet
+                    && commands.execute<astro::scene::RemoveDirectionalLight3DPayload, void>(
+                        "light3d.remove_directional", 1, {primitiveInspectorSmokeEntity})
+                    && !scene.directionalLight3D(primitiveInspectorSmokeEntity);
+                const bool undoRemove = removed && commands.undo()
+                    && scene.directionalLight3D(primitiveInspectorSmokeEntity)
+                    && scene.directionalLight3D(primitiveInspectorSmokeEntity)->id == componentId
+                    && !scene.directionalLight3D(primitiveInspectorSmokeEntity)->enabled
+                    && scene.directionalLight3D(primitiveInspectorSmokeEntity)->color == edit.color
+                    && scene.directionalLight3D(primitiveInspectorSmokeEntity)->intensity == edit.intensity;
+                directionalLightInspectorState.smokeCommandsPassed = added && set && undoSet && redoSet
+                    && removed && undoRemove;
+                if (!directionalLightInspectorState.smokeCommandsPassed)
+                    throw std::runtime_error("DirectionalLight3D Inspector command fixture failed Add/Set/Remove Undo/Redo");
+                commands.clearHistory();
+            }
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+            if (assetRegistry && !assetRegistry->materialEntries().empty())
+            {
+            const astro::scene::SetPrimitiveMaterialOverridePayload primitiveMaterialSmokePayload{
+                    primitiveInspectorSmokeEntity, assetRegistry->materialEntries().begin()->first};
+                if (!commands.execute<astro::scene::SetPrimitiveMaterialOverridePayload, void>(
+                    "entity.set_primitive_material_override", 1, primitiveMaterialSmokePayload)
+                    || scene.primitiveRenderer(primitiveInspectorSmokeEntity)->materialOverride
+                    != primitiveMaterialSmokePayload.material
+                    || !commands.undo()
+                    || scene.primitiveRenderer(primitiveInspectorSmokeEntity)->materialOverride.value != 0
+                    || !commands.redo()
+                    || scene.primitiveRenderer(primitiveInspectorSmokeEntity)->materialOverride
+                    != primitiveMaterialSmokePayload.material)
+                    throw std::runtime_error("Primitive material Inspector fixture assignment/Undo/Redo failed");
+                const astro::scene::SetPrimitiveMaterialOverridePayload clearPrimitiveMaterialSmoke{
+                    primitiveInspectorSmokeEntity, {}};
+                if (!commands.execute<astro::scene::SetPrimitiveMaterialOverridePayload, void>(
+                        "entity.set_primitive_material_override", 1, clearPrimitiveMaterialSmoke)
+                    || scene.primitiveRenderer(primitiveInspectorSmokeEntity)->materialOverride.value != 0)
+                    throw std::runtime_error("Primitive material Inspector fixture could not clear its override");
+                commands.clearHistory();
+            }
+#endif
+            const astro::scene::SetPrimitiveRendererPayload editSmokePrimitive{
+                primitiveInspectorSmokeEntity, astro::scene::Primitive3D::Sphere, true};
+            if (!commands.execute<astro::scene::SetPrimitiveRendererPayload, void>(
+                    "entity.set_primitive_renderer", 1, editSmokePrimitive)
+                || !commands.undo() || scene.primitiveRenderer(primitiveInspectorSmokeEntity)->primitive != astro::scene::Primitive3D::Cylinder
+                || scene.primitiveRenderer(primitiveInspectorSmokeEntity)->visible
+                || !commands.redo() || scene.primitiveRenderer(primitiveInspectorSmokeEntity)->primitive != astro::scene::Primitive3D::Sphere
+                || !scene.primitiveRenderer(primitiveInspectorSmokeEntity)->visible)
+                throw std::runtime_error("PrimitiveRenderer shape/visibility command Undo/Redo smoke failed");
+            const astro::scene::SetPrimitiveRendererPayload hideSmokePrimitive{
+                primitiveInspectorSmokeEntity, astro::scene::Primitive3D::Cylinder, false};
+            if (!commands.execute<astro::scene::SetPrimitiveRendererPayload, void>(
+                    "entity.set_primitive_renderer", 1, hideSmokePrimitive))
+                throw std::runtime_error("PrimitiveRenderer Inspector smoke could not restore its hidden fixture");
+            commands.clearHistory();
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+            if (primitiveMaterialSmoke)
+            {
+                if (primitiveMaterialSmokeAsset.value == 0)
+                    throw std::runtime_error("Primitive material screenshot has no registered material fixture");
+                astro::scene::Transform materialPrimitiveTransform;
+                materialPrimitiveTransform.position = {3.0, 0.0, 0.5};
+                if (!scene.setTransform(primitiveInspectorSmokeEntity, materialPrimitiveTransform))
+                    throw std::runtime_error("Could not position the visible material primitive fixture");
+                const astro::scene::SetPrimitiveRendererPayload visibleMaterialCube{
+                    primitiveInspectorSmokeEntity, astro::scene::Primitive3D::Cube, true};
+                const astro::scene::SetPrimitiveMaterialOverridePayload assignVisibleMaterial{
+                    primitiveInspectorSmokeEntity, primitiveMaterialSmokeAsset};
+                if (!commands.execute<astro::scene::SetPrimitiveRendererPayload, void>(
+                        "entity.set_primitive_renderer", 1, visibleMaterialCube)
+                    || !commands.execute<astro::scene::SetPrimitiveMaterialOverridePayload, void>(
+                        "entity.set_primitive_material_override", 1, assignVisibleMaterial))
+                    throw std::runtime_error("Could not assign the material to the visible Scene View Cube");
+                sceneTarget.requestFrameAll();
+            }
+            if (runtimeBgfxDirectionalLightSmoke)
+            {
+                directionalLightSmokeScene.emplace(7993, "Directional light pixel fixture");
+                const auto frontPlane = directionalLightSmokeScene->createEntity("Front-facing light fixture");
+                const auto backPlane = directionalLightSmokeScene->createEntity("Back-facing light fixture");
+                const auto sceneLight = directionalLightSmokeScene->createEntity(runtimeBgfxPointLightSmoke
+                    ? "Scene View blue point light" : "Scene View red directional light");
+                astro::scene::Transform frontTransform;
+                frontTransform.position = {-1.5, 0.0, 0.0};
+                frontTransform.rotationDegrees.x = -90.0;
+                frontTransform.scale = {1.4, 1.4, 1.4};
+                auto backTransform = frontTransform;
+                backTransform.position.x = 1.5;
+                backTransform.rotationDegrees.x = 90.0;
+                astro::scene::Transform sceneLightTransform;
+                sceneLightTransform.position.z = 3.0;
+                if (!frontPlane || !backPlane || !sceneLight
+                    || !directionalLightSmokeScene->setPrimitiveRenderer(
+                        frontPlane.value(), astro::scene::Primitive3D::Plane)
+                    || !directionalLightSmokeScene->setPrimitiveRenderer(
+                        backPlane.value(), astro::scene::Primitive3D::Plane)
+                    || !directionalLightSmokeScene->setTransform(frontPlane.value(), frontTransform)
+                    || !directionalLightSmokeScene->setTransform(backPlane.value(), backTransform)
+                    || !directionalLightSmokeScene->setTransform(sceneLight.value(), sceneLightTransform)
+                    || (!runtimeBgfxPointLightSmoke && !directionalLightSmokeScene->setDirectionalLight3D(
+                        sceneLight.value(), {1.0f, 0.0f, 0.0f}, 0.65f,
+                        !directionalLightNoLightSmoke))
+                    || (runtimeBgfxPointLightSmoke && !directionalLightSmokeScene->setPointLight3D(
+                        sceneLight.value(), {0.0f, 0.0f, 1.0f}, 8.0f, 12.0f))
+                    )
+                    throw std::runtime_error("Scene View light smoke fixture setup failed");
+                sceneTarget.requestFrameAll();
+            }
+#endif
+            const auto smokeCameraId = scene.camera3D(child.value())->id;
+            const astro::scene::SetCamera3DLensPayload smokeLens{child.value(), 75.0, 0.2, 800.0};
+            if (!commands.execute<astro::scene::SetCamera3DLensPayload, void>(
+                    "camera3d.set_lens", 1, smokeLens)
+                || scene.camera3D(child.value())->verticalFovDegrees != 75.0
+                || !commands.undo() || scene.camera3D(child.value())->verticalFovDegrees != 60.0
+                || !commands.redo() || scene.camera3D(child.value())->id != smokeCameraId
+                || scene.camera3D(child.value())->verticalFovDegrees != 75.0)
+                throw std::runtime_error("Camera3D lens command/Undo/Redo smoke failed");
+            if (!commands.execute<astro::scene::SetActiveCamera3DPayload, void>(
+                    "camera3d.set_active", 1, {child.value()})
+                || scene.activeCamera3D() != child.value()
+                || !commands.undo() || scene.activeCamera3D()
+                || !commands.redo() || scene.activeCamera3D() != child.value())
+                throw std::runtime_error("Camera3D active selection Undo/Redo smoke failed");
+            if (gameViewCameraDiagnosticCase != 0)
+            {
+                const auto diagnosticCamera = scene.createEntity("Smoke Game View Diagnostic Camera", root.value());
+                if (!diagnosticCamera || !scene.setCamera3D(diagnosticCamera.value(), 60.0, 0.1, 1000.0)
+                    || (gameViewCameraDiagnosticCase < 3 && !scene.setCamera3DActive(child.value(), false)))
+                    throw std::runtime_error("Game View diagnostic smoke could not prepare an isolated camera");
+                if (gameViewCameraDiagnosticCase == 2)
+                {
+                    if (!scene.setCamera3DActive(diagnosticCamera.value(), true))
+                        throw std::runtime_error("Game View invalid-camera smoke could not select its camera");
+                    astro::scene::Transform invalidCameraTransform;
+                    invalidCameraTransform.scale.x = 0.0;
+                    if (!scene.setTransform(diagnosticCamera.value(), invalidCameraTransform))
+                        throw std::runtime_error("Game View invalid-camera smoke could not configure a degenerate pose");
+                }
+                if (gameViewCameraDiagnosticCase == 3)
+                {
+                    const auto missingMesh = scene.createEntity("Smoke Missing Mesh Diagnostic", root.value());
+                    if (!missingMesh || !scene.setMeshRenderer(missingMesh.value(), {900000002ull}))
+                        throw std::runtime_error("Game View mesh diagnostic smoke could not configure an unresolved model");
+                    smokeDiagnosticExpectedEntity = missingMesh.value();
+                }
+                else smokeDiagnosticExpectedEntity = gameViewCameraDiagnosticCase == 1
+                    ? child.value() : diagnosticCamera.value();
+            }
+            commands.clearHistory();
             showTimeline = true;
             showSaveSystem = true;
             showCameraPresets = true;
@@ -4802,8 +9430,71 @@ public:
                 || !queueShortcut(SDLK_S) || !queueShortcut(SDLK_O))
                 throw std::runtime_error("Scene shortcut smoke setup failed");
             {
-                const auto playStarted = playSession.play(scene,
-                    [](Scene&, double) { return astro::core::Result<void>::success(); });
+                astro::core::Result<void> playStarted = astro::core::Result<void>::success();
+                if (runtimeBgfxGameViewSmoke || runtimeBgfxGameViewTextureSmoke || runtimeBgfxDirectionalLightSmoke)
+                {
+#if defined(ASTRO_EDITOR_HAS_RUNTIME_BGFX_3D)
+                    runtimeBgfxGameViewAuthoringScene.emplace(7992, runtimeBgfxGameViewTextureSmoke
+                        ? "Runtime BGFX Game View texture smoke" : runtimeBgfxDirectionalLightSmoke
+                            ? "Runtime BGFX directional light smoke" : "Runtime BGFX Game View smoke");
+                    const auto camera = runtimeBgfxGameViewAuthoringScene->createEntity("Play Camera");
+                    const auto cube = runtimeBgfxGameViewAuthoringScene->createEntity(
+                        runtimeBgfxGameViewTextureSmoke ? "Textured Play Mesh" : "Play Cube");
+                    const auto sourceTextured = runtimeBgfxGameViewTextureSmoke
+                        ? runtimeBgfxGameViewAuthoringScene->createEntity("glTF Source Texture")
+                        : astro::core::Result<EntityId>::success(0);
+                    const auto directionalLight = runtimeBgfxDirectionalLightSmoke
+                        ? runtimeBgfxGameViewAuthoringScene->createEntity(runtimeBgfxPointLightSmoke
+                            ? "Blue point light" : "Red directional light")
+                        : astro::core::Result<EntityId>::success(0);
+                    astro::scene::Transform cameraTransform;
+                    cameraTransform.position.z = 8.0;
+                    astro::scene::Transform projectTextureTransform;
+                    projectTextureTransform.position.x = -1.2;
+                    astro::scene::Transform sourceTextureTransform;
+                    sourceTextureTransform.position.x = 0.7;
+                    sourceTextureTransform.scale = {0.35, 0.35, 0.35};
+                    if (!camera || !cube || !directionalLight
+                        || !sourceTextured
+                        || !runtimeBgfxGameViewAuthoringScene->setTransform(camera.value(), cameraTransform)
+                        || (runtimeBgfxGameViewTextureSmoke
+                            && !runtimeBgfxGameViewAuthoringScene->setTransform(cube.value(), projectTextureTransform))
+                        || !runtimeBgfxGameViewAuthoringScene->setCamera3D(camera.value(), 60.0, 0.1, 100.0)
+                        || !runtimeBgfxGameViewAuthoringScene->setCamera3DActive(camera.value(), true)
+                        || (runtimeBgfxDirectionalLightSmoke
+                            && !runtimeBgfxPointLightSmoke
+                            && !runtimeBgfxGameViewAuthoringScene->setDirectionalLight3D(
+                                directionalLight.value(), {1.0f, 0.0f, 0.0f}, 0.65f,
+                                !directionalLightNoLightSmoke))
+                        || (runtimeBgfxPointLightSmoke
+                            && (!runtimeBgfxGameViewAuthoringScene->setTransform(directionalLight.value(),
+                                    astro::scene::Transform{{0.0, 0.0, 3.0}, {}, {1.0, 1.0, 1.0}})
+                                || !runtimeBgfxGameViewAuthoringScene->setPointLight3D(
+                                    directionalLight.value(), {0.0f, 0.0f, 1.0f}, 8.0f, 12.0f)))
+                        || (runtimeBgfxGameViewTextureSmoke
+                            ? (!runtimeBgfxSmokeModelAsset || !runtimeBgfxSmokeTextureAsset
+                                || !runtimeBgfxGameViewAuthoringScene->setMeshRenderer(cube.value(),
+                                    *runtimeBgfxSmokeModelAsset, 0, 1)
+                                || !runtimeBgfxGameViewAuthoringScene->setMeshMaterialOverride(cube.value(),
+                                    *runtimeBgfxSmokeTextureAsset))
+                            : !runtimeBgfxGameViewAuthoringScene->setPrimitiveRenderer(cube.value(),
+                                astro::scene::Primitive3D::Cube))
+                        || (runtimeBgfxGameViewTextureSmoke
+                            && (!runtimeBgfxSmokeModelAsset
+                                || !runtimeBgfxGameViewAuthoringScene->setMeshRenderer(sourceTextured.value(),
+                                    *runtimeBgfxSmokeModelAsset, 0, 1)
+                                || !runtimeBgfxGameViewAuthoringScene->setTransform(sourceTextured.value(),
+                                    sourceTextureTransform))))
+                        throw std::runtime_error("Runtime BGFX Game View smoke scene setup failed");
+                    playStarted = playSession.play(*runtimeBgfxGameViewAuthoringScene,
+                        [](Scene&, double) { return astro::core::Result<void>::success(); });
+#else
+                    throw std::runtime_error("Runtime BGFX Game View smoke requires the optional adapter build");
+#endif
+                }
+                else
+                    playStarted = playSession.play(scene,
+                        [](Scene&, double) { return astro::core::Result<void>::success(); });
                 if (!playStarted || !playSession.runtimeScene())
                     throw std::runtime_error("Game View runtime copy smoke failed");
             }
@@ -5117,6 +9808,9 @@ public:
             activeBenchmarkScene = 0;
             scene = benchmarkScenes.front();
             selectedEntity = scene.entities().empty() ? std::nullopt : std::optional<EntityId>{scene.entities().front().id};
+            if ((runtimeBgfxPointLightSmoke || (runtimeBgfxDirectionalLightSmoke && !directionalLightNoLightSmoke))
+                && primitiveInspectorSmokeEntity != 0)
+                selectedEntity = primitiveInspectorSmokeEntity;
             sceneDirty = false;
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
             if (benchmark3d) sceneTarget.requestFrameAll();
@@ -5126,11 +9820,36 @@ public:
                 [](Scene&, double) { return astro::core::Result<void>::success(); });
             if (!started) throw std::runtime_error("Could not start full-frame benchmark runtime copy");
         }
-        while (running && (smoke ? (frames < 140
+        while (running && (rendererBackendSmoke ? frames < 4 : smoke ? (frames < (lightInspectorPointerSmoke ? 260 : 140)
                 || (inspectCopyDialog && puzzleCampaignArchiveConflictCopyPreview.has_value()))
             : benchmark ? activeBenchmarkScene >= 0 && activeBenchmarkScene < static_cast<int>(benchmarkScenes.size())
                 && frames < benchmarkWarmupFrames + benchmarkMeasuredFrames : true))
         {
+            if (projectPathDialogRequest)
+            {
+                bool completed = false;
+                bool cancelled = false;
+                std::string selectedPath;
+                std::string error;
+                {
+                    std::lock_guard lock(projectPathDialogRequest->mutex);
+                    completed = projectPathDialogRequest->completed;
+                    cancelled = projectPathDialogRequest->cancelled;
+                    selectedPath = projectPathDialogRequest->selectedPath;
+                    error = projectPathDialogRequest->error;
+                }
+                if (completed)
+                {
+                    if (!error.empty()) reportError(tr("File dialog failed: ") + error);
+                    else if (!cancelled && !selectedPath.empty())
+                    {
+                        if (selectedPath.size() >= sizeof(path))
+                            reportError(tr("Selected path is too long for the project path field"));
+                        else std::memcpy(path, selectedPath.c_str(), selectedPath.size() + 1);
+                    }
+                    projectPathDialogRequest.reset();
+                }
+            }
             if (puzzleCampaignTransferRefreshPending)
             {
                 puzzleCampaignTransferRefreshPending = false;
@@ -5145,8 +9864,26 @@ public:
             SDL_Event event;
             while (SDL_PollEvent(&event))
             {
-                ImGui_ImplSDL3_ProcessEvent(&event);
+                const bool imguiEventAccepted = ImGui_ImplSDL3_ProcessEvent(&event);
+                if (lightInspectorPointerSmoke && event.type == SDL_EVENT_TEXT_INPUT)
+                    lightInspectorKeyboardTextEventAccepted = imguiEventAccepted;
+                if (multiTransformInspectorSmoke && event.type == SDL_EVENT_TEXT_INPUT)
+                    multiTransformKeyboardTextEventAccepted = imguiEventAccepted;
                 if (event.type == SDL_EVENT_QUIT) running = false;
+                if (event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED
+                    || event.type == SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED
+                    || event.type == SDL_EVENT_WINDOW_RESIZED)
+                    constrainWindowToCurrentDisplay();
+                if (monitorDpiSmoke && event.type >= SDL_EVENT_WINDOW_FIRST
+                    && event.type <= SDL_EVENT_WINDOW_LAST
+                    && event.window.windowID == SDL_GetWindowID(window))
+                {
+                    if (event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED) monitorTransitionEvents_ |= 0x1u;
+                    if (event.type == SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED) monitorTransitionEvents_ |= 0x2u;
+                }
+                if (windowGeometryEventPending_ && event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED
+                    && event.window.windowID == SDL_GetWindowID(window))
+                    windowGeometryEventObserved_ = true;
                 if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat
                     && !ImGui::GetIO().WantCaptureKeyboard && (event.key.mod & SDL_KMOD_CTRL) != 0)
                 {
@@ -5172,13 +9909,89 @@ public:
             if (newWidth <= 0 || newHeight <= 0) { SDL_Delay(16); continue; }
             if (newWidth != width || newHeight != height)
             {
+                const int oldWidth = width, oldHeight = height;
                 width = newWidth; height = newHeight;
                 bgfx::SwapChain swapChain;
                 swapChain.width = width; swapChain.height = height;
                 bgfx::reset(BGFX_RESET_VSYNC, &swapChain);
+                if (vulkanGameViewResizeTrace)
+                {
+                    const auto* statsBeforeResetFrame = bgfx::getStats();
+                    std::cout << "[editor] vulkanResizeTrace event=reset frame=" << frames
+                        << " from=" << oldWidth << 'x' << oldHeight
+                        << " requested=" << width << 'x' << height
+                        << " statsBefore=" << (statsBeforeResetFrame ? statsBeforeResetFrame->width : 0)
+                        << 'x' << (statsBeforeResetFrame ? statsBeforeResetFrame->height : 0) << '\n';
+                    tapResizeTraceFramesRemaining = tapResizeTraceCapturesPerTransition;
+                    tapResizeTraceWidth = width;
+                    tapResizeTraceHeight = height;
+                }
             }
-            if (smoke && (frames == 20 || frames == 45))
-                SDL_SetWindowSize(window, frames == 20 ? 1280 : 1100, frames == 20 ? 800 : 720);
+            const int vulkanResizeTraceStride = vulkanGameViewResizeCycles > 1 ? 15 : 25;
+            const int vulkanResizeTraceEventCount = 2 * vulkanGameViewResizeCycles;
+            const bool vulkanResizeTraceWindowChange = vulkanGameViewResizeTrace
+                && frames >= 20
+                && frames <= 20 + vulkanResizeTraceStride * (vulkanResizeTraceEventCount - 1)
+                && (frames - 20) % vulkanResizeTraceStride == 0;
+            if (smoke && (frames == 20 || frames == 45 || vulkanResizeTraceWindowChange))
+            {
+                SDL_Rect workArea{};
+                const bool hasWorkArea = currentDisplayWorkArea(workArea);
+                const bool growVulkanResizeTrace = vulkanGameViewResizeTrace
+                    && ((frames - 20) / vulkanResizeTraceStride) % 2 == 0;
+                const bool growWindow = frames == 20 || growVulkanResizeTrace;
+                const auto requestedWidth = growWindow ? 1280
+                    : assetBrowserModelPreviewSmoke ? 864 : initialLogicalWidth_;
+                const auto requestedHeight = growWindow ? 800
+                    : assetBrowserModelPreviewSmoke ? 608 : initialLogicalHeight_;
+                const auto resizePlan = astro::editor::EditorWorkspaceLayoutPolicy::calculate(
+                    hasWorkArea ? workArea.w : requestedWidth,
+                    hasWorkArea ? workArea.h : requestedHeight, requestedWidth, requestedHeight);
+                SDL_SetWindowSize(window, resizePlan.windowWidth, resizePlan.windowHeight);
+                constrainWindowToCurrentDisplay();
+            }
+            if (windowGeometrySmoke && frames == 90)
+            {
+                SDL_Rect workArea{};
+                if (!currentDisplayWorkArea(workArea))
+                    throw std::runtime_error("SDL geometry smoke could not query the current display work area");
+                const int outsideX = workArea.x + workArea.w + 32;
+                SDL_SetWindowPosition(window, outsideX, workArea.y + 16);
+                int movedX = 0, movedY = 0;
+                if (!SDL_GetWindowPosition(window, &movedX, &movedY) || movedX < outsideX)
+                    throw std::runtime_error("SDL geometry smoke could not move its window outside the usable area");
+                SDL_Event displayChanged{};
+                displayChanged.type = SDL_EVENT_WINDOW_DISPLAY_CHANGED;
+                displayChanged.window.windowID = SDL_GetWindowID(window);
+                windowGeometryEventPending_ = true;
+                if (!SDL_PushEvent(&displayChanged))
+                    throw std::runtime_error(std::string("SDL geometry smoke could not queue display-change event: ")
+                        + SDL_GetError());
+            }
+            if (monitorDpiSmoke && frames == 90)
+            {
+                monitorTransitionEvents_ = 0;
+                if (!positionWindowOnDisplay(monitorTargetDisplay_))
+                    throw std::runtime_error(std::string("Could not move the SDL window to the mixed-DPI display: ")
+                        + SDL_GetError());
+                monitorTransitionPhase_ = 1;
+            }
+            if (windowGeometrySmoke && frames == 91)
+            {
+                SDL_Rect workArea{};
+                int x = 0, y = 0, geometryWidth = 0, geometryHeight = 0;
+                if (!windowGeometryEventObserved_ || !currentDisplayWorkArea(workArea)
+                    || !SDL_GetWindowPosition(window, &x, &y)
+                    || !SDL_GetWindowSize(window, &geometryWidth, &geometryHeight))
+                    throw std::runtime_error("SDL geometry smoke did not process a display-change event");
+                const auto bounded = astro::editor::EditorWorkspaceLayoutPolicy::constrainWindow(
+                    workArea.x, workArea.y, workArea.w, workArea.h, x, y, geometryWidth, geometryHeight);
+                if (x != bounded.x || y != bounded.y
+                    || geometryWidth != bounded.width || geometryHeight != bounded.height)
+                    throw std::runtime_error("SDL display-change event left the window outside the usable work area");
+                windowGeometrySmokePassed_ = true;
+                windowGeometryEventPending_ = false;
+            }
 #if defined(ASTRO_EDITOR_HAS_PUZZLE_RUNTIME)
             if (smoke && frames == 108 && puzzleSmokeReady)
             {
@@ -5492,6 +10305,67 @@ public:
                     }
             SceneViewTarget::Timings editorSceneTiming, editorGameTiming;
             ImGui_ImplSDL3_NewFrame();
+            updateUiDisplayScale();
+            if (monitorDpiSmoke && monitorTransitionPhase_ == 1)
+            {
+                const auto currentDisplay = SDL_GetDisplayForWindow(window);
+                const auto currentScale = SDL_GetWindowDisplayScale(window);
+                if (currentDisplay == monitorTargetDisplay_ && std::isfinite(currentScale)
+                    && std::abs(currentScale - monitorTargetScale_) < 0.01f
+                    && std::abs(uiScalePolicy_->appliedScale() - monitorTargetScale_) < 0.01f)
+                {
+                    std::cout << "[editor] mixedDpiForward source=" << monitorSourceDisplay_ << '@'
+                              << monitorSourceScale_ << " target=" << currentDisplay << '@' << currentScale
+                              << " uiScale=" << uiScalePolicy_->appliedScale()
+                              << " sdlEventMask=" << monitorTransitionEvents_ << '\n';
+                    monitorTransitionEvents_ = 0;
+                    if (!positionWindowOnDisplay(monitorSourceDisplay_))
+                        throw std::runtime_error(std::string("Could not return the SDL window to its source display: ")
+                            + SDL_GetError());
+                    monitorTransitionPhase_ = 2;
+                }
+                else if (frames > 110)
+                    throw std::runtime_error("Mixed-DPI forward move did not update SDL display and UI scale");
+            }
+            else if (monitorDpiSmoke && monitorTransitionPhase_ == 2)
+            {
+                const auto currentDisplay = SDL_GetDisplayForWindow(window);
+                const auto currentScale = SDL_GetWindowDisplayScale(window);
+                if (currentDisplay == monitorSourceDisplay_ && std::isfinite(currentScale)
+                    && std::abs(currentScale - monitorSourceScale_) < 0.01f
+                    && std::abs(uiScalePolicy_->appliedScale() - monitorSourceScale_) < 0.01f)
+                {
+                    monitorTransitionSmokePassed_ = true;
+                    monitorTransitionPhase_ = 3;
+                    std::cout << "[editor] mixedDpiReturn display=" << currentDisplay << '@' << currentScale
+                              << " uiScale=" << uiScalePolicy_->appliedScale()
+                              << " sdlEventMask=" << monitorTransitionEvents_ << '\n';
+                }
+                else if (frames > 120)
+                    throw std::runtime_error("Mixed-DPI return move did not restore the source display/UI scale");
+            }
+            if (!pendingSmokeMouseEvents.empty())
+            {
+                auto& io = ImGui::GetIO();
+                auto* viewport = ImGui::GetMainViewport();
+                if (!viewport) throw std::runtime_error("Mouse smoke could not resolve the main ImGui viewport");
+                for (const auto& pendingEvent : pendingSmokeMouseEvents)
+                {
+                    const bool desktopCoordinates = (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0;
+                    const float mouseX = pendingEvent.x + (desktopCoordinates ? viewport->Pos.x : 0.0f);
+                    const float mouseY = pendingEvent.y + (desktopCoordinates ? viewport->Pos.y : 0.0f);
+                    io.AddMousePosEvent(mouseX, mouseY);
+                    if (pendingEvent.type == SDL_EVENT_MOUSE_BUTTON_DOWN || pendingEvent.type == SDL_EVENT_MOUSE_BUTTON_UP)
+                    {
+                        const int imguiButton = pendingEvent.button == SDL_BUTTON_LEFT ? ImGuiMouseButton_Left
+                            : pendingEvent.button == SDL_BUTTON_RIGHT ? ImGuiMouseButton_Right
+                            : pendingEvent.button == SDL_BUTTON_MIDDLE ? ImGuiMouseButton_Middle : -1;
+                        if (imguiButton < 0) throw std::runtime_error("Mouse smoke used an unsupported button");
+                        io.AddMouseButtonEvent(imguiButton, pendingEvent.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+                    }
+                }
+                pendingSmokeMouseEvents.clear();
+            }
             ImGui::NewFrame();
             if (ImGui::BeginMainMenuBar())
             {
@@ -5567,6 +10441,7 @@ public:
                     ImGui::MenuItem(tr("Project"), nullptr, &showProject);
                     ImGui::MenuItem(tr("C# Code"), nullptr, &showCodeWorkspace);
                     ImGui::MenuItem(tr("Diagnostics"), nullptr, &showDiagnostics);
+                    ImGui::MenuItem(tr("AI Change Review"), nullptr, &showAIChangeReview);
                     ImGui::MenuItem(tr("Game View"), nullptr, &showGameView);
 #if defined(ASTRO_EDITOR_HAS_PUZZLE_RUNTIME)
                     ImGui::MenuItem(tr("Puzzle Campaign Browser"), nullptr, &showPuzzleCampaignBrowser);
@@ -5596,9 +10471,15 @@ public:
                 ImGui::DockBuilderAddNode(dock, ImGuiDockNodeFlags_DockSpace);
                 ImGui::DockBuilderSetNodeSize(dock, ImGui::GetMainViewport()->WorkSize);
                 ImGuiID left, remainder, center, right, logicPane, scenePane;
-                ImGui::DockBuilderSplitNode(dock, ImGuiDir_Left, 0.23f, &left, &remainder);
-                ImGui::DockBuilderSplitNode(remainder, ImGuiDir_Right, 0.25f, &right, &center);
-                ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.32f, &logicPane, &scenePane);
+                int logicalWidth = 0, logicalHeight = 0;
+                SDL_GetWindowSize(window, &logicalWidth, &logicalHeight);
+                SDL_Rect workArea{};
+                if (currentDisplayWorkArea(workArea))
+                    workspaceLayout_ = astro::editor::EditorWorkspaceLayoutPolicy::calculate(
+                        workArea.w, workArea.h, logicalWidth, logicalHeight);
+                ImGui::DockBuilderSplitNode(dock, ImGuiDir_Left, workspaceLayout_.leftPaneFraction, &left, &remainder);
+                ImGui::DockBuilderSplitNode(remainder, ImGuiDir_Right, workspaceLayout_.rightPaneFraction, &right, &center);
+                ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, workspaceLayout_.bottomPaneFraction, &logicPane, &scenePane);
                 ImGui::DockBuilderDockWindow(tr("Hierarchy"), left);
                 ImGui::DockBuilderDockWindow(tr("Scene View"), scenePane);
                 ImGui::DockBuilderDockWindow(tr("Visual Logic"), logicPane);
@@ -5667,11 +10548,632 @@ public:
             {
                 ImGui::Begin(tr("Project"), &showProject);
                 docked = ImGui::IsWindowDocked();
+                const auto projectWindowSize = ImGui::GetWindowSize();
+                if (projectAssetPreviewLastWindowSize.x >= 0.0f
+                    && (std::abs(projectWindowSize.x - projectAssetPreviewLastWindowSize.x) > 1.0f
+                        || std::abs(projectWindowSize.y - projectAssetPreviewLastWindowSize.y) > 1.0f))
+                    projectAssetPreviewScrollRequested = false;
+                projectAssetPreviewLastWindowSize = projectWindowSize;
                 ImGui::TextUnformatted(activeProject.empty() ? tr("No project open") : activeProject.c_str());
                 ImGui::Separator();
                 ImGui::TextWrapped(tr("Scene files are stored under Scenes. Import PNG/JPEG source files from Assets/."));
                 if (assetRegistry)
                 {
+                    const auto currentPreviewSelection = selectedProjectAssetRoot == assetRegistry->projectRoot()
+                        ? selectedProjectAsset : std::nullopt;
+                    if (projectAssetPreviewRoot != assetRegistry->projectRoot()
+                        || projectAssetPreviewSelection != currentPreviewSelection)
+                    {
+                        projectAssetPreviewRoot = assetRegistry->projectRoot();
+                        projectAssetPreviewSelection = currentPreviewSelection;
+                        projectAssetPreviewScrollRequested = false;
+                        projectAssetPreviewRightDragActive = false;
+                        projectAssetPreviewMiddleDragActive = false;
+                        projectModelPreviewId.reset();
+                        projectModelPreviewDiagnostic.clear();
+                        projectModelPreviewMeshCount = projectModelPreviewPrimitiveCount = 0;
+                        projectModelPreviewVertexCount = projectModelPreviewIndexCount = 0;
+                        projectAssetPreviewScene = Scene(0xFFFF'FFF0u, "Project Model Preview");
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+                        assetModelPreviewTarget.invalidate3dCache();
+#endif
+                    }
+                    if (selectedProjectAsset && selectedProjectAssetRoot == assetRegistry->projectRoot())
+                    {
+                        if (const auto info = registeredAssetInfo(*assetRegistry, *selectedProjectAsset))
+                        {
+                            ImGui::SeparatorText(tr("Selected registered asset"));
+                            ImGui::TextDisabled(tr("Asset type: %s"), tr(info->kind.data()));
+                            const auto sourcePath = std::string(info->sourceRelativePath);
+                            ImGui::TextWrapped(tr("AssetId %llu — %s"),
+                                static_cast<unsigned long long>(selectedProjectAsset->value), sourcePath.c_str());
+                            selectedProjectAssetDisplayPath = sourcePath;
+                            projectSelectedAssetShown = true;
+                        }
+                    }
+                    assetBrowserPanelDrawn = true;
+                    ImGui::SeparatorText(tr("Asset Browser"));
+                    const std::array<std::size_t, 4> currentCatalogCounts{
+                        assetRegistry->entries().size(), assetRegistry->modelEntries().size(),
+                        assetRegistry->materialEntries().size(), assetRegistry->scriptEntries().size()};
+                    if (assetBrowserCatalogRoot != assetRegistry->projectRoot()
+                        || assetBrowserCatalogCounts != currentCatalogCounts)
+                        assetBrowserCatalogDirty = true;
+                    if (assetBrowserCatalogDirty)
+                    {
+                        assetBrowserCatalog = astro::editor::buildAssetBrowserCatalog(*assetRegistry);
+                        assetBrowserCatalogRoot = assetRegistry->projectRoot();
+                        assetBrowserCatalogCounts = currentCatalogCounts;
+                        assetBrowserCatalogDirty = false;
+                        assetBrowserVisible = astro::editor::filterAssetBrowserCatalog(assetBrowserCatalog,
+                            assetBrowserQuery.data(), assetBrowserTypeFilter);
+                    }
+                    if (ImGui::InputText(tr("Search by path or AssetId (UTF-8)"),
+                        assetBrowserQuery.data(), assetBrowserQuery.size()))
+                        assetBrowserVisible = astro::editor::filterAssetBrowserCatalog(assetBrowserCatalog,
+                            assetBrowserQuery.data(), assetBrowserTypeFilter);
+                    assetBrowserSearchDrawn = true;
+
+                    const std::array<std::pair<astro::editor::AssetBrowserTypeFilter, const char*>, 5> typeOptions{{
+                        {astro::editor::AssetBrowserTypeFilter::All, "All asset types"},
+                        {astro::editor::AssetBrowserTypeFilter::Images, "Images"},
+                        {astro::editor::AssetBrowserTypeFilter::Models, "Models"},
+                        {astro::editor::AssetBrowserTypeFilter::Materials, "Materials"},
+                        {astro::editor::AssetBrowserTypeFilter::Scripts, "Scripts"}}};
+                    const auto currentTypeLabel = [&]() -> const char* {
+                        const auto option = std::find_if(typeOptions.begin(), typeOptions.end(), [&](const auto& item) {
+                            return item.first == assetBrowserTypeFilter;
+                        });
+                        return option == typeOptions.end() ? tr("All asset types") : tr(option->second);
+                    };
+                    if (ImGui::BeginCombo(tr("Asset type"), currentTypeLabel()))
+                    {
+                        for (const auto& [filter, label] : typeOptions)
+                        {
+                            const bool selected = filter == assetBrowserTypeFilter;
+                            if (ImGui::Selectable(tr(label), selected))
+                            {
+                                assetBrowserTypeFilter = filter;
+                                assetBrowserVisible = astro::editor::filterAssetBrowserCatalog(assetBrowserCatalog,
+                                    assetBrowserQuery.data(), assetBrowserTypeFilter);
+                            }
+                            if (selected) ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                    assetBrowserTypeFilterDrawn = true;
+                    ImGui::SameLine();
+                    if (ImGui::Button(tr("Refresh asset catalog")))
+                    {
+                        assetBrowserCatalog = astro::editor::buildAssetBrowserCatalog(*assetRegistry);
+                        assetBrowserCatalogRoot = assetRegistry->projectRoot();
+                        assetBrowserCatalogCounts = currentCatalogCounts;
+                        assetBrowserCatalogDirty = false;
+                        assetBrowserVisible = astro::editor::filterAssetBrowserCatalog(assetBrowserCatalog,
+                            assetBrowserQuery.data(), assetBrowserTypeFilter);
+                    }
+                    ImGui::TextDisabled(tr("Visible assets: %zu"), assetBrowserVisible.size());
+                    assetBrowserVisibleCount = assetBrowserVisible.size();
+                    ImGui::BeginChild("##asset-browser-list", ImVec2(-1.0f, 220.0f), ImGuiChildFlags_Borders);
+                    if (assetBrowserVisible.empty())
+                        ImGui::TextDisabled(tr("No registered assets match the current filter"));
+                    else
+                    {
+                        ImGuiListClipper clipper;
+                        clipper.Begin(static_cast<int>(assetBrowserVisible.size()));
+                        while (clipper.Step())
+                        {
+                            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row)
+                            {
+                                const auto& entry = assetBrowserCatalog[assetBrowserVisible[static_cast<std::size_t>(row)]];
+                                const char* kindLabel = entry.kind == astro::editor::AssetBrowserKind::Image ? "Image"
+                                    : entry.kind == astro::editor::AssetBrowserKind::Model ? "Model"
+                                    : entry.kind == astro::editor::AssetBrowserKind::Material ? "Material" : "Script";
+                                const auto label = std::to_string(entry.id.value) + " | " + tr(kindLabel)
+                                    + " | " + entry.sourceRelativePath;
+                                const auto stableId = std::to_string(entry.id.value);
+                                ImGui::PushID(stableId.c_str());
+                                const bool clicked = ImGui::Selectable(label.c_str(),
+                                    selectedProjectAssetRoot == assetRegistry->projectRoot()
+                                        && selectedProjectAsset == entry.id);
+                                const bool smokeClick = (assetBrowserSmoke || assetBrowserModelPreviewSmoke)
+                                    && assetBrowserExpectedSelection == entry.id
+                                    && !assetBrowserSelectionActivated;
+                                if (clicked || smokeClick)
+                                {
+                                    selectedProjectAsset = entry.id;
+                                    selectedProjectAssetRoot = assetRegistry->projectRoot();
+                                    selectedProjectAssetDisplayPath.clear();
+                                    projectModelPreviewId.reset();
+                                    projectModelPreviewDiagnostic.clear();
+                                    projectModelPreviewMeshCount = projectModelPreviewPrimitiveCount = 0;
+                                    projectModelPreviewVertexCount = projectModelPreviewIndexCount = 0;
+                                    assetBrowserSelectionActivated = true;
+                                }
+                                ImGui::PopID();
+                            }
+                        }
+                    }
+                    ImGui::EndChild();
+                    if (selectedProjectAsset && selectedProjectAssetRoot == assetRegistry->projectRoot())
+                    {
+                        if (assetRegistry->find(*selectedProjectAsset))
+                        {
+                            auto texture = spriteTextures.find(selectedProjectAsset->value);
+                            if (texture == spriteTextures.end())
+                            {
+                                const auto cached = assetRegistry->cachedPath(*selectedProjectAsset);
+                                if (!cached.empty())
+                                {
+                                    const auto loaded = loadSpriteTexture(cached);
+                                    if (bgfx::isValid(loaded))
+                                        texture = spriteTextures.emplace(selectedProjectAsset->value, loaded).first;
+                                }
+                            }
+                            ImGui::SeparatorText(tr("Image preview"));
+                            if (texture != spriteTextures.end() && bgfx::isValid(texture->second))
+                            {
+                                ImGui::Image(static_cast<ImTextureID>(texture->second.idx + 1), ImVec2(192, 144));
+                                projectAssetImagePreviewShown = true;
+                                if (!projectAssetPreviewScrollRequested)
+                                {
+                                    ImGui::SetScrollHereY(0.5f);
+                                    projectAssetPreviewScrollRequested = true;
+                                }
+                            }
+                            else ImGui::TextDisabled(tr("Image preview unavailable: registered cache entry is missing or cannot be decoded"));
+                        }
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+                        else if (const auto* model = assetRegistry->findModel(*selectedProjectAsset))
+                        {
+                            if (projectModelPreviewId != selectedProjectAsset)
+                            {
+                                projectModelPreviewId = selectedProjectAsset;
+                                const auto imported = astro::render3d::GltfImporter::importFile(
+                                    assetRegistry->projectRoot(), std::filesystem::path("Assets")
+                                        / pathFromUtf8(model->sourceRelativePath.c_str()));
+                                if (!imported) projectModelPreviewDiagnostic = imported.error().message;
+                                else
+                                {
+                                    projectModelPreviewMeshCount = imported.value().meshes.size();
+                                    Scene candidatePreview(0xFFFF'FFF0u, "Project Model Preview");
+                                    constexpr std::size_t MaxPreviewPrimitives = 128;
+                                    constexpr std::uint64_t MaxPreviewGeometryBytes = 64ull * 1024 * 1024;
+                                    std::uint64_t previewGeometryBytes = 0;
+                                    std::size_t previewPrimitiveIndex = 0;
+                                    for (std::size_t meshIndex = 0; meshIndex < imported.value().meshes.size()
+                                        && projectModelPreviewDiagnostic.empty(); ++meshIndex)
+                                    {
+                                        const auto& mesh = imported.value().meshes[meshIndex];
+                                        if (meshIndex > std::numeric_limits<std::uint32_t>::max())
+                                        {
+                                            projectModelPreviewDiagnostic = "Model preview mesh index exceeds the supported range";
+                                            break;
+                                        }
+                                        for (std::size_t primitiveIndex = 0; primitiveIndex < mesh.primitives.size();
+                                            ++primitiveIndex)
+                                        {
+                                            if (primitiveIndex > std::numeric_limits<std::uint32_t>::max())
+                                            {
+                                                projectModelPreviewDiagnostic = "Model preview primitive index exceeds the supported range";
+                                                break;
+                                            }
+                                            const auto& primitive = mesh.primitives[primitiveIndex];
+                                            const auto vertexCount = primitive.vertices().size();
+                                            const auto indexCount = primitive.triangleIndices().size();
+                                            projectModelPreviewPrimitiveCount++;
+                                            projectModelPreviewVertexCount += vertexCount;
+                                            projectModelPreviewIndexCount += indexCount;
+                                            if (projectModelPreviewPrimitiveCount > MaxPreviewPrimitives
+                                                || vertexCount > 65536 || indexCount > 196608)
+                                            {
+                                                projectModelPreviewDiagnostic = "Model exceeds the preview primitive or per-mesh geometry limit";
+                                                break;
+                                            }
+                                            const auto vertexBytes = static_cast<std::uint64_t>(vertexCount) * 24;
+                                            const auto indexBytes = static_cast<std::uint64_t>(indexCount) * 2;
+                                            if (previewGeometryBytes > MaxPreviewGeometryBytes
+                                                || vertexBytes > MaxPreviewGeometryBytes - previewGeometryBytes
+                                                || indexBytes > MaxPreviewGeometryBytes - previewGeometryBytes - vertexBytes)
+                                            {
+                                                projectModelPreviewDiagnostic = "Model exceeds the 64 MiB preview geometry budget";
+                                                break;
+                                            }
+                                            previewGeometryBytes += vertexBytes + indexBytes;
+                                            const auto entity = candidatePreview.createEntity(
+                                                "Preview Primitive " + std::to_string(previewPrimitiveIndex++));
+                                            if (!entity)
+                                            {
+                                                projectModelPreviewDiagnostic = entity.error().message;
+                                                break;
+                                            }
+                                            const auto assigned = candidatePreview.setMeshRenderer(entity.value(),
+                                                *selectedProjectAsset, static_cast<std::uint32_t>(meshIndex),
+                                                static_cast<std::uint32_t>(primitiveIndex));
+                                            if (!assigned)
+                                            {
+                                                projectModelPreviewDiagnostic = assigned.error().message;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (projectModelPreviewDiagnostic.empty() && projectModelPreviewPrimitiveCount == 0)
+                                        projectModelPreviewDiagnostic = "Model contains no renderable triangle primitives";
+                                    if (projectModelPreviewDiagnostic.empty())
+                                    {
+                                        projectAssetPreviewScene = std::move(candidatePreview);
+                                        assetModelPreviewTarget.requestFrameAll();
+                                    }
+                                }
+                            }
+                            ImGui::SeparatorText(tr("Model geometry preview"));
+                            if (!projectModelPreviewDiagnostic.empty())
+                                ImGui::TextWrapped(tr("Model preview unavailable: %s"), projectModelPreviewDiagnostic.c_str());
+                            else
+                            {
+                                ImGui::Text(tr("Meshes: %zu | primitives: %zu"), projectModelPreviewMeshCount,
+                                    projectModelPreviewPrimitiveCount);
+                                ImGui::Text(tr("Vertices: %zu | indices: %zu"), projectModelPreviewVertexCount,
+                                    projectModelPreviewIndexCount);
+                                projectAssetModelPreviewShown = true;
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+                                const auto available = ImGui::GetContentRegionAvail();
+                                const float previewWidth = std::clamp(available.x, 160.0f, 400.0f);
+                                const ImVec2 previewSize{previewWidth, previewWidth * 0.75f};
+                                bgfx::TextureHandle previewTexture = BGFX_INVALID_HANDLE;
+                                std::string previewRenderError;
+                                if (assetModelPreviewTarget.render(projectAssetPreviewScene, &*assetRegistry,
+                                    spriteTextures, static_cast<int>(previewSize.x), static_cast<int>(previewSize.y),
+                                    program, sampler, outputMode, layout, previewTexture, previewRenderError))
+                                {
+                                    const auto previewMin = ImGui::GetCursorScreenPos();
+                                    const ImVec2 previewMax{previewMin.x + previewSize.x, previewMin.y + previewSize.y};
+                                    const bool previewHovered = ImGui::IsMouseHoveringRect(previewMin, previewMax, true);
+                                    const auto& io = ImGui::GetIO();
+                                    if (previewHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+                                        projectAssetPreviewRightDragActive = true;
+                                    if (previewHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Middle))
+                                        projectAssetPreviewMiddleDragActive = true;
+                                    if (projectAssetPreviewRightDragActive && io.MouseDown[ImGuiMouseButton_Right])
+                                        assetModelPreviewTarget.orbit3d(io.MouseDelta.x, io.MouseDelta.y);
+                                    if (projectAssetPreviewMiddleDragActive && io.MouseDown[ImGuiMouseButton_Middle])
+                                        assetModelPreviewTarget.pan3d(io.MouseDelta.x, io.MouseDelta.y, previewSize.y);
+                                    if (!io.MouseDown[ImGuiMouseButton_Right])
+                                        projectAssetPreviewRightDragActive = false;
+                                    if (!io.MouseDown[ImGuiMouseButton_Middle])
+                                        projectAssetPreviewMiddleDragActive = false;
+                                    if (previewHovered)
+                                    {
+                                        if (io.MouseWheel != 0.0f)
+                                            assetModelPreviewTarget.zoom3d(io.MouseWheel);
+                                    }
+                                    if (assetBrowserModelPreviewSmoke && !projectModelPreviewCameraControlsSmokePassed
+                                        && assetModelPreviewTarget.frameAllApplied())
+                                    {
+                                        const auto startFocus = assetModelPreviewTarget.cameraFocus();
+                                        const auto startDistance = assetModelPreviewTarget.cameraDistance();
+                                        const auto startYaw = assetModelPreviewTarget.cameraYaw();
+                                        assetModelPreviewTarget.orbit3d(18.0f, -9.0f);
+                                        assetModelPreviewTarget.pan3d(12.0f, -8.0f, previewSize.y);
+                                        assetModelPreviewTarget.zoom3d(1.0f);
+                                        const auto endFocus = assetModelPreviewTarget.cameraFocus();
+                                        projectModelPreviewCameraControlsSmokePassed =
+                                            std::abs(assetModelPreviewTarget.cameraYaw() - startYaw) > 0.0001f
+                                            && (std::abs(endFocus.x - startFocus.x) > 0.0001f
+                                                || std::abs(endFocus.y - startFocus.y) > 0.0001f
+                                                || std::abs(endFocus.z - startFocus.z) > 0.0001f)
+                                            && assetModelPreviewTarget.cameraDistance() < startDistance;
+                                    }
+                                    if (assetBrowserModelPreviewSmoke && projectModelPreviewMouseEventPhase < 17
+                                        && projectModelPreviewCameraControlsSmokePassed && frames >= 60)
+                                    {
+                                        const auto* mainViewport = ImGui::GetMainViewport();
+                                        if (mainViewport)
+                                        {
+                                            const float centerX = previewMin.x - mainViewport->Pos.x + previewSize.x * 0.5f;
+                                            const float centerY = previewMin.y - mainViewport->Pos.y + previewSize.y * 0.5f;
+                                            const float dragStartX = previewMin.x - mainViewport->Pos.x + previewSize.x - 8.0f;
+                                            const float outsideX = dragStartX + 14.0f;
+                                            if (projectModelPreviewMouseEventPhase == 0)
+                                            {
+                                                projectModelPreviewMouseStartYaw = assetModelPreviewTarget.cameraYaw();
+                                                const auto focus = assetModelPreviewTarget.cameraFocus();
+                                                projectModelPreviewMouseStartFocus = {focus.x, focus.y, focus.z};
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0,
+                                                    dragStartX, centerY);
+                                                projectModelPreviewMouseEventPhase = 1;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 1)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_RIGHT,
+                                                    dragStartX, centerY);
+                                                projectModelPreviewMouseEventPhase = 2;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 2)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0,
+                                                    outsideX, centerY, SDL_BUTTON_RMASK);
+                                                projectModelPreviewMouseEventPhase = 3;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 3)
+                                            {
+                                                projectModelPreviewRightDragSmokePassed =
+                                                    !previewHovered && std::abs(assetModelPreviewTarget.cameraYaw()
+                                                        - projectModelPreviewMouseStartYaw) > 0.0001f;
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_RIGHT,
+                                                    outsideX, centerY);
+                                                projectModelPreviewMouseEventPhase = 4;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 4)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0, centerX, centerY);
+                                                projectModelPreviewMouseEventPhase = 5;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 5)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0, dragStartX, centerY);
+                                                projectModelPreviewMouseEventPhase = 6;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 6)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_MIDDLE,
+                                                    dragStartX, centerY);
+                                                projectModelPreviewMouseEventPhase = 7;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 7)
+                                            {
+                                                const auto focus = assetModelPreviewTarget.cameraFocus();
+                                                projectModelPreviewMouseStartFocus = {focus.x, focus.y, focus.z};
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0,
+                                                    outsideX, centerY, SDL_BUTTON_MMASK);
+                                                projectModelPreviewMouseEventPhase = 8;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 8)
+                                            {
+                                                const auto focus = assetModelPreviewTarget.cameraFocus();
+                                                projectModelPreviewMiddleDragSmokePassed =
+                                                    !previewHovered
+                                                    && (std::abs(focus.x - projectModelPreviewMouseStartFocus[0]) > 0.0001f
+                                                        || std::abs(focus.y - projectModelPreviewMouseStartFocus[1]) > 0.0001f
+                                                        || std::abs(focus.z - projectModelPreviewMouseStartFocus[2]) > 0.0001f);
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_MIDDLE,
+                                                    outsideX, centerY);
+                                                projectModelPreviewMouseEventPhase = 9;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 9)
+                                                projectModelPreviewMouseEventPhase = 10;
+                                            else if (projectModelPreviewMouseEventPhase == 10)
+                                            {
+                                                projectModelPreviewMouseStartYaw = assetModelPreviewTarget.cameraYaw();
+                                                const auto focus = assetModelPreviewTarget.cameraFocus();
+                                                projectModelPreviewMouseStartFocus = {focus.x, focus.y, focus.z};
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_RIGHT,
+                                                    outsideX, centerY);
+                                                projectModelPreviewMouseEventPhase = 11;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 11)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0,
+                                                    centerX, centerY, SDL_BUTTON_RMASK);
+                                                projectModelPreviewMouseEventPhase = 12;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 12)
+                                            {
+                                                projectModelPreviewOutsidePressIgnoredSmokePassed =
+                                                    std::abs(assetModelPreviewTarget.cameraYaw()
+                                                        - projectModelPreviewMouseStartYaw) <= 0.0001f;
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_RIGHT,
+                                                    centerX, centerY);
+                                                projectModelPreviewMouseEventPhase = 13;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 13)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0, outsideX, centerY);
+                                                projectModelPreviewMouseEventPhase = 14;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 14)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_MIDDLE,
+                                                    outsideX, centerY);
+                                                projectModelPreviewMouseEventPhase = 15;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 15)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0,
+                                                    centerX, centerY, SDL_BUTTON_MMASK);
+                                                projectModelPreviewMouseEventPhase = 16;
+                                            }
+                                            else if (projectModelPreviewMouseEventPhase == 16)
+                                            {
+                                                const auto focus = assetModelPreviewTarget.cameraFocus();
+                                                projectModelPreviewOutsidePressIgnoredSmokePassed =
+                                                    projectModelPreviewOutsidePressIgnoredSmokePassed
+                                                    && std::abs(focus.x - projectModelPreviewMouseStartFocus[0]) <= 0.0001f
+                                                    && std::abs(focus.y - projectModelPreviewMouseStartFocus[1]) <= 0.0001f
+                                                    && std::abs(focus.z - projectModelPreviewMouseStartFocus[2]) <= 0.0001f;
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_MIDDLE,
+                                                    centerX, centerY);
+                                                projectModelPreviewMouseEventPhase = 17;
+                                            }
+                                        }
+                                    }
+                                    if (assetBrowserModelPreviewSmoke && projectModelPreviewMouseEventPhase == 17
+                                        && sceneViewMouseEventPhase < 18 && sceneViewInputRectValid && frames >= 60)
+                                    {
+                                        if (io.DisplaySize.x > 0.0f && io.DisplaySize.y > 0.0f)
+                                        {
+                                            const float right = sceneViewInputRect[2];
+                                            const float top = sceneViewInputRect[1];
+                                            const float bottom = sceneViewInputRect[3];
+                                            const float centerX = (sceneViewInputRect[0] + right) * 0.5f;
+                                            const float startX = right - 8.0f;
+                                            const float outsideX = std::min(right + 6.0f, io.DisplaySize.x - 4.0f);
+                                            const float centerY = (top + bottom) * 0.5f;
+                                            if (sceneViewMouseEventPhase == 0)
+                                            {
+                                                sceneViewMouseStartYaw = sceneTarget.cameraYaw();
+                                                const auto focus = sceneTarget.cameraFocus();
+                                                sceneViewMouseStartFocus = {focus.x, focus.y, focus.z};
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0, startX, centerY);
+                                                sceneViewMouseEventPhase = 1;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 1)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_RIGHT,
+                                                    startX, centerY);
+                                                sceneViewMouseEventPhase = 2;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 2)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0,
+                                                    outsideX, centerY, SDL_BUTTON_RMASK);
+                                                sceneViewMouseEventPhase = 3;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 3)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_RIGHT,
+                                                    outsideX, centerY);
+                                                sceneViewMouseEventPhase = 4;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 4)
+                                            {
+                                                sceneViewRightDragSmokePassed = sceneViewRightPressStartedInside
+                                                    && !sceneViewPointerHoveringViewport
+                                                    && std::abs(sceneTarget.cameraYaw() - sceneViewMouseStartYaw) > 0.0001f;
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0, startX, centerY);
+                                                sceneViewMouseEventPhase = 5;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 5)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_MIDDLE,
+                                                    startX, centerY);
+                                                sceneViewMouseEventPhase = 6;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 6)
+                                            {
+                                                const auto focus = sceneTarget.cameraFocus();
+                                                sceneViewMouseStartFocus = {focus.x, focus.y, focus.z};
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0,
+                                                    outsideX, centerY, SDL_BUTTON_MMASK);
+                                                sceneViewMouseEventPhase = 7;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 7)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_MIDDLE,
+                                                    outsideX, centerY);
+                                                sceneViewMouseEventPhase = 8;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 8)
+                                            {
+                                                const auto middleFocusAfterDrag = sceneTarget.cameraFocus();
+                                                sceneViewMiddleDragSmokePassed = sceneViewMiddlePressStartedInside
+                                                    && !sceneViewPointerHoveringViewport
+                                                    && (std::abs(middleFocusAfterDrag.x - sceneViewMouseStartFocus[0]) > 0.0001f
+                                                        || std::abs(middleFocusAfterDrag.y - sceneViewMouseStartFocus[1]) > 0.0001f
+                                                        || std::abs(middleFocusAfterDrag.z - sceneViewMouseStartFocus[2]) > 0.0001f);
+                                                sceneViewMouseStartYaw = sceneTarget.cameraYaw();
+                                                const auto focus = sceneTarget.cameraFocus();
+                                                sceneViewMouseStartFocus = {focus.x, focus.y, focus.z};
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_RIGHT,
+                                                    outsideX, centerY);
+                                                sceneViewMouseEventPhase = 9;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 9)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0,
+                                                    centerX, centerY, SDL_BUTTON_RMASK);
+                                                sceneViewMouseEventPhase = 10;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 10)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_RIGHT,
+                                                    centerX, centerY);
+                                                sceneViewMouseEventPhase = 11;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 11)
+                                            {
+                                                sceneViewOutsideRightPressIgnoredSmokePassed = sceneViewOutsideRightPressEventSeen
+                                                    && std::abs(sceneTarget.cameraYaw() - sceneViewMouseStartYaw) <= 0.0001f;
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0, outsideX, centerY);
+                                                sceneViewMouseEventPhase = 12;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 12)
+                                            {
+                                                const auto focus = sceneTarget.cameraFocus();
+                                                sceneViewMouseStartFocus = {focus.x, focus.y, focus.z};
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_BUTTON_MIDDLE,
+                                                    outsideX, centerY);
+                                                sceneViewMouseEventPhase = 13;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 13)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_MOTION, 0,
+                                                    centerX, centerY, SDL_BUTTON_MMASK);
+                                                sceneViewMouseEventPhase = 14;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 14)
+                                            {
+                                                queuePreviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP, SDL_BUTTON_MIDDLE,
+                                                    centerX, centerY);
+                                                sceneViewMouseEventPhase = 15;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 15)
+                                            {
+                                                const auto focus = sceneTarget.cameraFocus();
+                                                sceneViewOutsidePressIgnoredSmokePassed = sceneViewOutsideRightPressIgnoredSmokePassed
+                                                    && sceneViewOutsideMiddlePressEventSeen
+                                                    && std::abs(focus.x - sceneViewMouseStartFocus[0]) <= 0.0001f
+                                                    && std::abs(focus.y - sceneViewMouseStartFocus[1]) <= 0.0001f
+                                                    && std::abs(focus.z - sceneViewMouseStartFocus[2]) <= 0.0001f;
+                                                sceneTarget.requestFrameAll();
+                                                sceneViewMouseEventPhase = 16;
+                                            }
+                                            else if (sceneViewMouseEventPhase == 16 && sceneTarget.frameAllApplied())
+                                                sceneViewMouseEventPhase = 18;
+                                        }
+                                    }
+                                    if (smoke)
+                                    {
+                                        const auto* mainViewport = ImGui::GetMainViewport();
+                                        if (mainViewport && io.DisplaySize.x > 0.0f && io.DisplaySize.y > 0.0f)
+                                        {
+                                            projectModelPreviewRectNormalized = {
+                                                (previewMin.x - mainViewport->Pos.x) / io.DisplaySize.x,
+                                                (previewMin.y - mainViewport->Pos.y) / io.DisplaySize.y,
+                                                (previewMax.x - mainViewport->Pos.x) / io.DisplaySize.x,
+                                                (previewMax.y - mainViewport->Pos.y) / io.DisplaySize.y};
+                                            projectModelPreviewRectValid = true;
+                                        }
+                                    }
+                                    ImGui::Image(static_cast<ImTextureID>(previewTexture.idx + 1), previewSize,
+                                        ImVec2(0, 1), ImVec2(1, 0));
+                                    projectAssetModelViewportShown = true;
+                                    const auto imageMin = ImGui::GetItemRectMin();
+                                    const auto imageMax = ImGui::GetItemRectMax();
+                                    const auto* projectDrawList = ImGui::GetWindowDrawList();
+                                    const auto clipMin = projectDrawList->GetClipRectMin();
+                                    const auto clipMax = projectDrawList->GetClipRectMax();
+                                    projectModelPreviewViewportFullyVisible = imageMin.x >= clipMin.x
+                                        && imageMin.y >= clipMin.y && imageMax.x <= clipMax.x && imageMax.y <= clipMax.y;
+                                    if (!projectAssetPreviewScrollRequested)
+                                    {
+                                        ImGui::SetScrollHereY(0.5f);
+                                        projectAssetPreviewScrollRequested = true;
+                                    }
+                                    ImGui::TextDisabled(tr("Drag with right mouse to orbit; middle mouse to pan; wheel to zoom."));
+                                    if (!assetModelPreviewTarget.meshError().empty())
+                                    {
+                                        const auto previewDiagnostic = localizedSceneViewDiagnostics(
+                                            assetModelPreviewTarget.meshError());
+                                        ImGui::TextWrapped(tr("3D model preview diagnostic: %s"), previewDiagnostic.c_str());
+                                    }
+                                }
+                                else ImGui::TextWrapped(tr("3D model preview unavailable: %s"), previewRenderError.c_str());
+#endif
+                            }
+                        }
+#endif
+                    }
                     csharpBuildPanelDrawn = true;
                     ImGui::Separator();
                     ImGui::TextUnformatted(tr("C# scripts"));
@@ -5694,6 +11196,7 @@ public:
                     if (ImGui::Button(tr("Register current C# build")))
                     {
                         auto registered = assetRegistry->registerScriptsFromBuild();
+                        if (registered && !registered.value().empty()) assetBrowserCatalogDirty = true;
                         if (!registered) reportError(registered.error().message);
                         csharpBuildReport = assetRegistry->inspectScriptBuild();
                     }
@@ -5802,6 +11305,7 @@ public:
                         if (!imported) reportError(imported.error().message);
                         else
                         {
+                            assetBrowserCatalogDirty = true;
                             message = tr("Imported image as AssetId ") + std::to_string(imported.value().id.value);
                             const auto handle = loadSpriteTexture(assetRegistry->cachedPath(imported.value().id));
                             if (!bgfx::isValid(handle)) reportError(tr("Image imported, but WIC could not decode it for preview"));
@@ -5811,10 +11315,6 @@ public:
                     for (const auto missing : assetRegistry->missingAssets())
                         ImGui::TextColored(ImVec4(1, 0.35f, 0.25f, 1), tr("Missing source for AssetId %llu"),
                             static_cast<unsigned long long>(missing.value));
-                    if (ImGui::CollapsingHeader(tr("Imported images")))
-                        for (const auto& [id, ref] : assetRegistry->entries())
-                            ImGui::BulletText(tr("%llu — %s (%u x %u)"), static_cast<unsigned long long>(id.value),
-                                ref.sourceRelativePath.c_str(), ref.width, ref.height);
                 }
                 ImGui::End();
             }
@@ -6160,6 +11660,30 @@ public:
                 }
                 ImGui::EndDisabled();
                 ImGui::SameLine();
+                ImGui::BeginDisabled(activeProjectRoot.empty());
+                if (ImGui::BeginMenu(tr("+ 3D Primitive")))
+                {
+                    const auto createPrimitive = [&](const char* entityName, const char* label,
+                        const astro::scene::Primitive3D kind)
+                    {
+                        if (!ImGui::MenuItem(tr(label))) return;
+                        const auto parent = selectedEntity && scene.find(*selectedEntity)
+                            ? selectedEntity : std::optional<EntityId>{};
+                        const auto created = commands.execute<astro::scene::CreatePrimitiveEntityPayload, EntityId>(
+                            "entity.create_primitive", 1, {entityName, parent, kind, true});
+                        if (!created) { reportError(created.error().message); return; }
+                        selectedEntity = created.value();
+                        sceneDirty = true;
+                        message = tr("3D primitive created");
+                    };
+                    createPrimitive("Cube", "Cube", astro::scene::Primitive3D::Cube);
+                    createPrimitive("Plane", "Plane", astro::scene::Primitive3D::Plane);
+                    createPrimitive("Sphere", "Sphere", astro::scene::Primitive3D::Sphere);
+                    createPrimitive("Cylinder", "Cylinder", astro::scene::Primitive3D::Cylinder);
+                    ImGui::EndMenu();
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
                 ImGui::BeginDisabled(activeProjectRoot.empty() || !selectedEntity || !scene.find(*selectedEntity));
                 if (ImGui::Button(tr("+ Child")))
                 {
@@ -6175,16 +11699,16 @@ public:
                 }
                 ImGui::EndDisabled();
                 ImGui::SameLine();
-                ImGui::BeginDisabled(activeProjectRoot.empty() || !selectedEntity || !scene.find(*selectedEntity));
+                ImGui::BeginDisabled(!selectedEntity || !scene.find(*selectedEntity));
                 if (ImGui::Button(tr("Delete subtree")))
                 {
-                    auto erased = scene.erase(*selectedEntity, true);
+                    auto erased = commands.execute<astro::scene::DeleteEntitySubtreePayload, void>(
+                        "entity.delete_subtree", 1, {*selectedEntity});
                     if (erased)
                     {
                         selectedEntity.reset();
                         inspectorDraftEntity.reset();
                         sceneDirty = true;
-                        commands.clearHistory();
                         message = tr("Entity subtree deleted");
                     }
                     else reportError(erased.error().message);
@@ -6192,24 +11716,926 @@ public:
                 ImGui::EndDisabled();
                 ImGui::Separator();
                 ImGui::TextUnformatted(scene.name().c_str());
+                std::erase_if(hierarchySelection, [&](const EntityId id) { return scene.find(id) == nullptr; });
+                if (!selectedEntity) hierarchySelection.clear();
+                else if (!hierarchySelectionContains(hierarchySelection, *selectedEntity))
+                    hierarchySelection.assign(1, *selectedEntity);
+                ImGui::TextDisabled(tr("Selected: %zu (Ctrl+click to toggle; drag to reparent)"),
+                    hierarchySelection.size());
                 ImGui::BeginChild("EntityTree", ImVec2(0, 0), false);
-                drawHierarchyBranch(scene, std::nullopt, selectedEntity);
+                hierarchySelectionVisible = false;
+                hierarchyReparentSmokeSourceRowSeen = false;
+                hierarchyReparentSmokeTargetRowSeen = false;
+                ImGui::PushID("##SceneRootLabel");
+                ImGui::Selectable(tr("Scene root"), false, ImGuiSelectableFlags_SpanAvailWidth);
+                ImGui::PopID();
+                drawHierarchyBranch(scene, std::nullopt, selectedEntity, hierarchySelection,
+                    pendingHierarchyPlainClick, hierarchyForceOpenAncestors, hierarchyFocusEntity,
+                    hierarchyFocusApplied, hierarchySelectionVisible,
+                    reparentFromHierarchy, observeHierarchyRow);
+                ImGui::PushID("##SceneRootDropTarget");
+                ImGui::Selectable(tr("Scene root (drop here to unparent)"), false,
+                    ImGuiSelectableFlags_SpanAvailWidth);
+                const auto rootDropMin = ImGui::GetItemRectMin();
+                const auto rootDropMax = ImGui::GetItemRectMax();
+                hierarchyReparentSmokeRootCenter = ImVec2{(rootDropMin.x + rootDropMax.x) * 0.5f,
+                    (rootDropMin.y + rootDropMax.y) * 0.5f};
+                drawHierarchyDropTarget(scene, std::nullopt, reparentFromHierarchy);
+                ImGui::PopID();
                 ImGui::EndChild();
+                if (hierarchyReparentSmoke || hierarchyReparentManySmoke)
+                {
+                    auto queueHierarchyMouseEvent = [&](const SDL_EventType type, const ImVec2 position) {
+                        auto* viewport = ImGui::GetMainViewport();
+                        if (!viewport)
+                            throw std::runtime_error("Hierarchy drag smoke could not resolve the main viewport");
+                        const bool desktopCoordinates = (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0;
+                        queuePreviewMouseEvent(type, SDL_BUTTON_LEFT,
+                            position.x - (desktopCoordinates ? viewport->Pos.x : 0.0f),
+                            position.y - (desktopCoordinates ? viewport->Pos.y : 0.0f));
+                    };
+                    if (hierarchyReparentManySmoke)
+                    {
+                        auto queueHierarchyControl = [&](const bool down) {
+                            SDL_Event event{};
+                            event.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+                            event.key.windowID = SDL_GetWindowID(window);
+                            event.key.key = SDLK_LCTRL;
+                            event.key.scancode = SDL_GetScancodeFromKey(SDLK_LCTRL, nullptr);
+                            event.key.mod = down ? SDL_KMOD_CTRL : SDL_KMOD_NONE;
+                            event.key.down = down;
+                            if (!SDL_PushEvent(&event))
+                                throw std::runtime_error("Hierarchy multi-select smoke could not queue Ctrl input");
+                        };
+                        if (hierarchyReparentManySmokePhase == 0 && frames > 30
+                            && hierarchyReparentSmokeSourceRowSeen && hierarchyReparentSmokeTargetRowSeen
+                            && hierarchyReparentManyDescendantRowSeen && hierarchyReparentManyPeerRowSeen)
+                        {
+                            const auto* moving = scene.find(hierarchyReparentSmokeEntity);
+                            const auto* transform = scene.transform(hierarchyReparentSmokeEntity);
+                            const auto* peer = scene.find(hierarchyReparentManyPeer);
+                            const auto* peerTransform = scene.transform(hierarchyReparentManyPeer);
+                            if (!moving || !transform || !peer || !peerTransform)
+                                throw std::runtime_error("Hierarchy multi-reparent smoke fixture changed before input");
+                            hierarchyReparentSmokeOriginalParent = moving->parent;
+                            hierarchyReparentSmokeTransformId = transform->id;
+                            hierarchyReparentSmokeLocal = transform->value;
+                            hierarchyReparentManyPeerOriginalParent = peer->parent;
+                            hierarchyReparentManyPeerTransformId = peerTransform->id;
+                            hierarchyReparentManyPeerLocal = peerTransform->value;
+                            sceneDialog = false;
+                            hierarchyReparentManySmokePhase = 1;
+                        }
+                        else if (hierarchyReparentManySmokePhase == 1)
+                        {
+                            queueHierarchyControl(true);
+                            hierarchyReparentManySmokePhase = 2;
+                        }
+                        else if (hierarchyReparentManySmokePhase == 2)
+                        {
+                            queueHierarchyMouseEvent(SDL_EVENT_MOUSE_MOTION, hierarchyReparentManyDescendantCenter);
+                            hierarchyReparentManySmokePhase = 3;
+                        }
+                        else if (hierarchyReparentManySmokePhase == 3)
+                        {
+                            queueHierarchyMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN, hierarchyReparentManyDescendantCenter);
+                            hierarchyReparentManySmokePhase = 4;
+                        }
+                        else if (hierarchyReparentManySmokePhase == 4)
+                        {
+                            queueHierarchyMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP, hierarchyReparentManyDescendantCenter);
+                            hierarchyReparentManySmokePhase = 5;
+                        }
+                        else if (hierarchyReparentManySmokePhase == 5)
+                        {
+                            queueHierarchyMouseEvent(SDL_EVENT_MOUSE_MOTION, hierarchyReparentManyPeerCenter);
+                            hierarchyReparentManySmokePhase = 6;
+                        }
+                        else if (hierarchyReparentManySmokePhase == 6)
+                        {
+                            queueHierarchyMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN, hierarchyReparentManyPeerCenter);
+                            hierarchyReparentManySmokePhase = 7;
+                        }
+                        else if (hierarchyReparentManySmokePhase == 7)
+                        {
+                            queueHierarchyMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP, hierarchyReparentManyPeerCenter);
+                            hierarchyReparentManySmokePhase = 8;
+                        }
+                        else if (hierarchyReparentManySmokePhase == 8)
+                        {
+                            queueHierarchyControl(false);
+                            hierarchyReparentManySelectionVerified = hierarchySelection.size() == 3
+                                && hierarchySelectionContains(hierarchySelection, hierarchyReparentSmokeEntity)
+                                && hierarchySelectionContains(hierarchySelection, hierarchyReparentSmokeDescendant)
+                                && hierarchySelectionContains(hierarchySelection, hierarchyReparentManyPeer)
+                                && selectedEntity == hierarchyReparentManyPeer;
+                            if (!hierarchyReparentManySelectionVerified)
+                                throw std::runtime_error("Hierarchy Ctrl+click did not preserve the parent, descendant and peer selection");
+                            hierarchyReparentManySmokePhase = 9;
+                        }
+                        else if (hierarchyReparentManySmokePhase == 9)
+                        {
+                            queueHierarchyMouseEvent(SDL_EVENT_MOUSE_MOTION, hierarchyReparentSmokeSourceCenter);
+                            hierarchyReparentManySmokePhase = 10;
+                        }
+                        else if (hierarchyReparentManySmokePhase == 10)
+                        {
+                            queueHierarchyMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN, hierarchyReparentSmokeSourceCenter);
+                            hierarchyReparentManySmokePhase = 11;
+                        }
+                        else if (hierarchyReparentManySmokePhase == 11)
+                        {
+                            queueHierarchyMouseEvent(SDL_EVENT_MOUSE_MOTION, hierarchyReparentSmokeTargetCenter);
+                            hierarchyReparentManySmokePhase = 12;
+                        }
+                        else if (hierarchyReparentManySmokePhase == 12)
+                        {
+                            queueHierarchyMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP, hierarchyReparentSmokeTargetCenter);
+                            hierarchyReparentManySmokePhase = 13;
+                        }
+                        else if (hierarchyReparentManySmokePhase == 13 && hierarchyReparentManyDrop)
+                            hierarchyReparentManySmokePhase = 14;
+                        else if (hierarchyReparentManySmokePhase == 14)
+                        {
+                            const auto undone = commands.undo();
+                            const auto* sourceUndo = scene.find(hierarchyReparentSmokeEntity);
+                            const auto* peerUndo = scene.find(hierarchyReparentManyPeer);
+                            const bool restored = undone && sourceUndo && peerUndo
+                                && sourceUndo->parent == hierarchyReparentSmokeOriginalParent
+                                && peerUndo->parent == hierarchyReparentManyPeerOriginalParent;
+                            const auto redone = restored ? commands.redo()
+                                : astro::core::Result<void>::failure({astro::core::ErrorCode::InvalidState,
+                                    "Hierarchy multi-reparent smoke Undo did not restore all original parents"});
+                            const auto* sourceRedo = scene.find(hierarchyReparentSmokeEntity);
+                            const auto* peerRedo = scene.find(hierarchyReparentManyPeer);
+                            hierarchyReparentManyUndoRedo = restored && redone && sourceRedo && peerRedo
+                                && sourceRedo->parent == hierarchyReparentSmokeTarget
+                                && peerRedo->parent == hierarchyReparentSmokeTarget;
+                            hierarchyReparentManySmokePhase = 15;
+                        }
+                    }
+                    else if (hierarchyReparentSmokePhase == 0 && frames > 30 && hierarchyReparentSmokeSourceRowSeen
+                        && hierarchyReparentSmokeTargetRowSeen)
+                    {
+                        const auto* moving = scene.find(hierarchyReparentSmokeEntity);
+                        const auto* transform = scene.transform(hierarchyReparentSmokeEntity);
+                        if (!moving || !transform)
+                            throw std::runtime_error("Hierarchy drag smoke source changed before input automation");
+                        hierarchyReparentSmokeOriginalParent = moving->parent;
+                        hierarchyReparentSmokeTransformId = transform->id;
+                        hierarchyReparentSmokeLocal = transform->value;
+                        sceneDialog = false;
+                        hierarchyReparentSmokePhase = 11;
+                    }
+                    else if (hierarchyReparentSmokePhase == 11)
+                    {
+                        queueHierarchyMouseEvent(SDL_EVENT_MOUSE_MOTION, hierarchyReparentSmokeSourceCenter);
+                        hierarchyReparentSmokePhase = 1;
+                    }
+                    else if (hierarchyReparentSmokePhase == 1)
+                    {
+                        queueHierarchyMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN, hierarchyReparentSmokeSourceCenter);
+                        hierarchyReparentSmokePhase = 2;
+                    }
+                    else if (hierarchyReparentSmokePhase == 2)
+                    {
+                        queueHierarchyMouseEvent(SDL_EVENT_MOUSE_MOTION, hierarchyReparentSmokeTargetCenter);
+                        hierarchyReparentSmokePhase = 3;
+                    }
+                    else if (hierarchyReparentSmokePhase == 3)
+                    {
+                        queueHierarchyMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP, hierarchyReparentSmokeTargetCenter);
+                        hierarchyReparentSmokePhase = 4;
+                    }
+                    else if (hierarchyReparentSmokePhase == 4 && hierarchyReparentSmokeEntityDrop)
+                        hierarchyReparentSmokePhase = 5;
+                    else if (hierarchyReparentSmokePhase == 5 && hierarchyReparentSmokeSourceRowSeen)
+                    {
+                        queueHierarchyMouseEvent(SDL_EVENT_MOUSE_MOTION, hierarchyReparentSmokeSourceCenter);
+                        hierarchyReparentSmokePhase = 6;
+                    }
+                    else if (hierarchyReparentSmokePhase == 6)
+                    {
+                        queueHierarchyMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN, hierarchyReparentSmokeSourceCenter);
+                        hierarchyReparentSmokePhase = 7;
+                    }
+                    else if (hierarchyReparentSmokePhase == 7)
+                    {
+                        queueHierarchyMouseEvent(SDL_EVENT_MOUSE_MOTION, hierarchyReparentSmokeRootCenter);
+                        hierarchyReparentSmokePhase = 8;
+                    }
+                    else if (hierarchyReparentSmokePhase == 8)
+                    {
+                        queueHierarchyMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP, hierarchyReparentSmokeRootCenter);
+                        hierarchyReparentSmokePhase = 9;
+                    }
+                    else if (hierarchyReparentSmokePhase == 9 && hierarchyReparentSmokeRootDrop)
+                    {
+                        const auto undone = commands.undo();
+                        const auto* afterUndo = scene.find(hierarchyReparentSmokeEntity);
+                        const bool undoRestoredTarget = undone && afterUndo
+                            && afterUndo->parent == hierarchyReparentSmokeTarget;
+                        const auto redone = undoRestoredTarget ? commands.redo()
+                            : astro::core::Result<void>::failure({astro::core::ErrorCode::InvalidState,
+                                "Hierarchy drag smoke Undo did not restore the destination parent"});
+                        const auto* afterRedo = scene.find(hierarchyReparentSmokeEntity);
+                        hierarchyReparentSmokeUndoRedo = undoRestoredTarget && redone && afterRedo
+                            && !afterRedo->parent;
+                        hierarchyReparentSmokePhase = 10;
+                    }
+                }
             }
             ImGui::End();
-            if (ImGui::Begin(tr("Inspector")))
+            const bool inspectorWindowVisible = ImGui::Begin(tr("Inspector"));
+            if (inspectorWindowVisible)
             {
                 docked = docked && ImGui::IsWindowDocked();
                 if (activeProjectRoot.empty()) ImGui::TextDisabled(tr("Create or open a project first."));
-                else drawInspector(scene, selectedEntity, commands, inspectorDraft, inspectorDraftEntity,
-                    inspectorDraftScene, sceneDirty, message, assetRegistry ? &*assetRegistry : nullptr,
-                    csharpBuildReport, selectedScriptAsset, scriptAuthoringPanelDrawn, spriteTextures, reportError);
+                else
+                {
+                    drawInspector(scene, selectedEntity, hierarchySelection, multiTransformInspectorState,
+                        commands, inspectorDraft, inspectorDraftEntity,
+                        inspectorDraftScene, sceneDirty, message, assetRegistry ? &*assetRegistry : nullptr,
+                        csharpBuildReport, selectedScriptAsset, scriptAuthoringPanelDrawn,
+                        meshMaterialInspectorState, camera3DInspectorState, primitiveRendererInspectorState,
+                        pointLightInspectorState,
+                        directionalLightInspectorState,
+                        spriteTextures, reportError);
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+                    if (smoke && gameViewCameraDiagnosticCase == 0 && primitiveInspectorSmokeEntity != 0)
+                    {
+                        drawPrimitiveRendererInspector(scene, primitiveInspectorSmokeEntity, commands,
+                            sceneDirty, message, primitiveRendererInspectorState, reportError);
+                        drawPrimitiveMaterialInspector(scene, primitiveInspectorSmokeEntity, commands,
+                            sceneDirty, message, assetRegistry ? &*assetRegistry : nullptr,
+                            primitiveRendererInspectorState, reportError);
+                        if (runtimeBgfxPointLightSmoke && selectedEntity != primitiveInspectorSmokeEntity)
+                            drawPointLightInspector(scene, primitiveInspectorSmokeEntity, commands,
+                                sceneDirty, message, pointLightInspectorState, reportError);
+                        if (runtimeBgfxDirectionalLightSmoke && !directionalLightNoLightSmoke
+                            && selectedEntity != primitiveInspectorSmokeEntity)
+                            drawDirectionalLightInspector(scene, primitiveInspectorSmokeEntity, commands,
+                                sceneDirty, message, directionalLightInspectorState, reportError);
+                    }
+#endif
+                }
             }
             ImGui::End();
+            if (multiTransformInspectorSmoke && multiTransformInspectorSmokePhase < 3)
+            {
+                if (!queueKeyboardRelease())
+                    throw std::runtime_error("Could not release the previous key during multi-Transform keyboard smoke");
+                auto captureCurrentTargets = [&] {
+                    for (const auto& target : multiTransformInspectorSmokeState.targets)
+                    {
+                        if (target.entity == multiTransformSmokePrimaryEntity)
+                        {
+                            multiTransformSmokeOriginals[0] = target.before;
+                            multiTransformSmokeComponentIds[0] = target.component;
+                        }
+                        else if (target.entity == multiTransformSmokeEntity)
+                        {
+                            multiTransformSmokeOriginals[1] = target.before;
+                            multiTransformSmokeComponentIds[1] = target.component;
+                        }
+                    }
+                };
+                auto advanceOrFail = [&](const char* detail) {
+                    if (++multiTransformKeyboardAttempts > 45)
+                    {
+                        const auto center = multiTransformInspectorSmokeState.inputCenters[0];
+                        const auto mouse = ImGui::GetIO().MousePos;
+                        throw std::runtime_error(std::string(detail) + " center="
+                            + std::to_string(center.x) + "," + std::to_string(center.y)
+                            + " mouse=" + std::to_string(mouse.x) + "," + std::to_string(mouse.y)
+                            + " hovered=" + std::to_string(multiTransformInspectorSmokeState.inputHovered[0])
+                            + " active=" + std::to_string(multiTransformInspectorSmokeState.inputActive[0])
+                            + " textAccepted=" + std::to_string(multiTransformKeyboardTextEventAccepted)
+                            + " draft=" + (multiTransformInspectorSmokeState.overrides[0]
+                                ? std::to_string(*multiTransformInspectorSmokeState.overrides[0]) : std::string{"none"})
+                            + " focused=" + std::to_string(ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)));
+                    }
+                };
+                switch (multiTransformKeyboardPhase)
+                {
+                case MultiTransformKeyboardPhase::WaitForField:
+                    if (frames > 30 && multiTransformInspectorSmokeState.panelDrawn
+                        && multiTransformInspectorSmokeState.mixed[0])
+                    {
+                        captureCurrentTargets();
+                        multiTransformSmokeUndoCount = commands.undoCount();
+                        queueKeyboardFieldClick(multiTransformInspectorSmokeState.inputCenters[0]);
+                        multiTransformKeyboardPhase = MultiTransformKeyboardPhase::ActivateField;
+                        multiTransformKeyboardAttempts = 0;
+                    }
+                    break;
+                case MultiTransformKeyboardPhase::ActivateField:
+                    if (multiTransformInspectorSmokeState.inputActive[0])
+                    {
+                        queueKeyboardFieldRelease(multiTransformInspectorSmokeState.inputCenters[0]);
+                        multiTransformKeyboardPhase = MultiTransformKeyboardPhase::ReleaseFieldClick;
+                        multiTransformKeyboardAttempts = 0;
+                    }
+                    else
+                    {
+                        advanceOrFail("Multi-Transform numeric field did not activate for keyboard smoke");
+                        queueKeyboardFieldClick(multiTransformInspectorSmokeState.inputCenters[0]);
+                    }
+                    break;
+                case MultiTransformKeyboardPhase::ReleaseFieldClick:
+                    if (!multiTransformInspectorSmokeState.inputActive[0])
+                    {
+                        advanceOrFail("Multi-Transform numeric field lost edit focus after pointer release");
+                        queueKeyboardFieldClick(multiTransformInspectorSmokeState.inputCenters[0]);
+                        multiTransformKeyboardPhase = MultiTransformKeyboardPhase::ActivateField;
+                    }
+                    else
+                    {
+                        if (!queueKeyboardTap(SDLK_A, SDL_KMOD_CTRL))
+                            throw std::runtime_error("Could not select the multi-Transform numeric field text");
+                        multiTransformKeyboardPhase = MultiTransformKeyboardPhase::SelectText;
+                    }
+                    break;
+                case MultiTransformKeyboardPhase::SelectText:
+                    if (!queueKeyboardText("12.5"))
+                        throw std::runtime_error("Could not enqueue SDL text for the multi-Transform field");
+                    multiTransformKeyboardPhase = MultiTransformKeyboardPhase::EnterText;
+                    break;
+                case MultiTransformKeyboardPhase::EnterText:
+                    if (multiTransformKeyboardTextEventAccepted)
+                    {
+                        if (!queueKeyboardTap(SDLK_RETURN))
+                            throw std::runtime_error("Could not commit the multi-Transform numeric draft");
+                        multiTransformKeyboardPhase = MultiTransformKeyboardPhase::CommitText;
+                        multiTransformKeyboardAttempts = 0;
+                    }
+                    else advanceOrFail("SDL keyboard text did not update the multi-Transform draft");
+                    break;
+                case MultiTransformKeyboardPhase::CommitText:
+                    if (!multiTransformInspectorSmokeState.inputActive[0])
+                    {
+                        if (!multiTransformInspectorSmokeState.overrides[0]
+                            || *multiTransformInspectorSmokeState.overrides[0] != 12.5)
+                            throw std::runtime_error("Committing SDL keyboard text did not store the multi-Transform draft");
+                        const auto* first = scene.transform(multiTransformSmokePrimaryEntity);
+                        const auto* second = scene.transform(multiTransformSmokeEntity);
+                        multiTransformKeyboardDraftOnly = multiTransformKeyboardTextEventAccepted
+                            && multiTransformInspectorSmokeState.overrides[0]
+                            && *multiTransformInspectorSmokeState.overrides[0] == 12.5
+                            && first && second
+                            && first->value == multiTransformSmokeOriginals[0]
+                            && second->value == multiTransformSmokeOriginals[1];
+                        if (!multiTransformKeyboardDraftOnly)
+                            throw std::runtime_error("Multi-Transform keyboard edit changed the Scene before Apply or lost its draft");
+                        auto changed = second->value;
+                        changed.position.y += 0.5;
+                        if (!scene.setTransform(multiTransformSmokeEntity, changed))
+                            throw std::runtime_error("Multi-Transform stale-draft smoke could not change the Scene fixture");
+                        sceneDirty = true;
+                        multiTransformKeyboardPhase = MultiTransformKeyboardPhase::VerifyStale;
+                        multiTransformKeyboardAttempts = 0;
+                    }
+                    else advanceOrFail("Enter did not finish editing the multi-Transform numeric field");
+                    break;
+                case MultiTransformKeyboardPhase::VerifyStale:
+                    if (multiTransformInspectorSmokeState.stale)
+                    {
+                        multiTransformStaleDraftBlocked = !multiTransformInspectorSmokeState.applyEnabled
+                            && multiTransformInspectorSmokeState.overrides[0]
+                            && *multiTransformInspectorSmokeState.overrides[0] == 12.5;
+                        if (!multiTransformStaleDraftBlocked)
+                            throw std::runtime_error("Stale multi-Transform draft remained applicable or was discarded");
+                        resetMultiTransformDraft(scene,
+                            {multiTransformSmokePrimaryEntity, multiTransformSmokeEntity},
+                            multiTransformInspectorSmokeState);
+                        if (multiTransformInspectorSmokeState.overrides[0])
+                            throw std::runtime_error("Reloading a stale multi-Transform draft did not clear the pending value");
+                        multiTransformInspectorSmokeState.overrides[0] = 12.5;
+                        hierarchySelection = {multiTransformSmokePrimaryEntity};
+                        selectedEntity = multiTransformSmokePrimaryEntity;
+                        multiTransformKeyboardPhase = MultiTransformKeyboardPhase::VerifySelectionDiscard;
+                        multiTransformKeyboardAttempts = 0;
+                    }
+                    else advanceOrFail("Multi-Transform Inspector did not mark the externally changed draft stale");
+                    break;
+                case MultiTransformKeyboardPhase::VerifySelectionDiscard:
+                    if (multiTransformInspectorSmokeState.entities.size() == 1
+                        && multiTransformInspectorSmokeState.entities.front() == multiTransformSmokePrimaryEntity
+                        && multiTransformInspectorSmokeState.selectionDraftDiscardedMessageShown
+                        && !multiTransformInspectorSmokeState.overrides[0])
+                    {
+                        multiTransformSelectionDraftDiscarded = true;
+                        multiTransformSelectionDiscardMessageShown = true;
+                        hierarchySelection = {multiTransformSmokePrimaryEntity, multiTransformSmokeEntity};
+                        selectedEntity = multiTransformSmokePrimaryEntity;
+                        multiTransformKeyboardPhase = MultiTransformKeyboardPhase::VerifySelectionRestored;
+                        multiTransformKeyboardAttempts = 0;
+                    }
+                    else advanceOrFail("Changing the multi-selection did not clear and report the unapplied Transform draft");
+                    break;
+                case MultiTransformKeyboardPhase::VerifySelectionRestored:
+                    if (multiTransformInspectorSmokeState.entities
+                            == std::vector<EntityId>{multiTransformSmokePrimaryEntity, multiTransformSmokeEntity}
+                        && multiTransformInspectorSmokeState.panelDrawn
+                        && !multiTransformInspectorSmokeState.overrides[0]
+                        && !multiTransformInspectorSmokeState.stale)
+                    {
+                        captureCurrentTargets();
+                        multiTransformSmokeUndoCount = commands.undoCount();
+                        multiTransformInspectorSmokeState.overrides[0] = 12.5;
+                        if (!applyMultiTransformDraft(scene,
+                                {multiTransformSmokePrimaryEntity, multiTransformSmokeEntity}, commands,
+                                sceneDirty, message, multiTransformInspectorSmokeState, reportError))
+                            throw std::runtime_error("Multi-Transform Inspector shared Apply path rejected its valid refreshed draft");
+                        multiTransformInspectorSmokePhase = 3;
+                        const auto* first = scene.transform(multiTransformSmokePrimaryEntity);
+                        const auto* second = scene.transform(multiTransformSmokeEntity);
+                        multiTransformSmokeApplied = first && second
+                            && first->value.position.x == 12.5 && second->value.position.x == 12.5
+                            && commands.undoCount() == multiTransformSmokeUndoCount + 1;
+                        if (!multiTransformSmokeApplied)
+                            throw std::runtime_error("Multi-Transform Inspector Apply did not update every selected entity in one history entry");
+                        const bool undone = static_cast<bool>(commands.undo());
+                        const auto* firstUndo = scene.transform(multiTransformSmokePrimaryEntity);
+                        const auto* secondUndo = scene.transform(multiTransformSmokeEntity);
+                        const bool restored = undone && firstUndo && secondUndo
+                            && firstUndo->value == multiTransformSmokeOriginals[0]
+                            && secondUndo->value == multiTransformSmokeOriginals[1];
+                        const bool redone = restored && static_cast<bool>(commands.redo());
+                        const auto* firstRedo = scene.transform(multiTransformSmokePrimaryEntity);
+                        const auto* secondRedo = scene.transform(multiTransformSmokeEntity);
+                        multiTransformSmokeUndoRedo = redone && firstRedo && secondRedo
+                            && firstRedo->value.position.x == 12.5 && secondRedo->value.position.x == 12.5
+                            && firstRedo->id == multiTransformSmokeComponentIds[0]
+                            && secondRedo->id == multiTransformSmokeComponentIds[1];
+                        if (!multiTransformSmokeUndoRedo)
+                            throw std::runtime_error("Multi-Transform transaction failed Undo/Redo value or component ID checks");
+                        sceneDirty = true;
+                        if (!saveCurrentScene() || !openSceneFile(currentScenePath))
+                            throw std::runtime_error("Multi-Transform smoke could not save and reload its edited Scene");
+                        sceneDirty = false;
+                        if (!selectEntityInHierarchy(multiTransformSmokePrimaryEntity))
+                            throw std::runtime_error("Multi-Transform smoke could not restore its primary fixture selection");
+                        multiTransformKeyboardPhase = MultiTransformKeyboardPhase::Done;
+                        std::cout << "[editor] multiTransformKeyboard=1 sdlText=1 draftOnly="
+                            << (multiTransformKeyboardDraftOnly ? 1 : 0) << " staleBlocked="
+                            << (multiTransformStaleDraftBlocked ? 1 : 0) << " selectionDiscarded="
+                            << (multiTransformSelectionDraftDiscarded ? 1 : 0) << " discardNotice="
+                            << (multiTransformSelectionDiscardMessageShown ? 1 : 0) << " applyUndoRedo=1\n";
+                    }
+                    else advanceOrFail("Multi-Transform Inspector did not restore a clean two-object selection");
+                    break;
+                case MultiTransformKeyboardPhase::Done:
+                    break;
+                }
+            }
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+            const bool lightInspectorKeyboardWindowActive = !lightInspectorKeyboardPassed && frames >= 108;
+            if (lightInspectorPointerSmoke
+                && (lightInspectorPointerActionIndex < lightPointerActions.size()
+                    || lightInspectorKeyboardWindowActive)
+                && primitiveInspectorSmokeEntity != 0)
+            {
+                auto* viewport = ImGui::GetMainViewport();
+                if (!viewport) throw std::runtime_error("Light Inspector pointer smoke could not resolve the main viewport");
+                ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x + 18.0f, viewport->Pos.y + 120.0f), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(600.0f, 650.0f), ImGuiCond_Always);
+                if (!lightInspectorSmokeWindowFocused)
+                {
+                    ImGui::SetNextWindowFocus();
+                    lightInspectorSmokeWindowFocused = true;
+                }
+                constexpr auto pointerWindowFlags = ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings
+                    | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse;
+                const auto pointerSmokeTitle = std::string(tr("Inspector")) + "###LightInspectorPointerSmoke";
+                ImGui::Begin(pointerSmokeTitle.c_str(), nullptr, pointerWindowFlags);
+                ImGui::PushID(0x504F494E);
+                if (!pointInspectorPointerDraftSeeded)
+                {
+                    if (const auto* component = scene.pointLight3D(primitiveInspectorSmokeEntity))
+                    {
+                        pointLightInspectorState.scene = scene.id();
+                        pointLightInspectorState.entity = primitiveInspectorSmokeEntity;
+                        pointLightInspectorState.component = component->id;
+                        pointInspectorPointerOriginalColor = component->color;
+                        pointLightInspectorState.color = component->color;
+                        pointLightInspectorState.intensity = component->intensity;
+                        pointLightInspectorState.range = component->range;
+                        pointLightInspectorState.enabled = component->enabled;
+                        pointLightInspectorState.smokeEnabledPointerEdited = false;
+                        pointLightInspectorState.smokeIntensityPointerEdited = false;
+                        pointLightInspectorState.smokeColorChannelPointerEdited.fill(false);
+                        pointLightInspectorState.initialized = true;
+                        pointInspectorPointerDraftSeeded = true;
+                    }
+                }
+                pointLightInspectorState.smokeTestDraw = true;
+                if (scene.pointLight3D(primitiveInspectorSmokeEntity))
+                    drawPointLightInspector(scene, primitiveInspectorSmokeEntity, commands, sceneDirty, message,
+                        pointLightInspectorState, reportError);
+                pointLightInspectorState.smokeTestDraw = false;
+                ImGui::PopID();
+                ImGui::PushID(0x44495245);
+                if (!directionalInspectorPointerDraftSeeded)
+                {
+                    if (const auto* component = scene.directionalLight3D(primitiveInspectorSmokeEntity))
+                    {
+                        directionalLightInspectorState.scene = scene.id();
+                        directionalLightInspectorState.entity = primitiveInspectorSmokeEntity;
+                        directionalLightInspectorState.component = component->id;
+                        directionalInspectorPointerOriginalColor = component->color;
+                        directionalLightInspectorState.color = component->color;
+                        directionalLightInspectorState.intensity = component->intensity;
+                        directionalLightInspectorState.enabled = component->enabled;
+                        directionalLightInspectorState.smokeEnabledPointerEdited = false;
+                        directionalLightInspectorState.smokeIntensityPointerEdited = false;
+                        directionalLightInspectorState.smokeColorChannelPointerEdited.fill(false);
+                        directionalLightInspectorState.initialized = true;
+                        directionalInspectorPointerDraftSeeded = true;
+                    }
+                }
+                if (lightInspectorKeyboardWindowActive && !lightInspectorKeyboardDraftSeeded)
+                {
+                    if (runtimeBgfxPointLightSmoke)
+                    {
+                        if (const auto* component = scene.pointLight3D(primitiveInspectorSmokeEntity))
+                        {
+                            pointLightInspectorState.scene = scene.id();
+                            pointLightInspectorState.entity = primitiveInspectorSmokeEntity;
+                            pointLightInspectorState.component = component->id;
+                            pointLightInspectorState.color = component->color;
+                            pointLightInspectorState.intensity = component->intensity;
+                            pointLightInspectorState.range = component->range;
+                            pointLightInspectorState.enabled = component->enabled;
+                            pointLightInspectorState.initialized = true;
+                        }
+                    }
+                    else if (const auto* component = scene.directionalLight3D(primitiveInspectorSmokeEntity))
+                    {
+                        directionalLightInspectorState.scene = scene.id();
+                        directionalLightInspectorState.entity = primitiveInspectorSmokeEntity;
+                        directionalLightInspectorState.component = component->id;
+                        directionalLightInspectorState.color = component->color;
+                        directionalLightInspectorState.intensity = component->intensity;
+                        directionalLightInspectorState.enabled = component->enabled;
+                        directionalLightInspectorState.initialized = true;
+                    }
+                    auto& keyboardPointState = pointLightInspectorState;
+                    auto& keyboardDirectionalState = directionalLightInspectorState;
+                    keyboardPointState.smokeKeyboardEnabledEdited = false;
+                    keyboardDirectionalState.smokeKeyboardEnabledEdited = false;
+                    lightInspectorKeyboardDraftSeeded = true;
+                }
+                directionalLightInspectorState.smokeTestDraw = true;
+                if (scene.directionalLight3D(primitiveInspectorSmokeEntity))
+                    drawDirectionalLightInspector(scene, primitiveInspectorSmokeEntity, commands, sceneDirty, message,
+                        directionalLightInspectorState, reportError);
+                directionalLightInspectorState.smokeTestDraw = false;
+                ImGui::PopID();
+                ImGui::End();
+
+                const bool desktopCoordinates = (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) != 0;
+                auto queueClickEvent = [&](const SDL_EventType type, const ImVec2 screenPosition) {
+                    const float localX = screenPosition.x - (desktopCoordinates ? viewport->Pos.x : 0.0f);
+                    const float localY = screenPosition.y - (desktopCoordinates ? viewport->Pos.y : 0.0f);
+                    pendingSmokeMouseEvents.push_back({type, SDL_BUTTON_LEFT, localX, localY});
+                };
+                auto colorWasEditedByAllChannels = [](const std::array<float, 3>& edited,
+                    const std::array<float, 3>& original, const std::array<bool, 3>& channelInputs) {
+                    for (std::size_t channel = 0; channel < edited.size(); ++channel)
+                        if (!channelInputs[channel] || std::abs(edited[channel] - original[channel]) < 0.005f)
+                            return false;
+                    return true;
+                };
+                if (lightInspectorPointerActionIndex < lightPointerActions.size())
+                {
+                    const auto& action = lightPointerActions[lightInspectorPointerActionIndex];
+                    const bool pointTarget = action.target == LightPointerTarget::Point;
+                    auto& pointState = pointLightInspectorState;
+                    auto& directionalState = directionalLightInspectorState;
+                    ImVec2 start{};
+                    ImVec2 end{};
+                    bool drag = false;
+                    bool actionObserved = false;
+                    if (pointTarget)
+                    {
+                        switch (action.widget)
+                        {
+                        case LightPointerWidget::Enabled:
+                            start = end = pointState.enabledControlCenter;
+                            actionObserved = pointState.smokeEnabledPointerEdited;
+                            break;
+                        case LightPointerWidget::Intensity:
+                            start = pointState.intensitySliderStart;
+                            end = pointState.intensitySliderEnd;
+                            drag = true;
+                            actionObserved = pointState.smokeIntensityPointerEdited;
+                            break;
+                        case LightPointerWidget::Color:
+                            start = pointState.colorSliderTrack[action.channel][0];
+                            end = pointState.colorSliderTrack[action.channel][1];
+                            drag = true;
+                            actionObserved = pointState.smokeColorChannelPointerEdited[action.channel];
+                            break;
+                        case LightPointerWidget::Apply:
+                        {
+                            start = end = pointState.applyButtonCenter;
+                            const auto* point = scene.pointLight3D(primitiveInspectorSmokeEntity);
+                            actionObserved = point && point->enabled == pointState.enabled
+                                && point->intensity == pointState.intensity && point->color == pointState.color
+                                && point->intensity != 4.0f;
+                            break;
+                        }
+                        }
+                    }
+                    else
+                    {
+                        switch (action.widget)
+                        {
+                        case LightPointerWidget::Enabled:
+                            start = end = directionalState.enabledControlCenter;
+                            actionObserved = directionalState.smokeEnabledPointerEdited;
+                            break;
+                        case LightPointerWidget::Intensity:
+                            start = directionalState.intensitySliderStart;
+                            end = directionalState.intensitySliderEnd;
+                            drag = true;
+                            actionObserved = directionalState.smokeIntensityPointerEdited;
+                            break;
+                        case LightPointerWidget::Color:
+                            start = directionalState.colorSliderTrack[action.channel][0];
+                            end = directionalState.colorSliderTrack[action.channel][1];
+                            drag = true;
+                            actionObserved = directionalState.smokeColorChannelPointerEdited[action.channel];
+                            break;
+                        case LightPointerWidget::Apply:
+                        {
+                            start = end = directionalState.applyButtonCenter;
+                            const auto* light = scene.directionalLight3D(primitiveInspectorSmokeEntity);
+                            actionObserved = light && light->enabled == directionalState.enabled
+                                && light->intensity == directionalState.intensity && light->color == directionalState.color
+                                && light->intensity != 3.5f;
+                            break;
+                        }
+                        }
+                    }
+
+                    if (lightInspectorPointerActionPhase == 0)
+                    {
+                        queueClickEvent(SDL_EVENT_MOUSE_BUTTON_DOWN, start);
+                        lightInspectorPointerActionPhase = 1;
+                    }
+                    else if (lightInspectorPointerActionPhase == 1 && drag)
+                    {
+                        queueClickEvent(SDL_EVENT_MOUSE_MOTION, end);
+                        lightInspectorPointerActionPhase = 2;
+                    }
+                    else if (lightInspectorPointerActionPhase == 1 || lightInspectorPointerActionPhase == 2)
+                    {
+                        queueClickEvent(SDL_EVENT_MOUSE_BUTTON_UP, end);
+                        lightInspectorPointerActionPhase = 3;
+                    }
+                    else if (lightInspectorPointerActionPhase == 3 && actionObserved)
+                    {
+                        if (action.widget == LightPointerWidget::Apply && pointTarget)
+                        {
+                            const auto* point = scene.pointLight3D(primitiveInspectorSmokeEntity);
+                            pointInspectorPointerApplyPassed = point && pointState.enabled
+                                && point->enabled == pointState.enabled && point->intensity == pointState.intensity
+                                && point->intensity != 4.0f && point->color == pointState.color
+                                && colorWasEditedByAllChannels(pointState.color, pointInspectorPointerOriginalColor,
+                                    pointState.smokeColorChannelPointerEdited)
+                                && pointState.smokeEnabledPointerEdited && pointState.smokeIntensityPointerEdited;
+                            if (!pointInspectorPointerApplyPassed)
+                                throw std::runtime_error("PointLight3D RGB/checkbox/intensity Apply pointer test failed");
+                        }
+                        else if (action.widget == LightPointerWidget::Apply)
+                        {
+                            const auto* appliedDirectional = scene.directionalLight3D(primitiveInspectorSmokeEntity);
+                            directionalInspectorPointerApplyPassed = appliedDirectional && directionalState.enabled
+                                && appliedDirectional->enabled == directionalState.enabled
+                                && appliedDirectional->intensity == directionalState.intensity
+                                && appliedDirectional->intensity != 3.5f && appliedDirectional->color == directionalState.color
+                                && colorWasEditedByAllChannels(directionalState.color,
+                                    directionalInspectorPointerOriginalColor,
+                                    directionalState.smokeColorChannelPointerEdited)
+                                && directionalState.smokeEnabledPointerEdited
+                                && directionalState.smokeIntensityPointerEdited;
+                            if (!directionalInspectorPointerApplyPassed)
+                                throw std::runtime_error(std::string("DirectionalLight3D RGB/checkbox/intensity Apply pointer test failed")
+                                    + " enabled=" + (directionalState.enabled ? "1" : "0") + "/"
+                                    + (appliedDirectional && appliedDirectional->enabled ? "1" : "0")
+                                    + " intensity=" + std::to_string(directionalState.intensity) + "/"
+                                    + (appliedDirectional ? std::to_string(appliedDirectional->intensity) : "missing")
+                                    + " draftRgb=" + std::to_string(directionalState.color[0]) + ","
+                                    + std::to_string(directionalState.color[1]) + "," + std::to_string(directionalState.color[2])
+                                    + " sceneRgb=" + (appliedDirectional ? std::to_string(appliedDirectional->color[0]) : "missing")
+                                    + "," + (appliedDirectional ? std::to_string(appliedDirectional->color[1]) : "missing")
+                                    + "," + (appliedDirectional ? std::to_string(appliedDirectional->color[2]) : "missing")
+                                    + " rgbInputs=" + (directionalState.smokeColorChannelPointerEdited[0] ? "1" : "0")
+                                    + (directionalState.smokeColorChannelPointerEdited[1] ? "1" : "0")
+                                    + (directionalState.smokeColorChannelPointerEdited[2] ? "1" : "0")
+                                    + " flags=" + (directionalState.smokeEnabledPointerEdited ? "1" : "0")
+                                    + (directionalState.smokeIntensityPointerEdited ? "1" : "0"));
+
+                            const bool editedValuesApplied = directionalInspectorPointerApplyPassed
+                                && (!runtimeBgfxPointLightSmoke || pointInspectorPointerApplyPassed);
+                            const bool undoDirectional = editedValuesApplied && commands.undo();
+                            const bool undoPoint = undoDirectional
+                                && (!runtimeBgfxPointLightSmoke || static_cast<bool>(commands.undo()));
+                            const auto* point = scene.pointLight3D(primitiveInspectorSmokeEntity);
+                            const auto* directional = scene.directionalLight3D(primitiveInspectorSmokeEntity);
+                            lightInspectorPointerCommandsPassed = undoPoint && directional
+                                && !directional->enabled && directional->intensity == 3.5f
+                                && directional->color == directionalInspectorPointerOriginalColor
+                                && (!runtimeBgfxPointLightSmoke
+                                    || (point && !point->enabled && point->intensity == 4.0f
+                                        && point->color == pointInspectorPointerOriginalColor));
+                            if (!lightInspectorPointerCommandsPassed)
+                                throw std::runtime_error("Light Inspector pointer Apply/Undo transaction failed to restore fixture values");
+                            commands.clearHistory();
+                            sceneDirty = false;
+                        }
+                        ++lightInspectorPointerActionIndex;
+                        lightInspectorPointerActionPhase = 0;
+                    }
+                }
+                else if (!lightInspectorKeyboardPassed)
+                {
+                    const bool pointTarget = runtimeBgfxPointLightSmoke;
+                    auto& pointKeyboardState = pointLightInspectorState;
+                    auto& directionalKeyboardState = directionalLightInspectorState;
+                    auto& keyboardEnabled = pointTarget ? pointKeyboardState.enabled : directionalKeyboardState.enabled;
+                    auto& keyboardEnabledEdited = pointTarget
+                        ? pointKeyboardState.smokeKeyboardEnabledEdited : directionalKeyboardState.smokeKeyboardEnabledEdited;
+                    const bool keyboardEnabledFocused = pointTarget
+                        ? pointKeyboardState.smokeKeyboardEnabledFocused : directionalKeyboardState.smokeKeyboardEnabledFocused;
+                    const bool keyboardIntensityValueFocused = pointTarget
+                        ? pointKeyboardState.smokeKeyboardIntensityValueFocused : directionalKeyboardState.smokeKeyboardIntensityValueFocused;
+                    if (!queueKeyboardRelease())
+                        throw std::runtime_error("Could not release the previous light Inspector keyboard key");
+                    auto advanceToFocusedWidget = [&](const bool focused) {
+                        if (focused)
+                        {
+                            lightInspectorKeyboardFocusAttempts = 0;
+                            return true;
+                        }
+                        if (++lightInspectorKeyboardFocusAttempts > 40)
+                            throw std::runtime_error("Light Inspector keyboard navigation could not reach the expected control");
+                        if (!queueKeyboardTap(SDLK_TAB))
+                            throw std::runtime_error("Could not enqueue Tab for light Inspector keyboard smoke");
+                        return false;
+                    };
+
+                    switch (lightInspectorKeyboardPhase)
+                    {
+                    case LightKeyboardPhase::FocusEnabled:
+                        if (advanceToFocusedWidget(keyboardEnabledFocused))
+                        {
+                            keyboardEnabledEdited = false;
+                            lightInspectorKeyboardPhase = LightKeyboardPhase::ToggleEnabled;
+                        }
+                        break;
+                    case LightKeyboardPhase::ToggleEnabled:
+                    if (!queueKeyboardTap(SDLK_RETURN))
+                            throw std::runtime_error("Could not enqueue Enter for light Inspector checkbox");
+                        lightInspectorKeyboardPhase = LightKeyboardPhase::WaitEnabled;
+                        break;
+                    case LightKeyboardPhase::WaitEnabled:
+                        if (keyboardEnabledEdited && keyboardEnabled)
+                        lightInspectorKeyboardPhase = LightKeyboardPhase::FocusIntensityValue;
+                        break;
+                    case LightKeyboardPhase::FocusIntensityValue:
+                        if (advanceToFocusedWidget(keyboardIntensityValueFocused))
+                        {
+                            lightInspectorKeyboardValueFieldFocusPassed = true;
+                            const ImVec2 center = pointTarget ? pointKeyboardState.smokeKeyboardIntensityValueCenter
+                                : directionalKeyboardState.smokeKeyboardIntensityValueCenter;
+                            queueKeyboardFieldClick(center);
+                            lightInspectorKeyboardPhase = LightKeyboardPhase::ActivateIntensityValue;
+                        }
+                        break;
+                    case LightKeyboardPhase::ActivateIntensityValue:
+                    {
+                        const bool fieldActive = pointTarget
+                            ? pointKeyboardState.smokeKeyboardIntensityValueActive : directionalKeyboardState.smokeKeyboardIntensityValueActive;
+                        if (!fieldActive)
+                        {
+                            if (++lightInspectorKeyboardFocusAttempts > 40)
+                                throw std::runtime_error("Light Inspector intensity input could not enter text-edit mode");
+                            const ImVec2 center = pointTarget ? pointKeyboardState.smokeKeyboardIntensityValueCenter
+                                : directionalKeyboardState.smokeKeyboardIntensityValueCenter;
+                            queueKeyboardFieldClick(center);
+                            break;
+                        }
+                        lightInspectorKeyboardFocusAttempts = 0;
+                        lightInspectorKeyboardValueFieldWasActive = true;
+                        lightInspectorKeyboardRequestedTextInput = pointTarget
+                            ? pointKeyboardState.smokeKeyboardIntensityWantsTextInput
+                            : directionalKeyboardState.smokeKeyboardIntensityWantsTextInput;
+                        {
+                            const ImVec2 center = pointTarget ? pointKeyboardState.smokeKeyboardIntensityValueCenter
+                                : directionalKeyboardState.smokeKeyboardIntensityValueCenter;
+                            queueKeyboardFieldRelease(center);
+                        }
+                        lightInspectorKeyboardPhase = LightKeyboardPhase::ReleaseIntensityClick;
+                        break;
+                    }
+                    case LightKeyboardPhase::ReleaseIntensityClick:
+                    {
+                        const bool fieldActive = pointTarget
+                            ? pointKeyboardState.smokeKeyboardIntensityValueActive : directionalKeyboardState.smokeKeyboardIntensityValueActive;
+                        if (!fieldActive)
+                        {
+                            if (++lightInspectorKeyboardFocusAttempts > 40)
+                                throw std::runtime_error("Light Inspector text field lost activation after mouse release");
+                            const ImVec2 center = pointTarget ? pointKeyboardState.smokeKeyboardIntensityValueCenter
+                                : directionalKeyboardState.smokeKeyboardIntensityValueCenter;
+                            queueKeyboardFieldClick(center);
+                            lightInspectorKeyboardPhase = LightKeyboardPhase::ActivateIntensityValue;
+                            break;
+                        }
+                        if (!queueKeyboardTap(SDLK_A, SDL_KMOD_CTRL))
+                            throw std::runtime_error("Could not select light intensity text");
+                        lightInspectorKeyboardPhase = LightKeyboardPhase::SelectIntensityText;
+                        break;
+                    }
+                    case LightKeyboardPhase::SelectIntensityText:
+                        if (!queueKeyboardText("5.25"))
+                            throw std::runtime_error("Could not enqueue SDL text for the light Inspector intensity value field");
+                        lightInspectorKeyboardPhase = LightKeyboardPhase::InputIntensityValue;
+                        break;
+                    case LightKeyboardPhase::InputIntensityValue:
+                    {
+                        if (!queueKeyboardTap(SDLK_RETURN))
+                            throw std::runtime_error("Could not commit the light Inspector intensity value");
+                        lightInspectorKeyboardFocusAttempts = 0;
+                        lightInspectorKeyboardPhase = LightKeyboardPhase::CommitIntensityValue;
+                        break;
+                    }
+                    case LightKeyboardPhase::CommitIntensityValue:
+                    {
+                        const bool fieldActive = pointTarget
+                            ? pointKeyboardState.smokeKeyboardIntensityValueActive : directionalKeyboardState.smokeKeyboardIntensityValueActive;
+                        if (fieldActive)
+                        {
+                            if (++lightInspectorKeyboardFocusAttempts > 40)
+                                throw std::runtime_error("Enter did not finish editing the light Inspector intensity value");
+                            break;
+                        }
+                        const float draftIntensity = pointTarget
+                            ? pointKeyboardState.intensity : directionalKeyboardState.intensity;
+                        const bool numericDraftEdited = std::abs(draftIntensity - 5.25f) < 0.001f;
+                        const bool navCursorVisible = pointTarget
+                            ? pointKeyboardState.smokeKeyboardIntensityNavVisible
+                            : directionalKeyboardState.smokeKeyboardIntensityNavVisible;
+                        std::cout << "[editor] lightInspectorKeyboardProbe=1 target="
+                            << (pointTarget ? "point" : "directional")
+                            << " valueFieldActive=" << (lightInspectorKeyboardValueFieldWasActive ? 1 : 0)
+                            << " navCursorVisible=" << (navCursorVisible ? 1 : 0)
+                            << " textInput=" << (lightInspectorKeyboardRequestedTextInput ? 1 : 0)
+                            << " sdlTextAccepted=" << (lightInspectorKeyboardTextEventAccepted ? 1 : 0)
+                            << " numericDraftEdited=" << (numericDraftEdited ? 1 : 0)
+                            << " draft=" << draftIntensity << '\n';
+                        lightInspectorKeyboardPhase = LightKeyboardPhase::VerifyDraft;
+                        break;
+                    }
+                    case LightKeyboardPhase::VerifyDraft:
+                    {
+                        const std::array<float, 3> originalColor = pointTarget
+                            ? pointInspectorPointerOriginalColor : directionalInspectorPointerOriginalColor;
+                        const float originalIntensity = pointTarget ? 4.0f : 3.5f;
+                        const auto* point = scene.pointLight3D(primitiveInspectorSmokeEntity);
+                        const auto* directional = scene.directionalLight3D(primitiveInspectorSmokeEntity);
+                        const bool sceneUnchanged = pointTarget
+                            ? point && !point->enabled && point->color == originalColor
+                                && point->intensity == originalIntensity
+                            : directional && !directional->enabled && directional->color == originalColor
+                                && directional->intensity == originalIntensity;
+                        const float draftIntensity = pointTarget
+                            ? pointKeyboardState.intensity : directionalKeyboardState.intensity;
+                        if (!sceneUnchanged || !keyboardEnabledEdited || !keyboardEnabled
+                            || std::abs(draftIntensity - 5.25f) >= 0.001f
+                            || !lightInspectorKeyboardValueFieldFocusPassed)
+                            throw std::runtime_error("Light Inspector keyboard numeric draft/focus smoke did not complete");
+                        lightInspectorKeyboardPhase = LightKeyboardPhase::Done;
+                        break;
+                    }
+                    case LightKeyboardPhase::Done:
+                        std::cout << "[editor] lightInspectorKeyboard=1 target="
+                            << (pointTarget ? "point" : "directional")
+                            << " enabledDraft=1 valueFieldEdited=1 draftOnly=1 sceneUnchanged=1 sdl=1\n";
+                        lightInspectorKeyboardPassed = true;
+                        break;
+                    }
+                }
+            }
+#endif
             if (ImGui::Begin(tr("Scene View")))
             {
                 docked = docked && ImGui::IsWindowDocked();
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+                sceneViewPointerHoveringViewport = false;
                 if (ImGui::Button(tr("Frame All"))) sceneTarget.requestFrameAll();
                 ImGui::SameLine();
                 if (ImGui::Button(tr("Reload 3D meshes"))) sceneTarget.invalidate3dCache();
@@ -6222,29 +12648,66 @@ public:
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
                         const auto viewportMin = ImGui::GetCursorScreenPos();
                         const ImVec2 viewportMax{viewportMin.x + available.x, viewportMin.y + available.y};
-                        if (available.x > 2.0f && available.y > 2.0f
-                            && ImGui::IsMouseHoveringRect(viewportMin, viewportMax, true))
+                        sceneViewPointerHoveringViewport = available.x > 2.0f && available.y > 2.0f
+                            && ImGui::IsMouseHoveringRect(viewportMin, viewportMax, true);
+                        const auto& io = ImGui::GetIO();
+                        const bool sceneViewRightClicked = ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+                        const bool sceneViewMiddleClicked = ImGui::IsMouseClicked(ImGuiMouseButton_Middle);
+                        if (sceneViewPointerHoveringViewport && sceneViewRightClicked)
                         {
-                            const auto& io = ImGui::GetIO();
-                            if (io.MouseDown[ImGuiMouseButton_Right])
-                                sceneTarget.orbit3d(io.MouseDelta.x, io.MouseDelta.y);
-                            if (io.MouseDown[ImGuiMouseButton_Middle])
-                                sceneTarget.pan3d(io.MouseDelta.x, io.MouseDelta.y, available.y);
+                            sceneViewRightDragActive = true;
+                            if (assetBrowserModelPreviewSmoke && sceneViewMouseEventPhase == 3)
+                            {
+                                sceneViewRightPressStartedInside = true;
+                            }
+                        }
+                        if (sceneViewPointerHoveringViewport && sceneViewMiddleClicked)
+                        {
+                            sceneViewMiddleDragActive = true;
+                            if (assetBrowserModelPreviewSmoke && sceneViewMouseEventPhase == 7)
+                            {
+                                sceneViewMiddlePressStartedInside = true;
+                            }
+                        }
+                        if (assetBrowserModelPreviewSmoke && sceneViewRightClicked && !sceneViewPointerHoveringViewport)
+                        {
+                            sceneViewOutsideRightPressEventSeen = true;
+                        }
+                        if (assetBrowserModelPreviewSmoke && sceneViewMiddleClicked && !sceneViewPointerHoveringViewport)
+                        {
+                            sceneViewOutsideMiddlePressEventSeen = true;
+                        }
+                        if (sceneViewRightDragActive && io.MouseDown[ImGuiMouseButton_Right])
+                            sceneTarget.orbit3d(io.MouseDelta.x, io.MouseDelta.y);
+                        if (sceneViewMiddleDragActive && io.MouseDown[ImGuiMouseButton_Middle])
+                            sceneTarget.pan3d(io.MouseDelta.x, io.MouseDelta.y, available.y);
+                        if (!io.MouseDown[ImGuiMouseButton_Right])
+                            sceneViewRightDragActive = false;
+                        if (!io.MouseDown[ImGuiMouseButton_Middle])
+                            sceneViewMiddleDragActive = false;
+                        if (sceneViewPointerHoveringViewport)
+                        {
                             if (io.MouseWheel != 0.0f) sceneTarget.zoom3d(io.MouseWheel);
                         }
 #endif
                         bgfx::TextureHandle renderedTexture = BGFX_INVALID_HANDLE;
                         std::string renderError;
                         if (assetRegistry && available.x > 2.0f && available.y > 2.0f
-                            && sceneTarget.render(scene, &*assetRegistry, spriteTextures,
+                            && sceneTarget.render(runtimeBgfxDirectionalLightSmoke && directionalLightSmokeScene
+                                    ? *directionalLightSmokeScene : scene, &*assetRegistry, spriteTextures,
                                 static_cast<int>(available.x), static_cast<int>(available.y),
                                 program, sampler, outputMode, layout, renderedTexture, renderError,
                                 benchmark ? &editorSceneTiming : nullptr))
                         {
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+                            if (smoke && maskMipPattern == SmokeMaskMipPattern::CutoffTransitionRamp
+                                && !sceneViewSpatialZoomApplied && sceneTarget.frameAllApplied())
+                            {
+                                sceneTarget.zoom3d(5.0f);
+                                sceneViewSpatialZoomApplied = true;
+                            }
                             if (smoke)
                             {
-                                const auto& io = ImGui::GetIO();
                                 const auto* mainViewport = ImGui::GetMainViewport();
                                 if (mainViewport && io.DisplaySize.x > 0.0f && io.DisplaySize.y > 0.0f)
                                 {
@@ -6254,6 +12717,12 @@ public:
                                         (viewportMax.x - mainViewport->Pos.x) / io.DisplaySize.x,
                                         (viewportMax.y - mainViewport->Pos.y) / io.DisplaySize.y};
                                     sceneViewRectValid = true;
+                                    sceneViewInputRect = {
+                                        viewportMin.x - mainViewport->Pos.x,
+                                        viewportMin.y - mainViewport->Pos.y,
+                                        viewportMax.x - mainViewport->Pos.x,
+                                        viewportMax.y - mainViewport->Pos.y};
+                                    sceneViewInputRectValid = true;
                                 }
                             }
 #endif
@@ -6269,7 +12738,10 @@ public:
                             : "Open a project to render its SpriteRenderer assets.");
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
                         if (!sceneTarget.meshError().empty())
-                            ImGui::TextDisabled(tr("3D preview: %s"), sceneTarget.meshError().c_str());
+                        {
+                            const auto localizedSceneViewText = localizedSceneViewDiagnostics(sceneTarget.meshError());
+                            ImGui::TextDisabled(tr("3D preview: %s"), localizedSceneViewText.c_str());
+                        }
 #endif
                         ImGui::EndTabItem();
                     }
@@ -6284,8 +12756,25 @@ public:
             ImGui::End();
             if (showGameView)
             {
+                if (runtimeBgfxGameViewTextureSmoke || runtimeBgfxDirectionalLightSmoke)
+                {
+                    const bool directionalLightSmoke = runtimeBgfxDirectionalLightSmoke;
+                    ImGui::SetNextWindowPos(directionalLightSmoke ? ImVec2(900.0f, 140.0f)
+                        : ImVec2(240.0f, 140.0f), ImGuiCond_Always);
+                    ImGui::SetNextWindowSize(directionalLightSmoke ? ImVec2(190.0f, 480.0f)
+                        : ImVec2(640.0f, 480.0f), ImGuiCond_Always);
+                }
+                if (clampGameViewWindowNextFrame_)
+                {
+                    const auto* gameViewWindow = ImGui::FindWindowByName(tr("Game View"));
+                    if (gameViewWindow && (gameViewWindow->Size.x > workspaceLayout_.gameViewWidth
+                        || gameViewWindow->Size.y > workspaceLayout_.gameViewHeight))
+                        ImGui::SetNextWindowSize(ImVec2(std::min(gameViewWindow->Size.x, workspaceLayout_.gameViewWidth),
+                            std::min(gameViewWindow->Size.y, workspaceLayout_.gameViewHeight)), ImGuiCond_Always);
+                    clampGameViewWindowNextFrame_ = false;
+                }
                 if (!smoke && !benchmark)
-                    ImGui::SetNextWindowSize(ImVec2(520.0f, 560.0f), ImGuiCond_FirstUseEver);
+                    ImGui::SetNextWindowSize(ImVec2(workspaceLayout_.gameViewWidth, workspaceLayout_.gameViewHeight), ImGuiCond_FirstUseEver);
                 if (ImGui::Begin(tr("Game View"), &showGameView))
                 {
                 const auto state = playSession.state();
@@ -6923,14 +13412,70 @@ public:
                 {
                 bgfx::TextureHandle renderedTexture = BGFX_INVALID_HANDLE;
                 std::string renderError;
+#if defined(ASTRO_EDITOR_HAS_RUNTIME_BGFX_3D)
+                const bool gameViewRuntime3d = playSession.runtimeScene() != nullptr;
+#else
+                constexpr bool gameViewRuntime3d = false;
+#endif
                 if (assetRegistry && available.x > 2.0f && available.y > 2.0f
                     && gameTarget.render(displayedScene, &*assetRegistry, spriteTextures,
                         static_cast<int>(available.x), static_cast<int>(available.y),
                         program, sampler, outputMode, layout, renderedTexture, renderError,
-                        benchmark ? &editorGameTiming : nullptr))
+                        benchmark ? &editorGameTiming : nullptr, gameViewRuntime3d))
                 {
                     ImGui::Image(static_cast<ImTextureID>(renderedTexture.idx + 1), available,
                         framebufferUv0(), framebufferUv1());
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+                    if (framebufferReadbackSmoke || runtimeBgfxDirectionalLightSmoke || vulkanColorChartSmoke)
+                    {
+                        const auto* mainViewport = ImGui::GetMainViewport();
+                        const auto& io = ImGui::GetIO();
+                        const auto itemMin = ImGui::GetItemRectMin();
+                        const auto itemMax = ImGui::GetItemRectMax();
+                        if (mainViewport && io.DisplaySize.x > 0.0f && io.DisplaySize.y > 0.0f)
+                        {
+                            gameViewRectNormalized = {
+                                (itemMin.x - mainViewport->Pos.x) / io.DisplaySize.x,
+                                (itemMin.y - mainViewport->Pos.y) / io.DisplaySize.y,
+                                (itemMax.x - mainViewport->Pos.x) / io.DisplaySize.x,
+                                (itemMax.y - mainViewport->Pos.y) / io.DisplaySize.y};
+                            gameViewRectValid = true;
+                        }
+                    }
+#endif
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+                    if (!gameTarget.meshError().empty())
+                    {
+                        gameViewConsoleDiagnostic = gameTarget.meshError();
+                        gameViewConsoleDiagnostics = gameTarget.diagnostics();
+                        gameViewConsoleDiagnosticProjectRoot = assetRegistry->projectRoot();
+                        gameViewDiagnosticText = std::string(tr("Game View diagnostic: "))
+                            + localizedSceneViewDiagnostics(gameTarget.meshError());
+                        const auto& localizedGameViewDiagnostics = gameViewDiagnosticText;
+                        gameViewDiagnosticsShown = true;
+                        const auto textSize = ImGui::CalcTextSize(localizedGameViewDiagnostics.c_str(), nullptr, false,
+                            std::max(1.0f, available.x - 24.0f));
+                        const auto itemMin = ImGui::GetItemRectMin();
+                        const ImVec2 padding{8.0f, 6.0f};
+                        const ImVec2 boxMin{itemMin.x + 8.0f, itemMin.y + 8.0f};
+                        const ImVec2 boxMax{std::min(itemMin.x + available.x - 8.0f,
+                                boxMin.x + std::min(available.x - 16.0f, textSize.x + padding.x * 2.0f)),
+                            std::min(itemMin.y + available.y - 8.0f, boxMin.y + textSize.y + padding.y * 2.0f)};
+                        auto* drawList = ImGui::GetWindowDrawList();
+                        drawList->AddRectFilled(boxMin, boxMax, IM_COL32(20, 25, 34, 224), 4.0f);
+                        drawList->PushClipRect(boxMin, boxMax, true);
+                        drawList->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                            ImVec2(boxMin.x + padding.x, boxMin.y + padding.y), IM_COL32(255, 220, 140, 255),
+                            localizedGameViewDiagnostics.c_str(), nullptr, std::max(1.0f, available.x - 24.0f));
+                        drawList->PopClipRect();
+                    }
+                    else
+                    {
+                        gameViewConsoleDiagnostic.reset();
+                        gameViewConsoleDiagnostics.clear();
+                        gameViewConsoleDiagnosticProjectRoot.reset();
+                    }
+#endif
                     ++gameViewFrames;
                 }
                 else ImGui::TextDisabled(tr("%s"), assetRegistry ? renderError.c_str()
@@ -6960,6 +13505,896 @@ public:
             if (showCameraPresets)
                 drawCameraPresets(cameraRig, scene, selectedEntity, ImGui::GetIO().DeltaTime,
                     reportError, cameraWindowDrawn);
+            if (showAIChangeReview)
+            {
+                if (codexReviewSmoke)
+                {
+                    const auto* viewport = ImGui::GetMainViewport();
+                    if (viewport)
+                    {
+                                ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x + 24.0f,
+                                    viewport->Pos.y + (codexTransformReviewSmoke || codexReparentReviewSmoke
+                                        ? 18.0f : 90.0f)),
+                            ImGuiCond_Always);
+                                ImGui::SetNextWindowSize(ImVec2(480.0f,
+                                    codexTransformReviewSmoke ? 820.0f : codexReparentReviewSmoke ? 900.0f
+                                        : codexPrimitiveCreationSmoke ? 520.0f
+                                : codexCameraLensSmoke || codexCameraActivationSmoke || codexCameraClearSmoke
+                                    ? 460.0f : 360.0f), ImGuiCond_Always);
+                    }
+                }
+                if (ImGui::Begin(tr("AI Change Review"), &showAIChangeReview,
+                    codexReviewSmoke ? ImGuiWindowFlags_NoDocking : ImGuiWindowFlags_None))
+                {
+                    aiChangeReviewPanelDrawn = true;
+                    const char* primitiveNames[] = {tr("Cube"), tr("Plane"), tr("Sphere"), tr("Cylinder")};
+                    if (!selectedEntity || !scene.find(*selectedEntity))
+                        ImGui::TextDisabled(tr("Select a scene entity to prepare a property change."));
+                    else
+                    {
+                        const auto* selected = scene.find(*selectedEntity);
+                        const bool canPreview = !activeProjectRoot.empty();
+                        if (!codexChangeReview.hasPending() && aiProposedNameEntity != selectedEntity)
+                        {
+                            aiProposedName.fill('\0');
+                            const auto proposedName = codexChangeReviewSmoke
+                                ? std::string_view{"AI preview smoke Ω"} : std::string_view{selected->name};
+                            const auto copyCount = (std::min)(proposedName.size(), aiProposedName.size() - 1);
+                            std::copy_n(proposedName.data(), copyCount, aiProposedName.data());
+                            aiProposedNameEntity = selectedEntity;
+                            if (codexReviewSmoke) codexChangeReviewSmokeEntity = selected->id;
+                        }
+                        if (!codexChangeReview.hasPending() && aiProposedSpriteEntity != selectedEntity)
+                        {
+                            aiProposedSpriteVisible = codexSpriteVisibilitySmoke
+                                ? false : selected->spriteRenderer ? selected->spriteRenderer->visible : true;
+                            aiProposedSpriteEntity = selectedEntity;
+                            if (codexSpriteVisibilitySmoke && selected->spriteRenderer)
+                            {
+                                codexChangeReviewSmokeEntity = selected->id;
+                                codexSpriteReviewSmokeTexture = selected->spriteRenderer->texture;
+                            }
+                        }
+                        if (!codexChangeReview.hasPending() && aiProposedPrimitiveNameEntity != selectedEntity)
+                        {
+                            aiProposedPrimitiveName.fill('\0');
+                            const std::string_view proposedPrimitiveName = codexPrimitiveCreationSmoke
+                                ? std::string_view{"AI primitive smoke Ω"} : std::string_view{"New Primitive"};
+                            std::copy_n(proposedPrimitiveName.data(),
+                                (std::min)(proposedPrimitiveName.size(), aiProposedPrimitiveName.size() - 1),
+                                aiProposedPrimitiveName.data());
+                            aiProposedPrimitiveNameEntity = selectedEntity;
+                            aiProposedPrimitiveKind = 0;
+                            aiProposedPrimitiveUseParent = true;
+                            if (codexPrimitiveCreationSmoke)
+                                codexPrimitiveReviewSmokeParent = selected->id;
+                        }
+                        if (!codexChangeReview.hasPending() && aiProposedCameraLensEntity != selectedEntity)
+                        {
+                            if (const auto* camera = scene.camera3D(selected->id))
+                            {
+                                aiProposedCameraFovDegrees = codexCameraLensSmoke
+                                    ? 82.5 : camera->verticalFovDegrees;
+                                aiProposedCameraNearPlane = codexCameraLensSmoke
+                                    ? 0.25 : camera->nearPlane;
+                                aiProposedCameraFarPlane = codexCameraLensSmoke
+                                    ? 900.0 : camera->farPlane;
+                            }
+                            aiProposedCameraLensEntity = selectedEntity;
+                        }
+                        if (!codexChangeReview.hasPending() && aiProposedTransformEntity != selectedEntity)
+                        {
+                            if (const auto* transform = scene.transform(selected->id))
+                                aiProposedTransform = transform->value;
+                            if (codexTransformReviewSmoke)
+                            {
+                                aiProposedTransform.position = {2.0, 3.0, 4.0};
+                                aiProposedTransform.rotationDegrees = {10.0, 20.0, 30.0};
+                                aiProposedTransform.scale = {1.25, 1.5, 0.75};
+                                codexTransformReviewSmokeExpected = aiProposedTransform;
+                                codexChangeReviewSmokeEntity = selected->id;
+                                const auto* transform = scene.transform(selected->id);
+                                codexTransformReviewSmokeComponentId = transform ? transform->id : 0;
+                                codexTransformReviewSmokeOriginal = transform ? transform->value : astro::scene::Transform{};
+                            }
+                            aiProposedTransformEntity = selectedEntity;
+                        }
+                        if (!codexChangeReview.hasPending() && aiProposedParentEntity != selectedEntity)
+                        {
+                            aiProposedParent = selected->parent;
+                            if (codexReparentReviewSmoke)
+                            {
+                                aiProposedParent = codexReparentReviewSmokeParent;
+                                codexReparentReviewSmokeEntity = selected->id;
+                                codexReparentReviewSmokePreviousParent = selected->parent;
+                                const auto* transform = scene.transform(selected->id);
+                                codexReparentReviewSmokeComponentId = transform ? transform->id : 0;
+                                codexReparentReviewSmokeLocal = transform
+                                    ? transform->value : astro::scene::Transform{};
+                            }
+                            aiProposedParentEntity = selectedEntity;
+                        }
+                        ImGui::Text(tr("Selected entity: %s (ID %llu)"), selected->name.c_str(),
+                            static_cast<unsigned long long>(selected->id));
+                        if (!codexCameraAdditionSmoke && !codexCameraLensSmoke
+                            && !codexCameraActivationSmoke && !codexCameraClearSmoke)
+                        {
+                        ImGui::BeginDisabled(codexChangeReview.hasPending());
+                        ImGui::InputText(tr("Proposed entity name"), aiProposedName.data(), aiProposedName.size());
+                        ImGui::BeginDisabled(!canPreview);
+                        if (ImGui::Button(tr("Preview name change")))
+                        {
+                            astro::scene::SetScenePropertyPayload payload{
+                                selected->id, "name", std::string{aiProposedName.data()}};
+                            const auto previewed = codexChangeReview.preparePropertyChange(codexProjectAdapter,
+                                scene, activeProjectRoot, currentScenePath, std::move(payload));
+                            if (previewed)
+                            {
+                                message = tr("AI change preview is ready.");
+                                aiChangeReviewDiffShown = false;
+                            }
+                            else reportError(previewed.error().message);
+                        }
+                        const auto previewButtonMin = ImGui::GetItemRectMin();
+                        const auto previewButtonMax = ImGui::GetItemRectMax();
+                        if (codexChangeReviewSmoke && codexChangeReviewSmokePhase == 0)
+                        {
+                            queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN,
+                                ImVec2((previewButtonMin.x + previewButtonMax.x) * 0.5f,
+                                    (previewButtonMin.y + previewButtonMax.y) * 0.5f));
+                            codexChangeReviewSmokePhase = 1;
+                        }
+                        else if (codexChangeReviewSmoke && codexChangeReviewSmokePhase == 1)
+                        {
+                            queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP,
+                                ImVec2((previewButtonMin.x + previewButtonMax.x) * 0.5f,
+                                    (previewButtonMin.y + previewButtonMax.y) * 0.5f));
+                            codexChangeReviewSmokePhase = 2;
+                        }
+                        ImGui::EndDisabled();
+                        if (!canPreview) ImGui::TextDisabled(tr("Open a project before reviewing changes."));
+                        ImGui::EndDisabled();
+
+                        ImGui::BeginDisabled(codexChangeReview.hasPending());
+                        if (selected->spriteRenderer)
+                        {
+                            ImGui::Checkbox(tr("Proposed SpriteRenderer visibility"), &aiProposedSpriteVisible);
+                            ImGui::BeginDisabled(!canPreview);
+                            if (ImGui::Button(tr("Preview visibility change")))
+                            {
+                                const auto previewed = codexChangeReview.prepareSpriteRendererVisibilityChange(
+                                    codexProjectAdapter, scene, activeProjectRoot, currentScenePath,
+                                    selected->id, aiProposedSpriteVisible);
+                                if (previewed)
+                                {
+                                    message = tr("AI change preview is ready.");
+                                    aiChangeReviewDiffShown = false;
+                                }
+                                else reportError(previewed.error().message);
+                            }
+                            const auto visibilityButtonMin = ImGui::GetItemRectMin();
+                            const auto visibilityButtonMax = ImGui::GetItemRectMax();
+                            if (codexSpriteVisibilitySmoke && codexChangeReviewSmokePhase == 0)
+                            {
+                                queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN,
+                                    ImVec2((visibilityButtonMin.x + visibilityButtonMax.x) * 0.5f,
+                                        (visibilityButtonMin.y + visibilityButtonMax.y) * 0.5f));
+                                codexChangeReviewSmokePhase = 1;
+                            }
+                            else if (codexSpriteVisibilitySmoke && codexChangeReviewSmokePhase == 1)
+                            {
+                                queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP,
+                                    ImVec2((visibilityButtonMin.x + visibilityButtonMax.x) * 0.5f,
+                                        (visibilityButtonMin.y + visibilityButtonMax.y) * 0.5f));
+                                codexChangeReviewSmokePhase = 2;
+                            }
+                            ImGui::EndDisabled();
+                        }
+                        else ImGui::TextDisabled(tr("Selected entity has no SpriteRenderer component."));
+                        ImGui::EndDisabled();
+                        }
+
+                        if (!codexReviewSmoke || codexPrimitiveCreationSmoke)
+                        {
+                        ImGui::SeparatorText(tr("Create 3D primitive"));
+                        ImGui::BeginDisabled(codexChangeReview.hasPending());
+                        ImGui::InputText(tr("Primitive entity name"), aiProposedPrimitiveName.data(),
+                            aiProposedPrimitiveName.size());
+                        ImGui::Combo(tr("Primitive shape"), &aiProposedPrimitiveKind, primitiveNames,
+                            static_cast<int>(std::size(primitiveNames)));
+                        ImGui::Checkbox(tr("Use selected entity as parent"), &aiProposedPrimitiveUseParent);
+                        ImGui::Checkbox(tr("Visible"), &aiProposedPrimitiveVisible);
+                        ImGui::BeginDisabled(!canPreview);
+                        if (ImGui::Button(tr("Preview primitive creation")))
+                        {
+                            const auto primitive = static_cast<astro::scene::Primitive3D>(
+                                aiProposedPrimitiveKind + 1);
+                            astro::scene::CreatePrimitiveEntityPayload payload{
+                                std::string{aiProposedPrimitiveName.data()},
+                                aiProposedPrimitiveUseParent ? std::optional<EntityId>{selected->id} : std::nullopt,
+                                primitive, aiProposedPrimitiveVisible};
+                            const auto previewed = codexChangeReview.preparePrimitiveCreation(codexProjectAdapter,
+                                scene, activeProjectRoot, currentScenePath, std::move(payload));
+                            if (previewed)
+                            {
+                                message = tr("AI change preview is ready.");
+                                aiChangeReviewDiffShown = false;
+                            }
+                            else reportError(previewed.error().message);
+                        }
+                        const auto primitivePreviewMin = ImGui::GetItemRectMin();
+                        const auto primitivePreviewMax = ImGui::GetItemRectMax();
+                        if (codexPrimitiveCreationSmoke && codexChangeReviewSmokePhase == 0)
+                        {
+                            queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN,
+                                ImVec2((primitivePreviewMin.x + primitivePreviewMax.x) * 0.5f,
+                                    (primitivePreviewMin.y + primitivePreviewMax.y) * 0.5f));
+                            codexChangeReviewSmokePhase = 1;
+                        }
+                        else if (codexPrimitiveCreationSmoke && codexChangeReviewSmokePhase == 1)
+                        {
+                            queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP,
+                                ImVec2((primitivePreviewMin.x + primitivePreviewMax.x) * 0.5f,
+                                    (primitivePreviewMin.y + primitivePreviewMax.y) * 0.5f));
+                            codexChangeReviewSmokePhase = 2;
+                        }
+                        ImGui::EndDisabled();
+                        ImGui::EndDisabled();
+                        }
+
+                        if (!codexReviewSmoke || codexCameraAdditionSmoke)
+                        {
+                            ImGui::SeparatorText(tr("Add Camera3D"));
+                            ImGui::BeginDisabled(codexChangeReview.hasPending() || !canPreview
+                                || scene.camera3D(selected->id) != nullptr);
+                            if (ImGui::Button(tr("Preview add Camera3D")))
+                            {
+                                const auto previewed = codexChangeReview.prepareCamera3DAddition(
+                                    codexProjectAdapter, scene, activeProjectRoot, currentScenePath,
+                                    astro::scene::AddCamera3DPayload{selected->id});
+                                if (previewed)
+                                {
+                                    codexCameraReviewSmokePreviewWasReadOnly =
+                                        scene.camera3D(selected->id) == nullptr;
+                                    message = tr("AI change preview is ready.");
+                                    aiChangeReviewDiffShown = false;
+                                }
+                                else reportError(previewed.error().message);
+                            }
+                            const auto cameraPreviewMin = ImGui::GetItemRectMin();
+                            const auto cameraPreviewMax = ImGui::GetItemRectMax();
+                            if (codexCameraAdditionSmoke && codexChangeReviewSmokePhase == 0)
+                            {
+                                queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN,
+                                    ImVec2((cameraPreviewMin.x + cameraPreviewMax.x) * 0.5f,
+                                        (cameraPreviewMin.y + cameraPreviewMax.y) * 0.5f));
+                                codexChangeReviewSmokePhase = 1;
+                            }
+                            else if (codexCameraAdditionSmoke && codexChangeReviewSmokePhase == 1)
+                            {
+                                queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP,
+                                    ImVec2((cameraPreviewMin.x + cameraPreviewMax.x) * 0.5f,
+                                        (cameraPreviewMin.y + cameraPreviewMax.y) * 0.5f));
+                                codexChangeReviewSmokePhase = 2;
+                            }
+                            ImGui::EndDisabled();
+                        }
+
+                        if (!codexReviewSmoke || codexCameraLensSmoke)
+                        {
+                            ImGui::SeparatorText(tr("Review Camera3D lens"));
+                            if (scene.camera3D(selected->id))
+                            {
+                                ImGui::BeginDisabled(codexChangeReview.hasPending() || !canPreview);
+                                ImGui::InputDouble(tr("Proposed vertical FOV (degrees)"),
+                                    &aiProposedCameraFovDegrees, 0.0, 0.0, "%.3f");
+                                ImGui::InputDouble(tr("Proposed near plane"), &aiProposedCameraNearPlane,
+                                    0.0, 0.0, "%.3f");
+                                ImGui::InputDouble(tr("Proposed far plane"), &aiProposedCameraFarPlane,
+                                    0.0, 0.0, "%.3f");
+                                if (ImGui::Button(tr("Preview Camera3D lens change")))
+                                {
+                                    const auto previewed = codexChangeReview.prepareCamera3DLensChange(
+                                        codexProjectAdapter, scene, activeProjectRoot, currentScenePath,
+                                        astro::scene::SetCamera3DLensPayload{selected->id,
+                                            aiProposedCameraFovDegrees, aiProposedCameraNearPlane,
+                                            aiProposedCameraFarPlane});
+                                    if (previewed)
+                                    {
+                                        message = tr("AI change preview is ready.");
+                                        aiChangeReviewDiffShown = false;
+                                    }
+                                    else reportError(previewed.error().message);
+                                }
+                                const auto lensPreviewMin = ImGui::GetItemRectMin();
+                                const auto lensPreviewMax = ImGui::GetItemRectMax();
+                                if (codexCameraLensSmoke && codexChangeReviewSmokePhase == 0)
+                                {
+                                    queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN,
+                                        ImVec2((lensPreviewMin.x + lensPreviewMax.x) * 0.5f,
+                                            (lensPreviewMin.y + lensPreviewMax.y) * 0.5f));
+                                    codexChangeReviewSmokePhase = 1;
+                                }
+                                else if (codexCameraLensSmoke && codexChangeReviewSmokePhase == 1)
+                                {
+                                    queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP,
+                                        ImVec2((lensPreviewMin.x + lensPreviewMax.x) * 0.5f,
+                                            (lensPreviewMin.y + lensPreviewMax.y) * 0.5f));
+                                    codexChangeReviewSmokePhase = 2;
+                                }
+                                ImGui::EndDisabled();
+                            }
+                            else ImGui::TextDisabled(tr("Selected entity has no Camera3D component."));
+                        }
+
+                        if (!codexReviewSmoke || codexCameraActivationSmoke || codexCameraClearSmoke)
+                        {
+                            ImGui::SeparatorText(tr("Review active Camera3D"));
+                            const auto activeCamera = scene.activeCamera3D();
+                            if (activeCamera)
+                            {
+                                const auto* activeEntity = scene.find(*activeCamera);
+                                ImGui::TextWrapped(tr("Current active Camera3D: %s (ID %llu)"),
+                                    activeEntity ? activeEntity->name.c_str() : tr("Unknown entity"),
+                                    static_cast<unsigned long long>(*activeCamera));
+                            }
+                            else ImGui::TextWrapped(tr("Current active Camera3D: None"));
+
+                            const auto* selectedCamera = scene.camera3D(selected->id);
+                            ImGui::BeginDisabled(codexChangeReview.hasPending() || !canPreview
+                                || !selectedCamera || (activeCamera && *activeCamera == selected->id));
+                            if (ImGui::Button(tr("Preview activate selected Camera3D")))
+                            {
+                                const auto previewed = codexChangeReview.prepareCamera3DActiveSelectionChange(
+                                    codexProjectAdapter, scene, activeProjectRoot, currentScenePath,
+                                    astro::scene::SetActiveCamera3DPayload{selected->id});
+                                if (previewed)
+                                {
+                                    message = tr("AI change preview is ready.");
+                                    aiChangeReviewDiffShown = false;
+                                }
+                                else reportError(previewed.error().message);
+                            }
+                            const auto activateMin = ImGui::GetItemRectMin();
+                            const auto activateMax = ImGui::GetItemRectMax();
+                            if (codexCameraActivationSmoke && codexChangeReviewSmokePhase == 0)
+                            {
+                                queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN,
+                                    ImVec2((activateMin.x + activateMax.x) * 0.5f,
+                                        (activateMin.y + activateMax.y) * 0.5f));
+                                codexChangeReviewSmokePhase = 1;
+                            }
+                            else if (codexCameraActivationSmoke && codexChangeReviewSmokePhase == 1)
+                            {
+                                queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP,
+                                    ImVec2((activateMin.x + activateMax.x) * 0.5f,
+                                        (activateMin.y + activateMax.y) * 0.5f));
+                                codexChangeReviewSmokePhase = 2;
+                            }
+                            ImGui::EndDisabled();
+
+                            ImGui::BeginDisabled(codexChangeReview.hasPending() || !canPreview || !activeCamera);
+                            if (ImGui::Button(tr("Preview clear active Camera3D")))
+                            {
+                                const auto previewed = codexChangeReview.prepareCamera3DActiveSelectionChange(
+                                    codexProjectAdapter, scene, activeProjectRoot, currentScenePath,
+                                    astro::scene::SetActiveCamera3DPayload{0});
+                                if (previewed)
+                                {
+                                    message = tr("AI change preview is ready.");
+                                    aiChangeReviewDiffShown = false;
+                                }
+                                else reportError(previewed.error().message);
+                            }
+                            const auto clearMin = ImGui::GetItemRectMin();
+                            const auto clearMax = ImGui::GetItemRectMax();
+                            if (codexCameraClearSmoke && codexChangeReviewSmokePhase == 0)
+                            {
+                                queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN,
+                                    ImVec2((clearMin.x + clearMax.x) * 0.5f,
+                                        (clearMin.y + clearMax.y) * 0.5f));
+                                codexChangeReviewSmokePhase = 1;
+                            }
+                            else if (codexCameraClearSmoke && codexChangeReviewSmokePhase == 1)
+                            {
+                                queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP,
+                                    ImVec2((clearMin.x + clearMax.x) * 0.5f,
+                                        (clearMin.y + clearMax.y) * 0.5f));
+                                codexChangeReviewSmokePhase = 2;
+                            }
+                            ImGui::EndDisabled();
+                        }
+
+                        if ((!codexReviewSmoke || codexTransformReviewSmoke) && scene.transform(selected->id))
+                        {
+                            if (codexTransformReviewSmoke) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+                            if (ImGui::CollapsingHeader(tr("Review local Transform")))
+                            {
+                                ImGui::BeginDisabled(codexChangeReview.hasPending() || !canPreview);
+                                ImGui::InputDouble(tr("Position X"), &aiProposedTransform.position.x, 0.0, 0.0, "%.3f");
+                                ImGui::InputDouble(tr("Position Y"), &aiProposedTransform.position.y, 0.0, 0.0, "%.3f");
+                                ImGui::InputDouble(tr("Position Z"), &aiProposedTransform.position.z, 0.0, 0.0, "%.3f");
+                                ImGui::InputDouble(tr("Rotation X (degrees)"), &aiProposedTransform.rotationDegrees.x, 0.0, 0.0, "%.3f");
+                                ImGui::InputDouble(tr("Rotation Y (degrees)"), &aiProposedTransform.rotationDegrees.y, 0.0, 0.0, "%.3f");
+                                ImGui::InputDouble(tr("Rotation Z (degrees)"), &aiProposedTransform.rotationDegrees.z, 0.0, 0.0, "%.3f");
+                                ImGui::InputDouble(tr("Scale X"), &aiProposedTransform.scale.x, 0.0, 0.0, "%.3f");
+                                ImGui::InputDouble(tr("Scale Y"), &aiProposedTransform.scale.y, 0.0, 0.0, "%.3f");
+                                ImGui::InputDouble(tr("Scale Z"), &aiProposedTransform.scale.z, 0.0, 0.0, "%.3f");
+                                if (ImGui::Button(tr("Preview local Transform change")))
+                                {
+                                    const auto* beforeTransform = scene.transform(selected->id);
+                                    codexTransformReviewSmokeOriginal = beforeTransform
+                                        ? beforeTransform->value : astro::scene::Transform{};
+                                    const auto previewed = codexChangeReview.prepareTransformChange(
+                                        codexProjectAdapter, scene, activeProjectRoot, currentScenePath,
+                                        astro::scene::SetTransformPayload{selected->id, aiProposedTransform});
+                                    if (previewed)
+                                    {
+                                        message = tr("AI change preview is ready.");
+                                        aiChangeReviewDiffShown = false;
+                                        if (codexTransformReviewSmoke)
+                                        {
+                                            const auto* transform = scene.transform(selected->id);
+                                            codexTransformReviewSmokePreviewWasReadOnly = transform
+                                                && transform->value == codexTransformReviewSmokeOriginal;
+                                        }
+                                    }
+                                    else reportError(previewed.error().message);
+                                }
+                                const auto transformPreviewMin = ImGui::GetItemRectMin();
+                                const auto transformPreviewMax = ImGui::GetItemRectMax();
+                                if (codexTransformReviewSmoke && codexChangeReviewSmokePhase == 0)
+                                {
+                                    queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN,
+                                        ImVec2((transformPreviewMin.x + transformPreviewMax.x) * 0.5f,
+                                            (transformPreviewMin.y + transformPreviewMax.y) * 0.5f));
+                                    codexChangeReviewSmokePhase = 1;
+                                }
+                                else if (codexTransformReviewSmoke && codexChangeReviewSmokePhase == 1)
+                                {
+                                    queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP,
+                                        ImVec2((transformPreviewMin.x + transformPreviewMax.x) * 0.5f,
+                                            (transformPreviewMin.y + transformPreviewMax.y) * 0.5f));
+                                    codexChangeReviewSmokePhase = 2;
+                                }
+                                ImGui::EndDisabled();
+                            }
+                        }
+
+                        if (!codexReviewSmoke || codexReparentReviewSmoke)
+                        {
+                            if (codexReparentReviewSmoke) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+                            if (ImGui::CollapsingHeader(tr("Review hierarchy parent")))
+                            {
+                                auto parentLabel = [&](const std::optional<EntityId> parent) {
+                                    if (!parent) return std::string{tr("Root (no parent)")};
+                                    const auto* parentEntity = scene.find(*parent);
+                                    return (parentEntity ? parentEntity->name : std::string{tr("Unknown entity")})
+                                        + " (ID " + std::to_string(*parent) + ")";
+                                };
+                                const auto selectedParentLabel = parentLabel(aiProposedParent);
+                                ImGui::BeginDisabled(codexChangeReview.hasPending() || !canPreview);
+                                if (ImGui::BeginCombo(tr("New parent"), selectedParentLabel.c_str()))
+                                {
+                                    if (ImGui::Selectable(tr("Root (no parent)"), !aiProposedParent))
+                                        aiProposedParent.reset();
+                                    for (const auto& candidate : scene.entities())
+                                    {
+                                        if (candidate.id == selected->id) continue;
+                                        bool isDescendant = false;
+                                        auto* ancestor = &candidate;
+                                        while (ancestor)
+                                        {
+                                            if (ancestor->id == selected->id) { isDescendant = true; break; }
+                                            ancestor = ancestor->parent ? scene.find(*ancestor->parent) : nullptr;
+                                        }
+                                        if (isDescendant) continue;
+                                        const std::optional<EntityId> candidateId{candidate.id};
+                                        const auto label = parentLabel(candidateId);
+                                        if (ImGui::Selectable(label.c_str(), aiProposedParent == candidateId))
+                                            aiProposedParent = candidateId;
+                                    }
+                                    ImGui::EndCombo();
+                                }
+                                if (ImGui::Button(tr("Preview parent change")))
+                                {
+                                    const auto* beforeEntity = scene.find(selected->id);
+                                    const auto* beforeTransform = scene.transform(selected->id);
+                                    if (codexReparentReviewSmoke)
+                                    {
+                                        codexReparentReviewSmokePreviousParent = beforeEntity
+                                            ? beforeEntity->parent : std::nullopt;
+                                        codexReparentReviewSmokeLocal = beforeTransform
+                                            ? beforeTransform->value : astro::scene::Transform{};
+                                        codexReparentReviewSmokeComponentId = beforeTransform
+                                            ? beforeTransform->id : 0;
+                                    }
+                                    const auto previewed = codexChangeReview.prepareEntityParentChange(
+                                        codexProjectAdapter, scene, activeProjectRoot, currentScenePath,
+                                        astro::scene::SetEntityParentPayload{selected->id, aiProposedParent});
+                                    if (previewed)
+                                    {
+                                        message = tr("AI change preview is ready.");
+                                        aiChangeReviewDiffShown = false;
+                                        if (codexReparentReviewSmoke)
+                                        {
+                                            const auto* afterEntity = scene.find(selected->id);
+                                            const auto* afterTransform = scene.transform(selected->id);
+                                            codexReparentReviewSmokePreviewWasReadOnly = afterEntity && afterTransform
+                                                && afterEntity->parent == codexReparentReviewSmokePreviousParent
+                                                && afterTransform->id == codexReparentReviewSmokeComponentId
+                                                && afterTransform->value == codexReparentReviewSmokeLocal;
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+                                            if (scene.camera3D(selected->id))
+                                            {
+                                                const auto beforePose = astro::editor::sceneCameraPose(scene, selected->id);
+                                                auto proposedScene = scene;
+                                                const auto changed = proposedScene.reparent(selected->id, aiProposedParent);
+                                                if (beforePose && changed)
+                                                {
+                                                    const auto afterPose = astro::editor::sceneCameraPose(
+                                                        proposedScene, selected->id);
+                                                    if (afterPose)
+                                                        codexReparentReviewSmokeWorldPoseChanged =
+                                                            beforePose.value().position != afterPose.value().position
+                                                            || beforePose.value().target != afterPose.value().target
+                                                            || beforePose.value().up != afterPose.value().up;
+                                                }
+                                            }
+#endif
+                                        }
+                                    }
+                                    else reportError(previewed.error().message);
+                                }
+                                const auto parentPreviewMin = ImGui::GetItemRectMin();
+                                const auto parentPreviewMax = ImGui::GetItemRectMax();
+                                if (codexReparentReviewSmoke && codexChangeReviewSmokePhase == 0)
+                                {
+                                    queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN,
+                                        ImVec2((parentPreviewMin.x + parentPreviewMax.x) * 0.5f,
+                                            (parentPreviewMin.y + parentPreviewMax.y) * 0.5f));
+                                    codexChangeReviewSmokePhase = 1;
+                                }
+                                else if (codexReparentReviewSmoke && codexChangeReviewSmokePhase == 1)
+                                {
+                                    queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP,
+                                        ImVec2((parentPreviewMin.x + parentPreviewMax.x) * 0.5f,
+                                            (parentPreviewMin.y + parentPreviewMax.y) * 0.5f));
+                                    codexChangeReviewSmokePhase = 2;
+                                }
+                                ImGui::EndDisabled();
+                            }
+                        }
+
+                        if (codexChangeReview.pending() || codexChangeReview.pendingSpriteRenderer()
+                            || codexChangeReview.pendingPrimitive() || codexChangeReview.pendingCamera3D()
+                            || codexChangeReview.pendingCamera3DLens()
+                            || codexChangeReview.pendingCamera3DActiveSelection()
+                            || codexChangeReview.pendingTransform() || codexChangeReview.pendingEntityParent())
+                        {
+                            ImGui::Separator();
+                            const bool cameraAdditionPending = codexChangeReview.pendingCamera3D().has_value();
+                            const bool cameraLensPending = codexChangeReview.pendingCamera3DLens().has_value();
+                            const bool cameraSelectionPending =
+                                codexChangeReview.pendingCamera3DActiveSelection().has_value();
+                            const bool spriteVisibilityPending = codexChangeReview.pendingSpriteRenderer().has_value();
+                            const bool primitiveCreationPending = codexChangeReview.pendingPrimitive().has_value();
+                            const bool transformPending = codexChangeReview.pendingTransform().has_value();
+                            const bool parentChangePending = codexChangeReview.pendingEntityParent().has_value();
+                            const auto reviewEntityId = cameraAdditionPending
+                                ? codexChangeReview.pendingCamera3D()->preview.entityId
+                                : cameraSelectionPending
+                                    ? codexChangeReview.pendingCamera3DActiveSelection()->preview.targetEntity.value_or(
+                                        codexChangeReview.pendingCamera3DActiveSelection()->preview.previousEntity.value_or(0))
+                                : cameraLensPending ? codexChangeReview.pendingCamera3DLens()->preview.entityId
+                                : primitiveCreationPending
+                                ? codexChangeReview.pendingPrimitive()->preview.expectedEntityId
+                                : parentChangePending ? codexChangeReview.pendingEntityParent()->preview.entityId
+                                : transformPending ? codexChangeReview.pendingTransform()->preview.entityId
+                                : spriteVisibilityPending ? codexChangeReview.pendingSpriteRenderer()->preview.entityId
+                                    : codexChangeReview.pending()->preview.entityId;
+                            const bool changesValue = cameraAdditionPending || primitiveCreationPending || (cameraSelectionPending
+                                ? codexChangeReview.pendingCamera3DActiveSelection()->preview.changesValue
+                                : cameraLensPending
+                                ? codexChangeReview.pendingCamera3DLens()->preview.changesValue
+                                : parentChangePending ? codexChangeReview.pendingEntityParent()->preview.changesValue
+                                : transformPending ? codexChangeReview.pendingTransform()->preview.changesValue
+                                : spriteVisibilityPending ? codexChangeReview.pendingSpriteRenderer()->preview.changesValue
+                                    : codexChangeReview.pending()->preview.changesValue);
+                            ImGui::Text(tr("Change for entity ID %llu"),
+                                static_cast<unsigned long long>(reviewEntityId));
+                            if (cameraAdditionPending)
+                            {
+                                ImGui::TextWrapped(tr("Add an inactive perspective Camera3D to this entity."));
+                                aiChangeReviewDiffShown = true;
+                            }
+                            else if (cameraSelectionPending)
+                            {
+                                const auto& preview = codexChangeReview.pendingCamera3DActiveSelection()->preview;
+                                auto cameraLabel = [&](const std::optional<EntityId> id) {
+                                    if (!id) return std::string{tr("No active Camera3D")};
+                                    const auto* cameraEntity = scene.find(*id);
+                                    return (cameraEntity ? cameraEntity->name : std::string{tr("Unknown entity")})
+                                        + " (ID " + std::to_string(*id) + ")";
+                                };
+                                ImGui::TextWrapped(tr("Camera selection: %s → %s"),
+                                    cameraLabel(preview.previousEntity).c_str(),
+                                    cameraLabel(preview.targetEntity).c_str());
+                                ImGui::TextWrapped(tr(preview.targetEntity
+                                    ? "Switching cameras will change Game View after confirmation."
+                                    : "Clearing the active camera hides 3D meshes in Edit Mode Game View; Play Mode keeps its runtime scene."));
+                                aiChangeReviewDiffShown = true;
+                            }
+                            else if (cameraLensPending)
+                            {
+                                const auto& preview = codexChangeReview.pendingCamera3DLens()->preview;
+                                ImGui::Text(tr("Vertical FOV: %.3f → %.3f degrees"),
+                                    preview.beforeVerticalFovDegrees, preview.afterVerticalFovDegrees);
+                                ImGui::Text(tr("Near plane: %.3f → %.3f"),
+                                    preview.beforeNearPlane, preview.afterNearPlane);
+                                ImGui::Text(tr("Far plane: %.3f → %.3f"),
+                                    preview.beforeFarPlane, preview.afterFarPlane);
+                                ImGui::TextWrapped(tr(preview.active
+                                    ? "Active Camera3D: this lens change will affect Game View."
+                                    : "Inactive Camera3D: Game View will not change."));
+                                aiChangeReviewDiffShown = true;
+                            }
+                            else if (primitiveCreationPending)
+                            {
+                                const auto& preview = codexChangeReview.pendingPrimitive()->preview;
+                                ImGui::Text(tr("Create %s (%s), parent: %s, visible: %s"),
+                                    preview.name.c_str(), tr(primitiveNames[static_cast<int>(preview.primitive) - 1]),
+                                    preview.parent ? std::to_string(*preview.parent).c_str() : tr("None"),
+                                    tr(preview.visible ? "Yes" : "No"));
+                                aiChangeReviewDiffShown = true;
+                            }
+                            else if (spriteVisibilityPending)
+                            {
+                                const auto& preview = codexChangeReview.pendingSpriteRenderer()->preview;
+                                ImGui::Text(tr("Property: SpriteRenderer visibility (AssetId %llu)"),
+                                    static_cast<unsigned long long>(preview.texture.value));
+                                ImGui::Text(tr("Before: %s"), tr(preview.beforeVisible ? "Sprite visible" : "Sprite hidden"));
+                                ImGui::Text(tr("After: %s"), tr(preview.afterVisible ? "Sprite visible" : "Sprite hidden"));
+                                aiChangeReviewDiffShown = true;
+                            }
+                            else if (transformPending)
+                            {
+                                const auto& preview = codexChangeReview.pendingTransform()->preview;
+                                ImGui::Text(tr("Local position before: %.3f, %.3f, %.3f"),
+                                    preview.before.position.x, preview.before.position.y, preview.before.position.z);
+                                ImGui::Text(tr("Local position after: %.3f, %.3f, %.3f"),
+                                    preview.after.position.x, preview.after.position.y, preview.after.position.z);
+                                ImGui::Text(tr("Local rotation before: %.3f, %.3f, %.3f"),
+                                    preview.before.rotationDegrees.x, preview.before.rotationDegrees.y,
+                                    preview.before.rotationDegrees.z);
+                                ImGui::Text(tr("Local rotation after: %.3f, %.3f, %.3f"),
+                                    preview.after.rotationDegrees.x, preview.after.rotationDegrees.y,
+                                    preview.after.rotationDegrees.z);
+                                ImGui::Text(tr("Local scale before: %.3f, %.3f, %.3f"),
+                                    preview.before.scale.x, preview.before.scale.y, preview.before.scale.z);
+                                ImGui::Text(tr("Local scale after: %.3f, %.3f, %.3f"),
+                                    preview.after.scale.x, preview.after.scale.y, preview.after.scale.z);
+                                ImGui::TextWrapped(tr("Transform values are local to the parent; world camera pose is derived."));
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+                                if (scene.camera3D(preview.entityId))
+                                {
+                                    const auto beforePose = astro::editor::sceneCameraPose(scene, preview.entityId);
+                                    auto proposedScene = scene;
+                                    const auto changed = proposedScene.setTransform(preview.entityId, preview.after);
+                                    const auto afterPose = changed
+                                        ? astro::editor::sceneCameraPose(proposedScene, preview.entityId)
+                                        : astro::core::Result<astro::render3d::Camera3D>::failure(changed.error());
+                                    if (beforePose && afterPose)
+                                    {
+                                        ImGui::Text(tr("Camera world position before: %.3f, %.3f, %.3f"),
+                                            beforePose.value().position.x, beforePose.value().position.y,
+                                            beforePose.value().position.z);
+                                        ImGui::Text(tr("Camera world position after: %.3f, %.3f, %.3f"),
+                                            afterPose.value().position.x, afterPose.value().position.y,
+                                            afterPose.value().position.z);
+                                        ImGui::Text(tr("Camera world target before: %.3f, %.3f, %.3f"),
+                                            beforePose.value().target.x, beforePose.value().target.y,
+                                            beforePose.value().target.z);
+                                        ImGui::Text(tr("Camera world target after: %.3f, %.3f, %.3f"),
+                                            afterPose.value().target.x, afterPose.value().target.y,
+                                            afterPose.value().target.z);
+                                        ImGui::Text(tr("Camera world up before: %.3f, %.3f, %.3f"),
+                                            beforePose.value().up.x, beforePose.value().up.y,
+                                            beforePose.value().up.z);
+                                        ImGui::Text(tr("Camera world up after: %.3f, %.3f, %.3f"),
+                                            afterPose.value().up.x, afterPose.value().up.y,
+                                            afterPose.value().up.z);
+                                    }
+                                    else ImGui::TextWrapped(tr("World camera pose is unavailable for this Transform."));
+                                }
+#endif
+                                aiChangeReviewDiffShown = true;
+                            }
+                            else if (parentChangePending)
+                            {
+                                const auto& preview = codexChangeReview.pendingEntityParent()->preview;
+                                auto parentLabel = [&](const std::optional<EntityId> parent) {
+                                    if (!parent) return std::string{tr("Root (no parent)")};
+                                    const auto* parentEntity = scene.find(*parent);
+                                    return (parentEntity ? parentEntity->name : std::string{tr("Unknown entity")})
+                                        + " (ID " + std::to_string(*parent) + ")";
+                                };
+                                ImGui::TextWrapped(tr("Parent: %s → %s"),
+                                    parentLabel(preview.beforeParent).c_str(), parentLabel(preview.afterParent).c_str());
+                                ImGui::TextWrapped(tr("The entity and its descendants move together. Local Transform stays unchanged; world pose is recalculated."));
+                                ImGui::Text(tr("Affected entities: %llu"),
+                                    static_cast<unsigned long long>(preview.affectedSubtree.size()));
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+                                if (scene.camera3D(preview.entityId))
+                                {
+                                    const auto beforePose = astro::editor::sceneCameraPose(scene, preview.entityId);
+                                    auto proposedScene = scene;
+                                    const auto changed = proposedScene.reparent(preview.entityId, preview.afterParent);
+                                    const auto afterPose = changed
+                                        ? astro::editor::sceneCameraPose(proposedScene, preview.entityId)
+                                        : astro::core::Result<astro::render3d::Camera3D>::failure(changed.error());
+                                    if (beforePose && afterPose)
+                                    {
+                                        ImGui::Text(tr("Camera world position before: %.3f, %.3f, %.3f"),
+                                            beforePose.value().position.x, beforePose.value().position.y,
+                                            beforePose.value().position.z);
+                                        ImGui::Text(tr("Camera world position after: %.3f, %.3f, %.3f"),
+                                            afterPose.value().position.x, afterPose.value().position.y,
+                                            afterPose.value().position.z);
+                                        ImGui::Text(tr("Camera world target before: %.3f, %.3f, %.3f"),
+                                            beforePose.value().target.x, beforePose.value().target.y,
+                                            beforePose.value().target.z);
+                                        ImGui::Text(tr("Camera world target after: %.3f, %.3f, %.3f"),
+                                            afterPose.value().target.x, afterPose.value().target.y,
+                                            afterPose.value().target.z);
+                                        ImGui::Text(tr("Camera world up before: %.3f, %.3f, %.3f"),
+                                            beforePose.value().up.x, beforePose.value().up.y,
+                                            beforePose.value().up.z);
+                                        ImGui::Text(tr("Camera world up after: %.3f, %.3f, %.3f"),
+                                            afterPose.value().up.x, afterPose.value().up.y,
+                                            afterPose.value().up.z);
+                                    }
+                                    else ImGui::TextWrapped(tr("World camera pose is unavailable for this Transform."));
+                                }
+#endif
+                                aiChangeReviewDiffShown = true;
+                            }
+                            else
+                            {
+                                const auto& preview = codexChangeReview.pending()->preview;
+                                const auto* before = std::get_if<std::string>(&preview.before);
+                                const auto* after = std::get_if<std::string>(&preview.after);
+                                ImGui::Text(tr("Before: %s"), before ? before->c_str() : tr("(other value type)"));
+                                ImGui::Text(tr("After: %s"), after ? after->c_str() : tr("(other value type)"));
+                                aiChangeReviewDiffShown = before && after;
+                            }
+                            if (!changesValue)
+                                ImGui::TextDisabled(tr("The proposed value is unchanged."));
+                            ImGui::BeginDisabled(!changesValue);
+                            if (ImGui::Button(tr("Confirm and apply")))
+                            {
+                                bool appliedSuccessfully = false;
+                                if (primitiveCreationPending)
+                                {
+                                    const auto reviewedParent = codexChangeReview.pendingPrimitive()->payload.parent;
+                                    const auto created = codexChangeReview.confirmAndCreatePrimitive(aiEditorApi,
+                                        codexProjectAdapter, scene, activeProjectRoot, currentScenePath);
+                                    if (created)
+                                    {
+                                        if (!codexPrimitiveCreationSmoke) selectedEntity = created.value();
+                                        codexChangeReviewSmokeEntity = created.value();
+                                        codexPrimitiveReviewSmokeParent = reviewedParent;
+                                        appliedSuccessfully = true;
+                                    }
+                                    else reportError(created.error().message);
+                                }
+                                else if (cameraAdditionPending)
+                                {
+                                    const auto added = codexChangeReview.confirmAndAddCamera3D(aiEditorApi,
+                                        codexProjectAdapter, scene, activeProjectRoot, currentScenePath);
+                                    if (added)
+                                    {
+                                        codexCameraReviewSmokeComponentId = scene.camera3D(reviewEntityId)
+                                            ? scene.camera3D(reviewEntityId)->id : 0;
+                                        appliedSuccessfully = codexCameraReviewSmokeComponentId != 0;
+                                        if (!appliedSuccessfully)
+                                            reportError(tr("Confirmed Camera3D component was not found."));
+                                    }
+                                    else reportError(added.error().message);
+                                }
+                                else if (cameraSelectionPending)
+                                {
+                                    const auto preview = codexChangeReview.pendingCamera3DActiveSelection()->preview;
+                                    const auto applied = codexChangeReview.confirmAndSetActiveCamera3D(
+                                        aiEditorApi, codexProjectAdapter, scene, activeProjectRoot, currentScenePath);
+                                    if (applied)
+                                    {
+                                        codexCameraSelectionSmokePrevious = preview.previousEntity;
+                                        codexCameraSelectionSmokeTarget = preview.targetEntity;
+                                        codexCameraSelectionSmokePreviousComponentId = preview.previousComponentId;
+                                        codexCameraSelectionSmokeTargetComponentId = preview.targetComponentId;
+                                        appliedSuccessfully = scene.activeCamera3D() == preview.targetEntity;
+                                    }
+                                    else reportError(applied.error().message);
+                                }
+                                else if (cameraLensPending)
+                                {
+                                    const auto applied = codexChangeReview.confirmAndSetCamera3DLens(
+                                        aiEditorApi, codexProjectAdapter, scene, activeProjectRoot, currentScenePath);
+                                    if (applied)
+                                    {
+                                        const auto* camera = scene.camera3D(reviewEntityId);
+                                        codexCameraLensSmokeComponentId = camera ? camera->id : 0;
+                                        codexCameraLensSmokeWasActive = camera && camera->active;
+                                        appliedSuccessfully = camera != nullptr;
+                                    }
+                                    else reportError(applied.error().message);
+                                }
+                                else if (transformPending)
+                                {
+                                    const auto applied = codexChangeReview.confirmAndApply(aiEditorApi,
+                                        codexProjectAdapter, scene, activeProjectRoot, currentScenePath);
+                                    if (applied) appliedSuccessfully = true;
+                                    else reportError(applied.error().message);
+                                }
+                                else if (parentChangePending)
+                                {
+                                    const auto applied = codexChangeReview.confirmAndReparent(aiEditorApi,
+                                        codexProjectAdapter, scene, activeProjectRoot, currentScenePath);
+                                    if (applied) appliedSuccessfully = true;
+                                    else reportError(applied.error().message);
+                                }
+                                else
+                                {
+                                    const auto applied = codexChangeReview.confirmAndApply(aiEditorApi,
+                                        codexProjectAdapter, scene, activeProjectRoot, currentScenePath);
+                                    if (applied) appliedSuccessfully = true;
+                                    else reportError(applied.error().message);
+                                }
+                                if (appliedSuccessfully)
+                                {
+                                    sceneDirty = true;
+                                    message = primitiveCreationPending
+                                        ? tr("AI primitive created. Undo is available.")
+                                        : cameraAdditionPending ? tr("Camera3D added. Undo is available.")
+                                        : cameraLensPending ? tr("Camera3D lens updated. Undo is available.")
+                                        : cameraSelectionPending ? tr("Active Camera3D selection updated. Undo is available.")
+                                        : transformPending ? tr("Local Transform updated. Undo is available.")
+                                        : parentChangePending ? tr("Hierarchy parent updated. Undo is available.")
+                                            : tr("AI change applied. Undo is available.");
+                                    if (!primitiveCreationPending) aiProposedNameEntity.reset();
+                                    aiProposedSpriteEntity.reset();
+                                    if (codexReviewSmoke) codexChangeReviewSmokePhase = 5;
+                                }
+                            }
+                            const auto confirmButtonMin = ImGui::GetItemRectMin();
+                            const auto confirmButtonMax = ImGui::GetItemRectMax();
+                            if (codexReviewSmoke && codexChangeReviewSmokePhase == 2)
+                            {
+                                queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_DOWN,
+                                    ImVec2((confirmButtonMin.x + confirmButtonMax.x) * 0.5f,
+                                        (confirmButtonMin.y + confirmButtonMax.y) * 0.5f));
+                                codexChangeReviewSmokePhase = 3;
+                            }
+                            else if (codexReviewSmoke && codexChangeReviewSmokePhase == 3)
+                            {
+                                queueCodexReviewMouseEvent(SDL_EVENT_MOUSE_BUTTON_UP,
+                                    ImVec2((confirmButtonMin.x + confirmButtonMax.x) * 0.5f,
+                                        (confirmButtonMin.y + confirmButtonMax.y) * 0.5f));
+                                codexChangeReviewSmokePhase = 4;
+                            }
+                            ImGui::EndDisabled();
+                            ImGui::SameLine();
+                            if (ImGui::Button(tr("Cancel preview")))
+                            {
+                                codexChangeReview.cancel();
+                                message = tr("AI change preview cancelled.");
+                            }
+                        }
+                    }
+                }
+                ImGui::End();
+            }
             if (showDiagnostics)
             {
                 ImGui::Begin(tr("Diagnostics"), &showDiagnostics);
@@ -6974,6 +14409,96 @@ public:
                     for (std::size_t index = start; index < diagnostics.size(); ++index)
                         ImGui::BulletText(tr("%s"), diagnostics[index].c_str());
                 }
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+                if (gameViewConsoleDiagnostic)
+                {
+                    ImGui::SeparatorText(tr("Game View diagnostics"));
+                    for (std::size_t diagnosticIndex = 0;
+                        diagnosticIndex < gameViewConsoleDiagnostics.size(); ++diagnosticIndex)
+                    {
+                        const auto& diagnostic = gameViewConsoleDiagnostics[diagnosticIndex];
+                        if (smoke && gameViewCameraDiagnosticCase == 3
+                            && smokeDiagnosticExpectedEntity == diagnostic.relatedEntity
+                            && diagnostic.message == "MeshRenderer model AssetId is not registered")
+                            gameViewMissingAssetLinkSuppressed = !diagnostic.relatedAsset;
+                        const auto localizedDiagnostic = std::string(tr("Game View diagnostic: "))
+                            + localizedSceneViewDiagnostics(diagnostic.message);
+                        ImGui::TextWrapped(tr("%s"), localizedDiagnostic.c_str());
+                        if (diagnostic.relatedEntity)
+                        {
+                            const auto* relatedEntity = scene.find(*diagnostic.relatedEntity);
+                            if (relatedEntity)
+                            {
+                                ImGui::TextDisabled(tr("Related entity: %s"), relatedEntity->name.c_str());
+                                const auto buttonId = std::to_string(diagnosticIndex) + ":entity:"
+                                    + std::to_string(*diagnostic.relatedEntity);
+                                ImGui::PushID(buttonId.c_str());
+                                gameViewDiagnosticLinkShown = true;
+                                const bool clicked = ImGui::SmallButton(tr("Select entity in Hierarchy"));
+                                const bool smokeClick = smoke
+                                    && (gameViewCameraDiagnosticCase == 2 || gameViewCameraDiagnosticCase == 3)
+                                    && smokeDiagnosticExpectedEntity == diagnostic.relatedEntity
+                                    && !gameViewDiagnosticLinkActivated;
+                                if ((clicked || smokeClick) && selectEntityInHierarchy(relatedEntity->id))
+                                    gameViewDiagnosticLinkActivated = true;
+                                ImGui::PopID();
+                            }
+                        }
+                        if (diagnostic.relatedAsset && assetRegistry && gameViewConsoleDiagnosticProjectRoot
+                            && *gameViewConsoleDiagnosticProjectRoot == assetRegistry->projectRoot())
+                        {
+                            if (const auto info = registeredAssetInfo(*assetRegistry, *diagnostic.relatedAsset))
+                            {
+                                ImGui::TextDisabled(tr("Related asset: %s (AssetId %llu)"),
+                                    tr(info->kind.data()),
+                                    static_cast<unsigned long long>(diagnostic.relatedAsset->value));
+                                const auto buttonId = std::to_string(diagnosticIndex) + ":asset:"
+                                    + std::to_string(diagnostic.relatedAsset->value);
+                                ImGui::PushID(buttonId.c_str());
+                                gameViewDiagnosticAssetLinkShown = true;
+                                const bool clicked = ImGui::SmallButton(tr("Select asset in Project"));
+                                const bool smokeClick = smoke && gameViewCameraDiagnosticCase == 4
+                                    && smokeDiagnosticExpectedAsset == diagnostic.relatedAsset
+                                    && !gameViewDiagnosticAssetLinkActivated;
+                                if (clicked || smokeClick)
+                                {
+                                    selectedProjectAsset = diagnostic.relatedAsset;
+                                    selectedProjectAssetRoot = assetRegistry->projectRoot();
+                                    selectedProjectAssetDisplayPath.clear();
+                                    showProject = true;
+                                    gameViewDiagnosticAssetLinkActivated = true;
+                                }
+                                ImGui::PopID();
+                            }
+                        }
+                    }
+                    gameViewDiagnosticsConsoleShown = true;
+                    const bool noActiveCamera = gameViewConsoleDiagnostic->find(
+                        "Game View has no active Camera3D;") != std::string::npos;
+                    if (noActiveCamera)
+                    {
+                        ImGui::TextDisabled(tr("Camera candidates:"));
+                        bool candidateFound = false;
+                        for (const auto& entity : scene.entities())
+                        {
+                            if (!scene.camera3D(entity.id)) continue;
+                            candidateFound = true;
+                            gameViewDiagnosticLinkShown = true;
+                            const auto id = std::to_string(entity.id);
+                            ImGui::PushID(id.c_str());
+                            const bool clicked = ImGui::SmallButton(tr("Select entity in Hierarchy"));
+                            const bool smokeClick = smoke && gameViewCameraDiagnosticCase == 1
+                                && !gameViewDiagnosticLinkActivated;
+                            if ((clicked || smokeClick) && selectEntityInHierarchy(entity.id))
+                                gameViewDiagnosticLinkActivated = true;
+                            ImGui::SameLine();
+                            ImGui::TextUnformatted(entity.name.c_str());
+                            ImGui::PopID();
+                        }
+                        if (!candidateFound) ImGui::TextDisabled(tr("No Camera3D components in this scene."));
+                    }
+                }
+#endif
                 const auto audit = commands.auditTrail();
                 int shownErrors = 0;
                 for (auto it = audit.rbegin(); it != audit.rend() && shownErrors < 4; ++it)
@@ -6988,14 +14513,35 @@ public:
             if (dialog)
             {
                 ImGui::Begin(tr(create ? "New project" : "Open project"), &dialog);
-                ImGui::InputText(tr(create ? "New directory (UTF-8)" : "project.astro path (UTF-8)"), path, sizeof(path));
+                const char* pathLabel = tr(create ? "Project parent directory (UTF-8)" : "project.astro path (UTF-8)");
+                const char* browseLabel = tr("Browse...");
+                const float buttonWidth = ImGui::CalcTextSize(browseLabel).x
+                    + ImGui::GetStyle().FramePadding.x * 2.0f;
+                const float labelWidth = ImGui::CalcTextSize(pathLabel).x + ImGui::GetStyle().ItemSpacing.x;
+                const float fieldWidth = std::max(80.0f, ImGui::GetContentRegionAvail().x
+                    - buttonWidth - labelWidth - ImGui::GetStyle().ItemSpacing.x);
+                ImGui::SetNextItemWidth(fieldWidth);
+                ImGui::InputText(pathLabel, path, sizeof(path));
+                ImGui::SameLine();
+                const bool browseEnabled = !projectPathDialogRequest;
+                if (!browseEnabled) ImGui::BeginDisabled();
+                if (ImGui::Button(browseLabel)) startProjectPathDialog(!create);
+                if (!browseEnabled) ImGui::EndDisabled();
                 if (create) ImGui::InputText(tr("Project name"), name, sizeof(name));
                 if (ImGui::Button(tr(create ? "Create" : "Open")))
                 {
                     try
                     {
-                        if (create) createProject(std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(path))), name);
-                        else openProject(std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(path))));
+                        if (create)
+                        {
+                            const std::filesystem::path parent(std::u8string(
+                                reinterpret_cast<const char8_t*>(path)));
+                            const auto projectDirectory = astro::editor::resolveNewProjectDirectory(parent, name);
+                            if (!projectDirectory) throw std::runtime_error(projectDirectory.error().message);
+                            createProject(projectDirectory.value(), name);
+                        }
+                        else openProject(std::filesystem::path(std::u8string(
+                            reinterpret_cast<const char8_t*>(path))));
                         dialog = false;
                     }
                     catch (const std::exception& error) { reportError(error.what()); }
@@ -7023,13 +14569,118 @@ public:
 #if defined(ASTRO_EDITOR_HAS_PUZZLE_RUNTIME)
             drawPuzzleCampaignBrowser();
 #endif
+            if (vulkanColorChartSmoke && bgfx::isValid(vulkanColorChartTexture))
+            {
+                auto* viewport = ImGui::GetMainViewport();
+                const ImVec2 chartWindowPos(viewport->Pos.x + viewport->Size.x - 218.0f,
+                    viewport->Pos.y + 140.0f);
+                ImGui::SetNextWindowPos(chartWindowPos, ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(210.0f, 82.0f), ImGuiCond_Always);
+                constexpr auto chartWindowFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking
+                    | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing
+                    | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize;
+                ImGui::Begin(tr("Vulkan color chart smoke"), nullptr, chartWindowFlags);
+                ImGui::Image(ImTextureID(static_cast<std::intptr_t>(vulkanColorChartTexture.idx) + 1),
+                    ImVec2(192.0f, 48.0f), ImVec2(0, 0), ImVec2(1, 1));
+                const auto chartMin = ImGui::GetItemRectMin();
+                const auto chartMax = ImGui::GetItemRectMax();
+                vulkanColorChartWindowShown = chartMax.x > chartMin.x && chartMax.y > chartMin.y;
+                ImGui::End();
+            }
+            if (multiTransformInspectorSmoke)
+            {
+                const auto* viewport = ImGui::GetMainViewport();
+                if (!viewport) throw std::runtime_error("Multi-Transform Inspector smoke could not resolve the main viewport");
+                if (!multiTransformInspectorSmokeWindowFocused)
+                {
+                    ImGui::SetNextWindowFocus();
+                    multiTransformInspectorSmokeWindowFocused = true;
+                }
+                ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x + 24.0f, viewport->Pos.y + 120.0f), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(520.0f, 560.0f), ImGuiCond_Always);
+                constexpr auto smokeWindowFlags = ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings
+                    | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse;
+                const auto smokeWindowTitle = tr("Transform Group Smoke###MultiTransformInspectorSmoke");
+                if (ImGui::Begin(smokeWindowTitle, nullptr, smokeWindowFlags))
+                {
+                    auto smokeSelection = hierarchySelection;
+                    if (selectedEntity && scene.find(*selectedEntity)) smokeSelection.push_back(*selectedEntity);
+                    std::sort(smokeSelection.begin(), smokeSelection.end());
+                    smokeSelection.erase(std::unique(smokeSelection.begin(), smokeSelection.end()), smokeSelection.end());
+                    drawMultiTransformInspector(scene, smokeSelection, commands, sceneDirty, message,
+                        multiTransformInspectorSmokeState, reportError);
+                }
+                ImGui::End();
+            }
             ImGui::Render();
             draw(ImGui::GetDrawData(), width, height);
             const auto editorCpuEnd = std::chrono::steady_clock::now();
             if (smoke && frames == 89)
             {
                 const auto captureBase = smokeDirectory / "scene-game-visual";
+                if (vulkanGameViewTapSmoke)
+                {
+                    SDL_GetWindowSizeInPixels(window, &tapCaptureWindowWidth, &tapCaptureWindowHeight);
+                    tapCaptureResetWidth = width;
+                    tapCaptureResetHeight = height;
+                    const auto* captureStats = bgfx::getStats();
+                    if (captureStats)
+                    {
+                        tapCaptureBackbufferWidth = static_cast<int>(captureStats->width);
+                        tapCaptureBackbufferHeight = static_cast<int>(captureStats->height);
+                    }
+                    const auto* rendererCaps = bgfx::getCaps();
+                    std::string surfaceQueryError;
+                    tapSurfaceAtCapture = rendererCaps
+                        ? astro::editor::inspectVulkanSurfaceFormat(window, rendererCaps->vendorId,
+                            rendererCaps->deviceId, surfaceQueryError)
+                        : std::nullopt;
+                    if (!tapSurfaceAtCapture)
+                        throw std::runtime_error("Could not query Vulkan surface extent at screenshot capture: "
+                            + surfaceQueryError);
+                    std::cout << "[editor] vulkanGameViewTapCapture windowPixels="
+                        << tapCaptureWindowWidth << 'x' << tapCaptureWindowHeight
+                        << " bgfxReset=" << tapCaptureResetWidth << 'x' << tapCaptureResetHeight
+                        << " backbuffer=" << tapCaptureBackbufferWidth << 'x' << tapCaptureBackbufferHeight
+                        << " vkSurfaceCurrent=" << tapSurfaceAtCapture->surfaceCurrentWidth << 'x'
+                        << tapSurfaceAtCapture->surfaceCurrentHeight
+                        << " currentDefined=" << tapSurfaceAtCapture->surfaceCurrentExtentDefined
+                        << " min=" << tapSurfaceAtCapture->surfaceMinimumWidth << 'x'
+                        << tapSurfaceAtCapture->surfaceMinimumHeight
+                        << " max=" << tapSurfaceAtCapture->surfaceMaximumWidth << 'x'
+                        << tapSurfaceAtCapture->surfaceMaximumHeight
+                        << " requested=" << (SDL_getenv("ASTRO_VULKAN_GAME_VIEW_TAP_SIZE")
+                            ? SDL_getenv("ASTRO_VULKAN_GAME_VIEW_TAP_SIZE") : "default") << '\n';
+                }
                 bgfx::requestScreenShot(BGFX_INVALID_HANDLE, captureBase.string().c_str());
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+                if (framebufferReadbackSmoke)
+                {
+                    const auto scheduleReadback = [](SceneViewTarget& target, bgfx::TextureHandle& readback,
+                        std::vector<std::uint8_t>& pixels, int& readWidth, int& readHeight,
+                        std::uint32_t& readyFrame, const char* label, const bgfx::ViewId blitView) {
+                        const auto source = target.framebufferTexture();
+                        readWidth = target.framebufferWidth();
+                        readHeight = target.framebufferHeight();
+                        if (!bgfx::isValid(source) || readWidth <= 0 || readHeight <= 0)
+                            throw std::runtime_error(std::string(label) + " framebuffer is unavailable for readback");
+                        readback = bgfx::createTexture2D(static_cast<std::uint16_t>(readWidth),
+                            static_cast<std::uint16_t>(readHeight), false, 1, bgfx::TextureFormat::BGRA8,
+                            BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK);
+                        if (!bgfx::isValid(readback))
+                            throw std::runtime_error(std::string(label) + " BGRA8 readback allocation failed");
+                        bgfx::blit(blitView, { .handle = readback }, { .handle = source });
+                        pixels.resize(static_cast<std::size_t>(readWidth) * readHeight * 4);
+                        readyFrame = bgfx::read({ .handle = readback }, pixels.data());
+                    };
+                    scheduleReadback(sceneTarget, sceneViewReadback, sceneViewReadbackPixels,
+                        sceneViewReadbackWidth, sceneViewReadbackHeight, sceneViewReadbackReadyFrame,
+                        "Scene View", 6);
+                    scheduleReadback(gameTarget, gameViewReadback, gameViewReadbackPixels,
+                        gameViewReadbackWidth, gameViewReadbackHeight, gameViewReadbackReadyFrame,
+                        "Game View", 7);
+                }
+#endif
             }
 #if defined(ASTRO_EDITOR_HAS_PUZZLE_RUNTIME)
             if (smoke && frames == 100)
@@ -7046,10 +14697,36 @@ public:
                 puzzleSmokeReady = true;
             }
 #endif
+            constexpr int vulkanResizeTraceBaselineFrame = 8;
+            if (vulkanGameViewResizeTrace
+                && (frames == vulkanResizeTraceBaselineFrame || tapResizeTraceFramesRemaining > 0))
+            {
+                std::filesystem::path resizeCaptureDirectory = smokeDirectory;
+                if (const char* traceDirectory = SDL_getenv("ASTRO_VULKAN_GAME_VIEW_RESIZE_TRACE_DIR"))
+                {
+                    const auto* utf8 = reinterpret_cast<const char8_t*>(traceDirectory);
+                    resizeCaptureDirectory = std::filesystem::path(std::u8string(utf8, utf8 + std::strlen(traceDirectory)));
+                }
+                std::filesystem::create_directories(resizeCaptureDirectory);
+                const auto resizeCaptureBase = resizeCaptureDirectory
+                    / ("vulkan-resize-frame-" + std::to_string(frames));
+                bgfx::requestScreenShot(BGFX_INVALID_HANDLE, resizeCaptureBase.string().c_str());
+                std::cout << "[editor] vulkanResizeTrace event=screenshot frame=" << frames
+                    << " state=" << (frames == vulkanResizeTraceBaselineFrame ? "before-resize" : "after-reset")
+                    << " path=" << resizeCaptureBase.string() << '\n';
+            }
             const auto bgfxFrameCallStart = std::chrono::steady_clock::now();
             bgfx::frame();
             const auto hostFrameEnd = std::chrono::steady_clock::now();
             const auto* frameStats = bgfx::getStats();
+            if (vulkanGameViewResizeTrace && tapResizeTraceFramesRemaining > 0)
+            {
+                std::cout << "[editor] vulkanResizeTrace event=frame frame=" << frames
+                    << " requested=" << tapResizeTraceWidth << 'x' << tapResizeTraceHeight
+                    << " stats=" << (frameStats ? frameStats->width : 0)
+                    << 'x' << (frameStats ? frameStats->height : 0) << '\n';
+                --tapResizeTraceFramesRemaining;
+            }
             if (benchmark && frames >= benchmarkWarmupFrames)
             {
                 const auto milliseconds = [](const auto duration) {
@@ -7206,10 +14883,208 @@ public:
         const bool rendered = bgfx::getStats()->numDraw > 0;
         if (smoke)
         {
-            if (!editorSettingsWindowDrawn || std::string_view(tr("Language")) != "Язык")
+            if (!hierarchyReparentSmoke && !hierarchyReparentManySmoke
+                && (!editorSettingsWindowDrawn || std::string_view(tr("Language")) != "Язык"))
                 throw std::runtime_error("Russian editor settings smoke failed");
             if (!scriptAuthoringPanelDrawn)
                 throw std::runtime_error("ScriptBehavior Inspector authoring panel was not drawn");
+            if (assetBrowserSmoke
+                && (!assetBrowserPanelDrawn || !assetBrowserSearchDrawn || !assetBrowserTypeFilterDrawn
+                    || assetBrowserVisibleCount != 1 || !assetBrowserSelectionActivated
+                    || selectedProjectAsset != assetBrowserExpectedSelection
+                    || selectedProjectAssetRoot != assetRegistry->projectRoot()
+                    || !projectSelectedAssetShown || selectedProjectAssetDisplayPath != "Sprites/smoke-red.png"
+                    || !projectAssetImagePreviewShown))
+                throw std::runtime_error("Asset Browser search/filter/selection smoke failed");
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+            if (assetBrowserModelPreviewSmoke
+                && (!assetBrowserPanelDrawn || !assetBrowserSearchDrawn || !assetBrowserTypeFilterDrawn
+                    || !assetBrowserSelectionActivated || selectedProjectAsset != assetBrowserExpectedSelection
+                    || !projectSelectedAssetShown || !projectAssetModelPreviewShown
+                    || projectModelPreviewMeshCount != 1 || projectModelPreviewPrimitiveCount != 2
+                    || projectModelPreviewVertexCount != 6 || projectModelPreviewIndexCount != 6
+                    || !projectAssetModelViewportShown || !projectModelPreviewViewportFullyVisible
+                    || assetModelPreviewTarget.frameMeshSubmissions() != 2
+                    || !assetModelPreviewTarget.frameAllApplied() || assetModelPreviewTarget.frameMeshDiagnostics() != 0
+                    || !projectModelPreviewCameraControlsSmokePassed
+                    || projectModelPreviewMouseEventPhase != 17
+                    || !projectModelPreviewRightDragSmokePassed || !projectModelPreviewMiddleDragSmokePassed
+                    || !projectModelPreviewOutsidePressIgnoredSmokePassed
+                    || projectAssetPreviewRightDragActive || projectAssetPreviewMiddleDragActive
+                    || sceneViewMouseEventPhase != 18 || !sceneViewRightDragSmokePassed
+                    || !sceneViewMiddleDragSmokePassed || !sceneViewOutsidePressIgnoredSmokePassed
+                    || sceneViewRightDragActive || sceneViewMiddleDragActive))
+                throw std::runtime_error(std::string("Asset Browser model geometry preview smoke failed: panel=")
+                    + (assetBrowserPanelDrawn ? "1" : "0") + " search=" + (assetBrowserSearchDrawn ? "1" : "0")
+                    + " filter=" + (assetBrowserTypeFilterDrawn ? "1" : "0") + " selected="
+                    + (assetBrowserSelectionActivated ? "1" : "0") + " preview="
+                    + (projectAssetModelPreviewShown ? "1" : "0") + " selected-id="
+                    + (selectedProjectAsset ? std::to_string(selectedProjectAsset->value) : "none") + " expected-id="
+                    + (assetBrowserExpectedSelection ? std::to_string(assetBrowserExpectedSelection->value) : "none")
+                    + " meshes=" + std::to_string(projectModelPreviewMeshCount)
+                    + " primitives=" + std::to_string(projectModelPreviewPrimitiveCount)
+                    + " vertices=" + std::to_string(projectModelPreviewVertexCount)
+                    + " indices=" + std::to_string(projectModelPreviewIndexCount)
+                    + " viewport=" + (projectAssetModelViewportShown ? "1" : "0")
+                    + " viewport-fully-visible=" + (projectModelPreviewViewportFullyVisible ? "1" : "0")
+                    + " viewport-submissions=" + std::to_string(assetModelPreviewTarget.frameMeshSubmissions())
+                    + " viewport-frame-all=" + (assetModelPreviewTarget.frameAllApplied() ? "1" : "0")
+                    + " viewport-controls=" + (projectModelPreviewCameraControlsSmokePassed ? "1" : "0")
+                    + " viewport-mouse-phase=" + std::to_string(projectModelPreviewMouseEventPhase)
+                    + " viewport-right-drag=" + (projectModelPreviewRightDragSmokePassed ? "1" : "0")
+                    + " viewport-middle-drag=" + (projectModelPreviewMiddleDragSmokePassed ? "1" : "0")
+                    + " viewport-outside-press-ignored=" + (projectModelPreviewOutsidePressIgnoredSmokePassed ? "1" : "0")
+                    + " viewport-drag-active=" + (projectAssetPreviewRightDragActive || projectAssetPreviewMiddleDragActive ? "1" : "0")
+                    + " scene-view-mouse-phase=" + std::to_string(sceneViewMouseEventPhase)
+                    + " scene-view-right-drag=" + (sceneViewRightDragSmokePassed ? "1" : "0")
+                    + " scene-view-middle-drag=" + (sceneViewMiddleDragSmokePassed ? "1" : "0")
+                    + " scene-view-outside-press-ignored=" + (sceneViewOutsidePressIgnoredSmokePassed ? "1" : "0")
+                    + " scene-view-drag-active=" + (sceneViewRightDragActive || sceneViewMiddleDragActive ? "1" : "0")
+                    + " scene-view-hover=" + (sceneViewPointerHoveringViewport ? "1" : "0")
+                    + " scene-view-right-press-inside=" + (sceneViewRightPressStartedInside ? "1" : "0")
+                    + " scene-view-middle-press-inside=" + (sceneViewMiddlePressStartedInside ? "1" : "0")
+                    + " scene-view-rect=" + std::to_string(sceneViewRectNormalized[0]) + ","
+                    + std::to_string(sceneViewRectNormalized[1]) + ","
+                    + std::to_string(sceneViewRectNormalized[2]) + ","
+                    + std::to_string(sceneViewRectNormalized[3])
+                    + " viewport-diagnostics=" + std::to_string(assetModelPreviewTarget.frameMeshDiagnostics())
+                    + " viewport-visible-pixels=" + std::to_string(projectModelPreviewVisiblePixels)
+                    + " viewport-rect-valid=" + (projectModelPreviewRectValid ? "1" : "0")
+                    + " viewport-rect=" + std::to_string(projectModelPreviewRectNormalized[0]) + ","
+                    + std::to_string(projectModelPreviewRectNormalized[1]) + ","
+                    + std::to_string(projectModelPreviewRectNormalized[2]) + ","
+                    + std::to_string(projectModelPreviewRectNormalized[3])
+                    + " diagnostic=" + projectModelPreviewDiagnostic);
+#endif
+            const bool expectedSelectedCameraActive = gameViewCameraDiagnosticCase != 1
+                && !codexCameraAdditionSmoke && !codexCameraClearSmoke;
+            if (!codexCameraAdditionSmoke && !hierarchyReparentSmoke && !hierarchyReparentManySmoke
+                && gameViewCameraDiagnosticCase != 3
+                && (!camera3DInspectorState.panelDrawn || !camera3DInspectorState.lensControlsShown
+                || !camera3DInspectorState.activeControlShown || !selectedEntity
+                || !scene.camera3D(*selectedEntity)
+                || scene.camera3D(*selectedEntity)->active != expectedSelectedCameraActive))
+                throw std::runtime_error(std::string("Camera3D Inspector smoke failed: panel=")
+                    + (camera3DInspectorState.panelDrawn ? "1" : "0") + " lens="
+                    + (camera3DInspectorState.lensControlsShown ? "1" : "0") + " active-control="
+                    + (camera3DInspectorState.activeControlShown ? "1" : "0") + " selected="
+                    + (selectedEntity ? std::to_string(*selectedEntity) : "none") + " camera-active="
+                    + (selectedEntity && scene.camera3D(*selectedEntity) && scene.camera3D(*selectedEntity)->active ? "1" : "0")
+                    + " review-phase=" + std::to_string(codexChangeReviewSmokePhase)
+                    + " review-pending=" + (codexChangeReview.pendingCamera3D() ? "1" : "0")
+                    + " review-component-id=" + std::to_string(codexCameraReviewSmokeComponentId));
+            if (gameViewCameraDiagnosticCase == 0
+                && (!primitiveRendererInspectorState.panelDrawn
+                    || !primitiveRendererInspectorState.shapeControlShown
+                    || !primitiveRendererInspectorState.visibilityControlShown
+                    || !primitiveRendererInspectorState.materialPanelDrawn
+                    || (!benchmark3d && !primitiveRendererInspectorState.materialChoiceShown)
+                    || primitiveRendererInspectorState.entity != primitiveInspectorSmokeEntity
+                    || primitiveRendererInspectorState.materialEntity != primitiveInspectorSmokeEntity
+                    || primitiveRendererInspectorState.primitive != (primitiveMaterialSmoke
+                        ? astro::scene::Primitive3D::Cube : astro::scene::Primitive3D::Cylinder)
+                    || primitiveRendererInspectorState.visible != primitiveMaterialSmoke))
+                throw std::runtime_error(std::string("PrimitiveRenderer Inspector smoke failed: panel=")
+                    + (primitiveRendererInspectorState.panelDrawn ? "1" : "0") + " shape="
+                    + (primitiveRendererInspectorState.shapeControlShown ? "1" : "0") + " visible-control="
+                    + (primitiveRendererInspectorState.visibilityControlShown ? "1" : "0") + " entity="
+                    + std::to_string(primitiveRendererInspectorState.entity) + " expected="
+                    + std::to_string(primitiveInspectorSmokeEntity) + " kind="
+                    + std::to_string(static_cast<int>(primitiveRendererInspectorState.primitive)) + " visible="
+                    + (primitiveRendererInspectorState.visible ? "1" : "0") + " material-panel="
+                    + (primitiveRendererInspectorState.materialPanelDrawn ? "1" : "0"));
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+            if (!vulkanSceneViewOnlySmoke)
+            {
+            if (gameViewCameraDiagnosticCase == 0)
+            {
+                if (!codexCameraClearSmoke
+                    && (!gameTarget.frameCameraDriven() || gameTarget.frameMeshSubmissions() == 0))
+                    throw std::runtime_error("Game View smoke did not submit 3D meshes through the active Scene Camera3D");
+            }
+            else if (gameViewCameraDiagnosticCase == 3)
+            {
+                if (!gameViewDiagnosticsShown
+                    || gameViewDiagnosticText.find("AssetId модели MeshRenderer не зарегистрирован") == std::string::npos
+                    || !gameTarget.frameCameraDriven() || gameTarget.frameMeshSubmissions() == 0)
+                    throw std::runtime_error(std::string("Game View mesh diagnostic did not retain valid camera-driven rendering: text=")
+                        + gameViewDiagnosticText + " camera-driven=" + (gameTarget.frameCameraDriven() ? "1" : "0")
+                        + " meshes=" + std::to_string(gameTarget.frameMeshSubmissions()));
+                const auto* expectedEntity = smokeDiagnosticExpectedEntity
+                    ? scene.find(*smokeDiagnosticExpectedEntity) : nullptr;
+                const bool expectedParentExpanded = expectedEntity && expectedEntity->parent
+                    && std::find(hierarchyForceOpenAncestors.begin(), hierarchyForceOpenAncestors.end(),
+                        *expectedEntity->parent) != hierarchyForceOpenAncestors.end();
+                if (!gameViewDiagnosticsConsoleShown || !gameViewDiagnosticLinkShown
+                    || !gameViewDiagnosticLinkActivated || !hierarchySelectionVisible || !hierarchyFocusApplied
+                    || !expectedParentExpanded || !gameViewMissingAssetLinkSuppressed
+                    || selectedEntity != smokeDiagnosticExpectedEntity)
+                    throw std::runtime_error("Mesh diagnostic did not focus its related entity and expand Hierarchy");
+            }
+            else if (gameViewCameraDiagnosticCase == 4)
+            {
+                if (!gameViewDiagnosticsShown || !gameViewDiagnosticsConsoleShown
+                    || !gameTarget.frameCameraDriven() || gameTarget.frameMeshSubmissions() == 0
+                    || !smokeDiagnosticExpectedAsset || !gameViewDiagnosticAssetLinkShown
+                    || !gameViewDiagnosticAssetLinkActivated
+                    || selectedProjectAsset != smokeDiagnosticExpectedAsset
+                    || selectedProjectAssetRoot != assetRegistry->projectRoot()
+                    || !projectSelectedAssetShown
+                    || selectedProjectAssetDisplayPath != smokeDiagnosticExpectedAssetPath)
+                    throw std::runtime_error(std::string("Registered material diagnostic did not resolve in Project: link=")
+                        + (gameViewDiagnosticAssetLinkShown ? "1" : "0") + " activated="
+                        + (gameViewDiagnosticAssetLinkActivated ? "1" : "0") + " selected="
+                        + (selectedProjectAsset ? std::to_string(selectedProjectAsset->value) : "none") + " expected="
+                        + (smokeDiagnosticExpectedAsset ? std::to_string(smokeDiagnosticExpectedAsset->value) : "none")
+                        + " project-panel=" + (projectSelectedAssetShown ? "1" : "0") + " path="
+                        + selectedProjectAssetDisplayPath + " expected-path=" + smokeDiagnosticExpectedAssetPath);
+            }
+            else
+            {
+                const auto expectedDiagnostic = gameViewCameraDiagnosticCase == 1
+                    ? "В игровом виде не выбрана активная камера 3D"
+                    : "Активная камера 3D игрового вида настроена некорректно";
+                if (!gameViewDiagnosticsShown || gameViewDiagnosticText.find(expectedDiagnostic) == std::string::npos
+                    || gameTarget.frameCameraDriven() || gameTarget.frameMeshSubmissions() != 0)
+                    throw std::runtime_error("Game View camera diagnostic smoke did not display the expected localized warning");
+                if (!gameViewDiagnosticsConsoleShown || !gameViewDiagnosticLinkShown
+                    || !gameViewDiagnosticLinkActivated || !hierarchySelectionVisible || !hierarchyFocusApplied
+                    || !smokeDiagnosticExpectedEntity || selectedEntity != smokeDiagnosticExpectedEntity)
+                    throw std::runtime_error(std::string("Diagnostics console did not focus Camera3D: console=")
+                        + (gameViewDiagnosticsConsoleShown ? "1" : "0") + " link="
+                        + (gameViewDiagnosticLinkShown ? "1" : "0") + " activated="
+                        + (gameViewDiagnosticLinkActivated ? "1" : "0") + " row="
+                        + (hierarchySelectionVisible ? "1" : "0") + " scrolled="
+                        + (hierarchyFocusApplied ? "1" : "0") + " selected="
+                        + (selectedEntity ? std::to_string(*selectedEntity) : "none") + " expected="
+                        + (smokeDiagnosticExpectedEntity ? std::to_string(*smokeDiagnosticExpectedEntity) : "none"));
+            }
+            if (!codexCameraAdditionSmoke && !codexCameraActivationSmoke && !codexCameraClearSmoke
+                && gameViewCameraDiagnosticCase != 2 && gameViewCameraDiagnosticCase != 3
+                && (!meshMaterialInspectorState.panelDrawn || !meshMaterialInspectorState.sourceSlotShown
+                || !meshMaterialInspectorState.materialChoicesShown
+                || !meshMaterialInspectorState.projectOverrideChoiceShown
+                || !meshMaterialInspectorState.sourceMaterialChoiceShown
+                || !meshMaterialInspectorState.previewLimitsShown
+                || !meshMaterialInspectorState.samplingControlsShown
+                || !smokeMaterialOverrideCommandPassed))
+                throw std::runtime_error(std::string("MeshRenderer material Inspector smoke failed: panel=")
+                    + (meshMaterialInspectorState.panelDrawn ? "1" : "0") + " source="
+                    + (meshMaterialInspectorState.sourceSlotShown ? "1" : "0") + " choices="
+                    + (meshMaterialInspectorState.materialChoicesShown ? "1" : "0") + " override-label="
+                    + (meshMaterialInspectorState.projectOverrideChoiceShown ? "1" : "0") + " source-label="
+                    + (meshMaterialInspectorState.sourceMaterialChoiceShown ? "1" : "0") + " limits="
+                    + (meshMaterialInspectorState.previewLimitsShown ? "1" : "0") + " sampler-controls="
+                    + (meshMaterialInspectorState.samplingControlsShown ? "1" : "0") + " command="
+                    + (smokeMaterialOverrideCommandPassed ? "1" : "0") + " selected="
+                    + (selectedEntity ? std::to_string(*selectedEntity) : "none") + " inspector-entity="
+                    + std::to_string(meshMaterialInspectorState.entity) + " override="
+                    + std::to_string(meshMaterialInspectorState.materialOverride.value) + " source-valid="
+                    + (meshMaterialInspectorState.sourceMaterialValid ? "1" : "0") + " source-index="
+                    + (meshMaterialInspectorState.sourceMaterialIndex
+                        ? std::to_string(*meshMaterialInspectorState.sourceMaterialIndex) : "none"));
+            }
+#endif
 #if defined(ASTRO_EDITOR_METADATA_VALIDATOR_DLL) && defined(ASTRO_EDITOR_DOTNET_ROOT)
             if (!csharpMetadataValidationPanelDrawn)
                 throw std::runtime_error("C# metadata validation panel smoke failed");
@@ -7220,17 +15095,482 @@ public:
             const auto screenshotFile = smokeDirectory / "scene-game-visual.tga";
             for (int attempt = 0; attempt < 100 && !std::filesystem::exists(screenshotFile); ++attempt)
                 SDL_Delay(10);
-            if (!smokeScreenshotContainsSpriteColors(screenshotFile))
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+            if (runtimeBgfxGameViewTextureSmoke)
+            {
+                std::array<wchar_t, 32768> outputPath{};
+                const auto outputLength = GetEnvironmentVariableW(L"ASTRO_EDITOR_SCREENSHOT_OUTPUT",
+                    outputPath.data(), static_cast<DWORD>(outputPath.size()));
+                if (outputLength > 0 && outputLength < outputPath.size())
+                {
+                    const std::filesystem::path outputFile(outputPath.data());
+                    std::filesystem::create_directories(outputFile.parent_path());
+                    std::filesystem::copy_file(screenshotFile, outputFile,
+                        std::filesystem::copy_options::overwrite_existing);
+                }
+            }
+            if (vulkanColorChartSmoke)
+            {
+                const auto comparison = vulkanColorChartWindowShown
+                    ? smokeCompareColorChart(screenshotFile)
+                    : ColorChartComparison{};
+                std::cout << "[editor] vulkanColorChart matched=" << comparison.matched << '/'
+                    << comparison.samples << " maxDelta=" << comparison.maximumDelta
+                    << " channelTolerance=8/255 source=BGRA8_SRGB_MUTABLE origin="
+                    << comparison.originX << ',' << comparison.originY
+                    << " texture=" << vulkanColorChartTexture.idx << " samples=";
+                for (std::size_t index = 0; index < comparison.actualBgra.size(); ++index)
+                {
+                    if (index) std::cout << ';';
+                    std::cout << unsigned(comparison.actualBgra[index][2]) << ','
+                        << unsigned(comparison.actualBgra[index][1]) << ','
+                        << unsigned(comparison.actualBgra[index][0]);
+                }
+                std::cout << '\n';
+                if (!comparison.valid)
+                    throw std::runtime_error("Vulkan known-color chart did not match final-window screenshot");
+            }
+            if (framebufferReadbackSmoke)
+            {
+                const bool compareSceneView = !runtimeBgfxGameViewTextureSmoke;
+                const bool compareGameView = runtimeBgfxDirectionalLightSmoke || runtimeBgfxGameViewTextureSmoke;
+                const std::size_t sceneMinimumMatchPermille = directionalLightNoLightSmoke ? 995 : 985;
+                const auto sceneComparison = compareSceneView && sceneViewRectValid
+                    ? smokeCompareFramebufferReadback(screenshotFile, sceneViewRectNormalized,
+                        sceneViewReadbackPixels, sceneViewReadbackWidth, sceneViewReadbackHeight,
+                        bgfx::getCaps()->originBottomLeft, sceneMinimumMatchPermille)
+                    : FramebufferReadbackComparison{};
+                const auto gameComparison = compareGameView && gameViewRectValid
+                    ? smokeCompareFramebufferReadback(screenshotFile, gameViewRectNormalized,
+                        gameViewReadbackPixels, gameViewReadbackWidth, gameViewReadbackHeight,
+                        bgfx::getCaps()->originBottomLeft)
+                    : FramebufferReadbackComparison{};
+                const char* readbackCase = directionalLightNoLightSmoke ? "directional-no-light"
+                    : runtimeBgfxVulkanGameViewTextureSmoke ? "game-vulkan-texture"
+                    : runtimeBgfxGameViewTextureSmoke
+                        ? (SDL_getenv("ASTRO_RUNTIME_BGFX_MASK_SMOKE") ? "game-mask" : "game-texture")
+                    : alphaMaskBoundaryCase == 1 ? "scene-mask-equal" : "scene-alpha-blend";
+                std::cout << "[editor] framebufferReadback case=" << readbackCase
+                    << " scene=";
+                if (compareSceneView)
+                    std::cout << sceneComparison.matched << '/' << sceneComparison.samples
+                        << " maxDelta=" << sceneComparison.maximumDelta;
+                else std::cout << "not-checked";
+                std::cout << " game=";
+                if (compareGameView)
+                    std::cout << gameComparison.matched << '/' << gameComparison.samples
+                        << " maxDelta=" << gameComparison.maximumDelta;
+                else std::cout << "not-checked";
+                std::cout << " sceneThreshold=" << (sceneMinimumMatchPermille / 10.0)
+                    << "% gameThreshold=99.5% channelTolerance=8/255";
+                if (compareGameView && !gameComparison.valid)
+                    std::cout << " gameAlternateOrientation=" << gameComparison.alternateOrientationMatched
+                        << '/' << gameComparison.samples << " maxDelta="
+                        << gameComparison.alternateOrientationMaximumDelta
+                        << " gameMeanScreen=" << gameComparison.meanScreenChannels[0] << ','
+                        << gameComparison.meanScreenChannels[1] << ',' << gameComparison.meanScreenChannels[2]
+                        << " gameMeanFramebuffer=" << gameComparison.meanSourceChannels[0] << ','
+                        << gameComparison.meanSourceChannels[1] << ',' << gameComparison.meanSourceChannels[2];
+                std::cout << '\n';
+                if (vulkanGameViewTapSmoke && compareGameView)
+                {
+                    const auto* tapStats = bgfx::getStats();
+                    std::cout << "[editor] vulkanGameViewTap target=" << gameComparison.targetWidth << 'x'
+                        << gameComparison.targetHeight << " screen=" << gameComparison.screenWidth << 'x'
+                        << gameComparison.screenHeight << " backbuffer="
+                        << (tapStats ? tapStats->width : 0) << 'x' << (tapStats ? tapStats->height : 0)
+                        << " captureWindow=" << tapCaptureWindowWidth << 'x' << tapCaptureWindowHeight
+                        << " captureReset=" << tapCaptureResetWidth << 'x' << tapCaptureResetHeight
+                        << " captureBackbuffer=" << tapCaptureBackbufferWidth << 'x' << tapCaptureBackbufferHeight
+                        << " screenRect=" << gameComparison.screenRectX << ',' << gameComparison.screenRectY
+                        << '+' << gameComparison.screenRectWidth << 'x' << gameComparison.screenRectHeight
+                        << " uvFlipY=" << bgfx::getCaps()->originBottomLeft
+                        << " rowMatches=";
+                    for (std::size_t row = 0; row < gameComparison.rowMatches.size(); ++row)
+                    {
+                        if (row) std::cout << ',';
+                        std::cout << gameComparison.rowMatches[row];
+                    }
+                    std::cout << " alternateRowMatches=";
+                    for (std::size_t row = 0; row < gameComparison.alternateRowMatches.size(); ++row)
+                    {
+                        if (row) std::cout << ',';
+                        std::cout << gameComparison.alternateRowMatches[row];
+                    }
+                    std::cout << " probesBGRA=";
+                    for (std::size_t probe = 0; probe < gameComparison.tapSamples.size(); ++probe)
+                    {
+                        if (probe) std::cout << ';';
+                        const auto& sample = gameComparison.tapSamples[probe];
+                        std::cout << sample.gridX << ',' << sample.gridY << '@'
+                            << sample.targetX << ',' << sample.targetY << ':'
+                            << unsigned(sample.targetBgra[0]) << ',' << unsigned(sample.targetBgra[1]) << ','
+                            << unsigned(sample.targetBgra[2]) << "/screen@" << sample.screenX << ','
+                            << sample.screenY << '=' << unsigned(sample.screenBgra[0]) << ','
+                            << unsigned(sample.screenBgra[1]) << ',' << unsigned(sample.screenBgra[2]);
+                    }
+                    std::cout << '\n';
+                }
+                if ((compareSceneView && !sceneComparison.valid) || (compareGameView && !gameComparison.valid))
+                {
+                    if (runtimeBgfxVulkanGameViewTextureSmoke && !gameComparison.valid)
+                        std::cout << "[editor] VULKAN_GAME_VIEW_READBACK_MISMATCH game="
+                            << gameComparison.matched << '/' << gameComparison.samples
+                            << " maxDelta=" << gameComparison.maximumDelta << " alternateOrientation="
+                            << gameComparison.alternateOrientationMatched << '/' << gameComparison.samples
+                            << " maxDelta=" << gameComparison.alternateOrientationMaximumDelta
+                            << " meanScreen=" << gameComparison.meanScreenChannels[0] << ','
+                            << gameComparison.meanScreenChannels[1] << ',' << gameComparison.meanScreenChannels[2]
+                            << " meanFramebuffer=" << gameComparison.meanSourceChannels[0] << ','
+                            << gameComparison.meanSourceChannels[1] << ',' << gameComparison.meanSourceChannels[2]
+                            << " adapter=" << gameTarget.runtimeBgfxAdapterUsed()
+                            << " cameraDriven=" << gameTarget.frameCameraDriven()
+                            << " submissions=" << gameTarget.frameRuntimeBgfxSubmissions()
+                            << " textureSubmissions=" << gameTarget.frameRuntimeBgfxTextureSubmissions()
+                            << " texturePixels=" << runtimeBgfxGameViewTexturePixels
+                            << " sourceTexturePixels=" << runtimeBgfxGameViewSourceTexturePixels << '\n';
+                    if (!vulkanGameViewTapSmoke)
+                        throw std::runtime_error("Scene/Game framebuffer readback did not match final Editor pixels"
+                            " within the per-case BGRA8 sRGB sample thresholds");
+                }
+            }
+#endif
+            if (runtimeBgfxDirectionalLightSmoke)
+            {
+                std::array<wchar_t, 32768> outputPath{};
+                const auto outputLength = GetEnvironmentVariableW(L"ASTRO_EDITOR_SCREENSHOT_OUTPUT",
+                    outputPath.data(), static_cast<DWORD>(outputPath.size()));
+                if (outputLength > 0 && outputLength < outputPath.size())
+                {
+                    const std::filesystem::path outputFile(outputPath.data());
+                    std::filesystem::create_directories(outputFile.parent_path());
+                    std::filesystem::copy_file(screenshotFile, outputFile,
+                        std::filesystem::copy_options::overwrite_existing);
+                }
+            }
+            // Compact MASK cases assert their 3D pixels below; opaque meshes can cover the 2D color markers.
+            const bool compactMaskTransition = workspaceLayout_.compact
+                && maskMipPattern == SmokeMaskMipPattern::CutoffTransitionRamp;
+            if (!vulkanSceneViewOnlySmoke && !compactMaskTransition
+                && !runtimeBgfxGameViewSmoke && !runtimeBgfxGameViewTextureSmoke
+                && !runtimeBgfxDirectionalLightSmoke && !codexReviewSmoke && !multiTransformInspectorSmoke
+                && !smokeScreenshotContainsSpriteColors(screenshotFile))
                 throw std::runtime_error("Scene/Game visual regression failed: screenshot lacks sprite colors");
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+            if (assetBrowserModelPreviewSmoke)
+            {
+                projectModelPreviewVisiblePixels = projectModelPreviewRectValid
+                    ? smokeScreenshotModelPreviewPixels(screenshotFile, projectModelPreviewRectNormalized) : 0;
+                if (projectModelPreviewVisiblePixels < 32)
+                    throw std::runtime_error("Project model preview screenshot contains too few visible model pixels: "
+                        + std::to_string(projectModelPreviewVisiblePixels));
+                std::cout << "[editor] projectModelPreview meshes=" << projectModelPreviewMeshCount
+                    << " primitives=" << projectModelPreviewPrimitiveCount
+                    << " drawSubmissions=" << assetModelPreviewTarget.frameMeshSubmissions()
+                    << " frameAll=" << assetModelPreviewTarget.frameAllApplied()
+                    << " orbitPanZoom=" << projectModelPreviewCameraControlsSmokePassed
+                    << " sdlRightDrag=" << projectModelPreviewRightDragSmokePassed
+                    << " sdlMiddleDrag=" << projectModelPreviewMiddleDragSmokePassed
+                    << " outsidePressIgnored=" << projectModelPreviewOutsidePressIgnoredSmokePassed
+                    << " dragReleased=" << (!projectAssetPreviewRightDragActive && !projectAssetPreviewMiddleDragActive)
+                    << " sceneViewRightDrag=" << sceneViewRightDragSmokePassed
+                    << " sceneViewMiddleDrag=" << sceneViewMiddleDragSmokePassed
+                    << " sceneViewOutsidePressIgnored=" << sceneViewOutsidePressIgnoredSmokePassed
+                    << " sceneViewDragReleased=" << (!sceneViewRightDragActive && !sceneViewMiddleDragActive)
+                    << " viewportFullyVisible=" << projectModelPreviewViewportFullyVisible
+                    << " visiblePixels=" << projectModelPreviewVisiblePixels << '\n';
+            }
             sceneViewWhitePixels = sceneViewRectValid
                 ? smokeScreenshotSceneViewWhitePixels(screenshotFile, sceneViewRectNormalized) : 0;
-            if (sceneViewWhitePixels < 32)
+            sceneViewBaseColorPixels = sceneViewRectValid
+                ? smokeScreenshotSceneViewBaseColorPixels(screenshotFile, sceneViewRectNormalized) : 0;
+            runtimeBgfxGameViewTexturePixels = runtimeBgfxGameViewTextureSmoke && gameViewRectValid
+                ? smokeScreenshotSceneViewBaseColorPixels(screenshotFile, gameViewRectNormalized) : 0;
+            runtimeBgfxGameViewSourceTexturePixels = runtimeBgfxGameViewTextureSmoke && gameViewRectValid
+                ? smokeScreenshotSceneViewBaseColorPixels(screenshotFile, gameViewRectNormalized, true) : 0;
+            runtimeBgfxDirectionalLightPixels = runtimeBgfxDirectionalLightSmoke
+                && !runtimeBgfxPointLightSmoke
+                ? smokeScreenshotRedLightPixels(screenshotFile, gameViewRectNormalized) : 0;
+            sceneViewDirectionalLightPixels = runtimeBgfxDirectionalLightSmoke
+                && !runtimeBgfxPointLightSmoke
+                ? smokeScreenshotRedLightPixels(screenshotFile, sceneViewRectNormalized) : 0;
+            runtimeBgfxPointLightPixels = runtimeBgfxPointLightSmoke && gameViewRectValid
+                ? smokeScreenshotBlueLightPixels(screenshotFile, gameViewRectNormalized) : 0;
+            sceneViewPointLightPixels = runtimeBgfxPointLightSmoke && sceneViewRectValid
+                ? smokeScreenshotBlueLightPixels(screenshotFile, sceneViewRectNormalized) : 0;
+            sceneViewFrontLitPixels = runtimeBgfxDirectionalLightSmoke && !runtimeBgfxPointLightSmoke
+                && !directionalLightNoLightSmoke
+                ? smokeScreenshotRedLightPixels(screenshotFile, sceneViewRectNormalized,
+                    {0.29f, 0.30f, 0.43f, 0.70f}) : 0;
+            sceneViewBackLitPixels = runtimeBgfxDirectionalLightSmoke && !runtimeBgfxPointLightSmoke
+                && !directionalLightNoLightSmoke
+                ? smokeScreenshotRedLightPixels(screenshotFile, sceneViewRectNormalized,
+                    {0.57f, 0.30f, 0.71f, 0.70f}) : 0;
+            if (runtimeBgfxDirectionalLightSmoke && !runtimeBgfxPointLightSmoke && !directionalLightNoLightSmoke
+                && runtimeBgfxDirectionalLightPixels < 16)
+                throw std::runtime_error("Runtime BGFX directional light smoke did not render the expected lit pixels: "
+                    + std::to_string(runtimeBgfxDirectionalLightPixels) + " rect-valid="
+                    + (gameViewRectValid ? "1" : "0") + " rect=" + std::to_string(gameViewRectNormalized[0])
+                    + "," + std::to_string(gameViewRectNormalized[1]) + "-"
+                    + std::to_string(gameViewRectNormalized[2]) + "," + std::to_string(gameViewRectNormalized[3])
+                    + " adapter=" + (gameTarget.runtimeBgfxAdapterUsed() ? "1" : "0")
+                    + " submissions=" + std::to_string(gameTarget.frameRuntimeBgfxSubmissions()));
+            if (runtimeBgfxDirectionalLightSmoke && !runtimeBgfxPointLightSmoke && !directionalLightNoLightSmoke
+                && sceneViewDirectionalLightPixels < 16)
+                throw std::runtime_error("Scene View directional-light smoke did not render the expected lit pixels: "
+                    + std::to_string(sceneViewDirectionalLightPixels));
+            if (runtimeBgfxDirectionalLightSmoke && !runtimeBgfxPointLightSmoke && !directionalLightNoLightSmoke
+                && (sceneViewFrontLitPixels < 16 || sceneViewBackLitPixels != 0))
+                throw std::runtime_error("Scene View front/back directional-light regions failed: front="
+                    + std::to_string(sceneViewFrontLitPixels) + " back=" + std::to_string(sceneViewBackLitPixels));
+            if (runtimeBgfxPointLightSmoke && (runtimeBgfxPointLightPixels < 16 || sceneViewPointLightPixels < 16))
+                throw std::runtime_error("Point-light smoke did not render enough blue pixels: game="
+                    + std::to_string(runtimeBgfxPointLightPixels) + " scene="
+                    + std::to_string(sceneViewPointLightPixels));
+            if (runtimeBgfxPointLightSmoke && frames >= 258)
+            {
+                const auto* point = scene.pointLight3D(primitiveInspectorSmokeEntity);
+                if (!pointLightInspectorState.panelDrawn
+                    || !pointLightInspectorState.colorControlShown || !pointLightInspectorState.intensityControlShown
+                    || !pointLightInspectorState.rangeControlShown || !pointLightInspectorState.enabledControlShown
+                    || !pointLightInspectorState.applyButtonShown || !pointLightInspectorState.removeButtonShown
+                    || !pointLightInspectorState.smokeCommandsPassed
+                    || pointLightInspectorState.entity != primitiveInspectorSmokeEntity || !point || point->enabled
+                    || point->color != std::array<float, 3>{0.2f, 0.6f, 1.0f}
+                    || point->intensity != 4.0f
+                    || point->range != 32.0f)
+                    throw std::runtime_error(std::string("PointLight3D Inspector smoke did not finish authoring and Undo/Redo: panel=")
+                        + (pointLightInspectorState.panelDrawn ? "1" : "0") + " add="
+                        + (pointLightInspectorState.addButtonShown ? "1" : "0") + " apply="
+                        + (pointLightInspectorState.applyButtonShown ? "1" : "0") + " remove="
+                        + (pointLightInspectorState.removeButtonShown ? "1" : "0") + " undo-redo="
+                        + (pointLightInspectorState.smokeCommandsPassed ? "1" : "0") + " pointer-action="
+                        + std::to_string(lightInspectorPointerActionIndex) + " phase="
+                        + std::to_string(lightInspectorPointerActionPhase) + " intensity="
+                        + (point ? std::to_string(point->intensity) : "missing"));
+            }
+            if (runtimeBgfxDirectionalLightSmoke && !runtimeBgfxPointLightSmoke
+                && !directionalLightNoLightSmoke && frames >= 258)
+            {
+                const auto* light = scene.directionalLight3D(primitiveInspectorSmokeEntity);
+                if (!directionalLightInspectorState.panelDrawn
+                    || !directionalLightInspectorState.colorControlShown
+                    || !directionalLightInspectorState.intensityControlShown
+                    || !directionalLightInspectorState.enabledControlShown
+                    || !directionalLightInspectorState.applyButtonShown
+                    || !directionalLightInspectorState.removeButtonShown
+                    || !directionalLightInspectorState.smokeCommandsPassed
+                    || directionalLightInspectorState.entity != primitiveInspectorSmokeEntity || !light
+                    || light->enabled || light->color != std::array<float, 3>{0.1f, 0.4f, 0.8f}
+                    || light->intensity != 3.5f)
+                    throw std::runtime_error(std::string("DirectionalLight3D Inspector controls/commands failed: panel=")
+                        + (directionalLightInspectorState.panelDrawn ? "1" : "0") + " add="
+                        + (directionalLightInspectorState.addButtonShown ? "1" : "0") + " apply="
+                        + (directionalLightInspectorState.applyButtonShown ? "1" : "0") + " remove="
+                        + (directionalLightInspectorState.removeButtonShown ? "1" : "0") + " commands="
+                        + (directionalLightInspectorState.smokeCommandsPassed ? "1" : "0") + " pointer-action="
+                        + std::to_string(lightInspectorPointerActionIndex) + " phase="
+                        + std::to_string(lightInspectorPointerActionPhase) + " intensity="
+                        + (light ? std::to_string(light->intensity) : "missing"));
+            }
+            if (lightInspectorPointerSmoke && frames >= 250)
+            {
+                const auto* point = scene.pointLight3D(primitiveInspectorSmokeEntity);
+                const auto* directional = scene.directionalLight3D(primitiveInspectorSmokeEntity);
+                if (lightInspectorPointerActionIndex != lightPointerActions.size()
+                    || !lightInspectorPointerCommandsPassed
+                    || !lightInspectorKeyboardPassed
+                    || (runtimeBgfxPointLightSmoke
+                        && (!pointInspectorPointerDraftSeeded || !point || point->intensity != 4.0f
+                            || point->color != pointInspectorPointerOriginalColor))
+                    || !directionalInspectorPointerDraftSeeded || !directional || directional->intensity != 3.5f
+                    || directional->color != directionalInspectorPointerOriginalColor)
+                    throw std::runtime_error("Light Inspector pointer/keyboard smoke failed; action="
+                        + std::to_string(lightInspectorPointerActionIndex) + " phase="
+                        + std::to_string(lightInspectorPointerActionPhase) + " pointHover="
+                        + (pointLightInspectorState.applyButtonHovered ? "1" : "0") + " pointPos="
+                        + std::to_string(pointLightInspectorState.applyButtonCenter.x) + ","
+                        + std::to_string(pointLightInspectorState.applyButtonCenter.y) + " directionalHover="
+                        + (directionalLightInspectorState.applyButtonHovered ? "1" : "0") + " directionalPos="
+                        + std::to_string(directionalLightInspectorState.applyButtonCenter.x) + ","
+                        + std::to_string(directionalLightInspectorState.applyButtonCenter.y) + " mouseDown="
+                        + (ImGui::GetIO().MouseDown[ImGuiMouseButton_Left] ? "1" : "0") + " enabled="
+                        + (directionalLightInspectorState.enabled ? "1" : "0") + " intensity="
+                        + std::to_string(directionalLightInspectorState.intensity) + " sliderEdited="
+                        + (directionalLightInspectorState.smokeIntensityPointerEdited ? "1" : "0")
+                        + " keyboardPhase=" + std::to_string(static_cast<int>(lightInspectorKeyboardPhase))
+                        + " keyboardFocusAttempts=" + std::to_string(lightInspectorKeyboardFocusAttempts)
+                        + " enabledFocus=" + (pointLightInspectorState.keyboardEnabledFocused ? "1" : "0")
+                        + " enabledDraft=" + (pointLightInspectorState.enabled ? "1" : "0")
+                        + " enabledEdited=" + (pointLightInspectorState.smokeKeyboardEnabledEdited ? "1" : "0")
+                        + " colorFocus=" + (runtimeBgfxPointLightSmoke
+                            ? (pointLightInspectorState.keyboardColorFocused ? "1" : "0")
+                            : (directionalLightInspectorState.keyboardColorFocused ? "1" : "0"))
+                        + " pointColor=" + std::to_string(pointLightInspectorState.color[0]) + ","
+                        + std::to_string(pointLightInspectorState.color[1]) + ","
+                        + std::to_string(pointLightInspectorState.color[2])
+                        + " pointIntensity=" + std::to_string(pointLightInspectorState.intensity));
+            }
+            if (directionalLightNoLightSmoke)
+            {
+                std::array<wchar_t, 32768> rawOutput{};
+                const auto rawOutputLength = GetEnvironmentVariableW(L"ASTRO_EDITOR_SCENEVIEW_RAW_OUTPUT",
+                    rawOutput.data(), static_cast<DWORD>(rawOutput.size()));
+                if (rawOutputLength == 0 || rawOutputLength >= rawOutput.size()
+                    || !sceneViewRectValid || !smokeWriteSceneViewRawCrop(screenshotFile,
+                        std::filesystem::path(rawOutput.data()), sceneViewRectNormalized))
+                    throw std::runtime_error("No-light equivalence smoke could not write a valid Scene View crop");
+            }
+            if (runtimeBgfxGameViewTextureSmoke && runtimeBgfxGameViewTexturePixels < 64)
+                throw std::runtime_error("Runtime BGFX Game View texture smoke found too few base-color pixels: "
+                    + std::to_string(runtimeBgfxGameViewTexturePixels) + " rect="
+                    + std::to_string(gameViewRectNormalized[0]) + "," + std::to_string(gameViewRectNormalized[1])
+                    + "-" + std::to_string(gameViewRectNormalized[2]) + "," + std::to_string(gameViewRectNormalized[3])
+                    + " valid=" + (gameViewRectValid ? "1" : "0") + " adapter="
+                    + (gameTarget.runtimeBgfxAdapterUsed() ? "1" : "0") + " meshes="
+                    + std::to_string(gameTarget.frameRuntimeBgfxSubmissions()) + " textures="
+                    + std::to_string(gameTarget.frameRuntimeBgfxTextureSubmissions()) + " cache="
+                    + std::to_string(gameTarget.runtimeBgfxCachedTextureCount()));
+            if (runtimeBgfxGameViewTextureSmoke && runtimeBgfxGameViewSourceTexturePixels < 64)
+                throw std::runtime_error("Runtime BGFX Game View source glTF texture produced too few cyan pixels: "
+                    + std::to_string(runtimeBgfxGameViewSourceTexturePixels));
+            sceneViewPrimitiveMaterialPixels = primitiveMaterialSmoke && sceneViewRectValid
+                ? smokeScreenshotPrimitiveMaterialPixels(screenshotFile, sceneViewRectNormalized) : 0;
+            if (vulkanSceneViewOnlySmoke)
+                std::cout << "[editor-vulkan-scene-view] rectValid=" << sceneViewRectValid
+                    << " rect=" << sceneViewRectNormalized[0] << ',' << sceneViewRectNormalized[1] << ','
+                    << sceneViewRectNormalized[2] << ',' << sceneViewRectNormalized[3]
+                    << " frames=" << sceneViewFrames << " meshSubmissions=" << sceneTarget.meshSubmissions()
+                    << " frameMeshSubmissions=" << sceneTarget.frameMeshSubmissions()
+                    << " frameDiagnostics=" << sceneTarget.frameMeshDiagnostics()
+                    << " yellowPixels=" << sceneViewPrimitiveMaterialPixels << '\n';
+            if (primitiveMaterialSmoke)
+            {
+                if (sceneViewPrimitiveMaterialPixels < 128)
+                    throw std::runtime_error("Visible built-in Cube did not produce enough unique yellow material pixels in Scene View: "
+                        + std::to_string(sceneViewPrimitiveMaterialPixels));
+                std::array<wchar_t, 32768> outputPath{};
+                const auto outputLength = GetEnvironmentVariableW(L"ASTRO_EDITOR_SCREENSHOT_OUTPUT",
+                    outputPath.data(), static_cast<DWORD>(outputPath.size()));
+                if (outputLength == 0 || outputLength >= outputPath.size())
+                    throw std::runtime_error("Primitive material screenshot requires ASTRO_EDITOR_SCREENSHOT_OUTPUT");
+                const std::filesystem::path outputFile(outputPath.data());
+                std::filesystem::create_directories(outputFile.parent_path());
+                std::filesystem::copy_file(screenshotFile, outputFile,
+                    std::filesystem::copy_options::overwrite_existing);
+                std::cout << "[editor] primitiveMaterialPixels=" << sceneViewPrimitiveMaterialPixels
+                    << " renderer=" << bgfx::getRendererName(bgfx::getRendererType())
+                    << " screenshot=" << outputFile.string() << '\n';
+            }
+            if (runtimeBgfxGameViewSmoke || runtimeBgfxGameViewTextureSmoke || runtimeBgfxDirectionalLightSmoke)
+            {
+                std::array<wchar_t, 32768> outputPath{};
+                const auto outputLength = GetEnvironmentVariableW(L"ASTRO_EDITOR_SCREENSHOT_OUTPUT",
+                    outputPath.data(), static_cast<DWORD>(outputPath.size()));
+                if (outputLength == 0 || outputLength >= outputPath.size())
+                    throw std::runtime_error("Runtime BGFX Game View smoke requires ASTRO_EDITOR_SCREENSHOT_OUTPUT");
+                const std::filesystem::path outputFile(outputPath.data());
+                std::filesystem::create_directories(outputFile.parent_path());
+                std::filesystem::copy_file(screenshotFile, outputFile,
+                    std::filesystem::copy_options::overwrite_existing);
+                std::cout << "[editor] runtimeBgfxGameViewScreenshot=" << outputFile.string() << '\n';
+            }
+            sceneViewBlendPixels = sceneViewRectValid
+                ? smokeScreenshotSceneViewBlendPixels(screenshotFile, sceneViewRectNormalized) : 0;
+            sceneViewMaskPixels = (alphaMaskBoundaryCase >= 0 || maskMipSmoke) && sceneViewRectValid
+                ? smokeScreenshotSceneViewMagentaPixels(screenshotFile, sceneViewRectNormalized) : 0;
+            if (maskMipPattern == SmokeMaskMipPattern::CutoffTransitionRamp && sceneViewRectValid)
+                sceneViewAlphaSpatialCounts = smokeScreenshotSceneViewAlphaSpatialCounts(
+                    screenshotFile, sceneViewRectNormalized);
+            if (!runtimeBgfxGameViewSmoke && !runtimeBgfxGameViewTextureSmoke
+                && !runtimeBgfxDirectionalLightSmoke && sceneViewWhitePixels < 32)
                 throw std::runtime_error("Editor Scene View visual smoke found too few white mesh pixels in the rendered viewport: "
                     + std::to_string(sceneViewWhitePixels));
+            if (!runtimeBgfxGameViewSmoke && !runtimeBgfxGameViewTextureSmoke
+                && !runtimeBgfxDirectionalLightSmoke && sceneViewBaseColorPixels < 32)
+                throw std::runtime_error("Editor Scene View visual smoke found too few base-color texture pixels: "
+                    + std::to_string(sceneViewBaseColorPixels));
+            if (!runtimeBgfxDirectionalLightSmoke
+                && (sceneTarget.frameAlphaModeSubmissions(astro::assets::MaterialAlphaMode::Opaque) == 0
+                || sceneTarget.frameAlphaModeSubmissions(astro::assets::MaterialAlphaMode::Mask) == 0
+                || sceneTarget.frameAlphaModeSubmissions(astro::assets::MaterialAlphaMode::Blend) == 0))
+                throw std::runtime_error("Editor Scene View alpha smoke did not submit all OPAQUE/MASK/BLEND queues");
+            if (!runtimeBgfxGameViewTextureSmoke && !runtimeBgfxGameViewSmoke
+                && !runtimeBgfxDirectionalLightSmoke
+                && (alphaMaskBoundaryCase < 0 || alphaMaskBoundaryCase == 0) && sceneViewBlendPixels < 32)
+                throw std::runtime_error("Editor Scene View alpha smoke did not capture the expected translucent cyan overlap: "
+                    + std::to_string(sceneViewBlendPixels) + " rect=" + std::to_string(sceneViewRectNormalized[0]) + ","
+                    + std::to_string(sceneViewRectNormalized[1]) + "-" + std::to_string(sceneViewRectNormalized[2]) + ","
+                    + std::to_string(sceneViewRectNormalized[3]) + " queues="
+                    + std::to_string(sceneTarget.frameAlphaModeSubmissions(astro::assets::MaterialAlphaMode::Opaque)) + "/"
+                    + std::to_string(sceneTarget.frameAlphaModeSubmissions(astro::assets::MaterialAlphaMode::Mask)) + "/"
+                    + std::to_string(sceneTarget.frameAlphaModeSubmissions(astro::assets::MaterialAlphaMode::Blend)));
+            if ((alphaMaskBoundaryCase == 0 && sceneViewMaskPixels >= 8)
+                || (alphaMaskBoundaryCase > 0 && sceneViewMaskPixels < 32))
+                throw std::runtime_error("Editor Scene View MASK cutoff pixel check failed for case "
+                    + std::to_string(alphaMaskBoundaryCase) + ": magentaPixels="
+                    + std::to_string(sceneViewMaskPixels));
+            if (maskMipSmoke && sceneTarget.frameMaskMipmappedTextureSubmissions() == 0)
+                throw std::runtime_error("Editor Scene View MASK mip coverage smoke submitted no mipmapped MASK texture");
+            const auto sampledSceneViewPixels = sceneViewAlphaSpatialCounts.totalSamples();
+            const auto maskCoverage = sampledSceneViewPixels == 0 ? 0.0
+                : static_cast<double>(sceneViewMaskPixels) / static_cast<double>(sampledSceneViewPixels);
+            const auto blendCoverage = sampledSceneViewPixels == 0 ? 0.0
+                : static_cast<double>(sceneViewBlendPixels) / static_cast<double>(sampledSceneViewPixels);
+            const bool cutoffTransitionRamp = maskMipPattern == SmokeMaskMipPattern::CutoffTransitionRamp;
+            const bool maskMipPixelRangeFailed = cutoffTransitionRamp
+                ? (maskCoverage < 0.0005 || maskCoverage > 0.05 || blendCoverage < 0.0005)
+                : (sceneViewMaskPixels < 100 || sceneViewMaskPixels > 650);
+            if (maskMipSmoke && alphaMaskBoundaryCase < 0 && maskMipPixelRangeFailed)
+                throw std::runtime_error("Editor Scene View MASK mip coverage smoke failed for UV scale "
+                    + std::to_string(maskMipUvScale) + ": magentaPixels=" + std::to_string(sceneViewMaskPixels)
+                    + ", maskMipSubmissions="
+                    + std::to_string(sceneTarget.frameMaskMipmappedTextureSubmissions())
+                    + ", spatialBands=" + sceneViewAlphaSpatialCounts.describe());
+            if (cutoffTransitionRamp
+                && !sceneViewAlphaSpatialCounts.hasAlternatingMaskAndBlendRegions())
+                throw std::runtime_error("Editor Scene View MASK transition ramp did not produce alternating spatial mask/blend regions: "
+                    + sceneViewAlphaSpatialCounts.describe());
+            if (!runtimeBgfxDirectionalLightSmoke && sceneTarget.frameTexturedMeshSubmissions() < 2)
+                throw std::runtime_error("Editor Scene View smoke did not render both the project override and glTF source material");
+            constexpr std::uint32_t expectedSourceSamplerFlags = BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_CLAMP
+                | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT;
+            constexpr std::uint32_t expectedProjectSamplerFlags = BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_MAG_POINT;
+            if (!runtimeBgfxDirectionalLightSmoke && (sceneTarget.frameSourceSamplerSubmissions() == 0
+                || sceneTarget.frameTextureTransformSubmissions() == 0
+                || sceneTarget.lastSourceSamplerFlags() != expectedSourceSamplerFlags
+                || sceneTarget.frameProjectSamplerSubmissions() == 0
+                || sceneTarget.frameProjectTransformSubmissions() == 0
+                || (!maskMipSmoke && sceneTarget.lastProjectSamplerFlags() != expectedProjectSamplerFlags)
+                || sceneTarget.frameMipmappedTextureSubmissions() == 0
+                || (maskMipSmoke && sceneTarget.frameMaskMipmappedTextureSubmissions() == 0)
+                || sceneTarget.sharedTextureCacheHits() == 0))
+                throw std::runtime_error("Editor Scene View smoke did not apply sampler/mip/cache settings: mipmapped="
+                    + std::to_string(sceneTarget.frameMipmappedTextureSubmissions()) + ", cacheHits="
+                    + std::to_string(sceneTarget.sharedTextureCacheHits()) + ", sourceFlags="
+                    + std::to_string(sceneTarget.lastSourceSamplerFlags()) + ", projectFlags="
+                    + std::to_string(sceneTarget.lastProjectSamplerFlags()));
 #endif
             if (!playSession.runtimeScene() || playSession.runtimeScene() == &scene)
                 throw std::runtime_error("Game View must render an isolated runtime Scene copy");
+#if defined(ASTRO_EDITOR_HAS_RUNTIME_BGFX_3D)
+            if (runtimeBgfxGameViewSmoke
+                && (playSession.runtimeScene() == runtimeBgfxGameViewAuthoringScene.operator->()
+                    || !gameTarget.runtimeBgfxAdapterUsed() || gameTarget.frameRuntimeBgfxSubmissions() != 1
+                    || gameTarget.runtimeBgfxCachedMeshCount() != 1))
+                throw std::runtime_error("Runtime BGFX Game View smoke did not render the Play copy through the adapter");
+            if (runtimeBgfxGameViewFallbackSmoke
+                && (gameTarget.runtimeBgfxAdapterUsed() || gameTarget.frameRuntimeBgfxSubmissions() != 0
+                    || gameTarget.frameTexturedMeshSubmissions() == 0))
+                throw std::runtime_error("Runtime BGFX Game View did not fall back to the Editor renderer for textured materials");
+            if (runtimeBgfxGameViewTextureSmoke
+                && (playSession.runtimeScene() == runtimeBgfxGameViewAuthoringScene.operator->()
+                    || !gameTarget.runtimeBgfxAdapterUsed() || gameTarget.frameRuntimeBgfxSubmissions() != 2
+                    || gameTarget.frameRuntimeBgfxTextureSubmissions() != 2
+                    || gameTarget.runtimeBgfxCachedTextureCount() != 2
+                    || runtimeBgfxGameViewTexturePixels < 64))
+                throw std::runtime_error("Runtime BGFX Game View did not submit the opaque project texture on its Play copy");
+#endif
 #if defined(ASTRO_EDITOR_HAS_PUZZLE_RUNTIME)
             if (!puzzleCampaignCatalogDrawn || !puzzleCampaignAuthoringDrawn
                 || !puzzleCampaignLinkDiagnosticsDrawn || !puzzleCampaignMissingLinkDrawn)
@@ -7267,14 +15607,234 @@ public:
 #endif
             stopPlaySession();
             sceneDialog = false;
+            if ((codexReviewSmoke || hierarchyReparentSmoke || hierarchyReparentManySmoke)
+                && sceneDirty && !saveCurrentScene())
+                throw std::runtime_error("Codex change review smoke could not persist its confirmed edit");
             if (undoShortcuts != 1 || redoShortcuts != 1 || saveShortcuts != 1 || openShortcuts != 1
                 || !openSceneFile(currentScenePath) || sceneDirty || !scene.find(1)
                 || scene.find(1)->name != "Edited Root Ω"
                 || !scene.spriteRenderer(1) || !smokeSpriteAsset || scene.spriteRenderer(1)->texture != *smokeSpriteAsset
                 || scene.scriptBehaviors(1).size() != 1
+                || (codexSpriteVisibilitySmoke && (!scene.spriteRenderer(codexChangeReviewSmokeEntity)
+                    || scene.spriteRenderer(codexChangeReviewSmokeEntity)->visible))
                 || scene.scriptBehaviors(1).front().managedTypeName != "Smoke.UnregisteredScript"
                 || scene.scriptBehaviors(1).front().enabled)
-                throw std::runtime_error("Scene persistence/shortcut smoke failed");
+            {
+                throw std::runtime_error(std::string("Scene persistence/shortcut smoke failed: shortcuts=")
+                    + std::to_string(undoShortcuts) + "," + std::to_string(redoShortcuts) + ","
+                    + std::to_string(saveShortcuts) + "," + std::to_string(openShortcuts) + " dirty="
+                    + std::to_string(sceneDirty) + " root=" + std::to_string(scene.find(1) != nullptr)
+                    + ":" + (scene.find(1) ? scene.find(1)->name : std::string{"missing"})
+                    + " sprite=" + std::to_string(scene.spriteRenderer(1) != nullptr)
+                    + " script=" + std::to_string(scene.scriptBehaviors(1).size()));
+            }
+            if (hierarchyReparentSmoke)
+            {
+                const auto* moved = scene.find(hierarchyReparentSmokeEntity);
+                const auto* transform = scene.transform(hierarchyReparentSmokeEntity);
+                const auto* descendant = scene.find(hierarchyReparentSmokeDescendant);
+                if (hierarchyReparentSmokePhase != 10 || !hierarchyReparentSmokeEntityDrop
+                    || !hierarchyReparentSmokeRootDrop || !hierarchyReparentSmokeUndoRedo
+                    || !moved || moved->parent || !transform
+                    || transform->id != hierarchyReparentSmokeTransformId
+                    || transform->value != hierarchyReparentSmokeLocal
+                    || !descendant || descendant->parent != hierarchyReparentSmokeEntity)
+                    throw std::runtime_error("Hierarchy drag/drop did not complete entity/root drops and save/reload: phase="
+                        + std::to_string(hierarchyReparentSmokePhase) + " entityDrop="
+                        + std::to_string(hierarchyReparentSmokeEntityDrop) + " rootDrop="
+                        + std::to_string(hierarchyReparentSmokeRootDrop) + " undoRedo="
+                        + std::to_string(hierarchyReparentSmokeUndoRedo) + " parent="
+                        + (moved && moved->parent ? std::to_string(*moved->parent) : std::string{"<root>"})
+                        + " transform=" + std::to_string(transform != nullptr) + ":"
+                        + std::to_string(transform ? transform->id : 0) + "/"
+                        + std::to_string(hierarchyReparentSmokeTransformId) + " local="
+                        + std::to_string(transform && transform->value == hierarchyReparentSmokeLocal)
+                        + " descendant=" + std::to_string(descendant != nullptr) + ":"
+                        + std::to_string(descendant && descendant->parent == hierarchyReparentSmokeEntity));
+            }
+            if (hierarchyReparentManySmoke)
+            {
+                const auto* source = scene.find(hierarchyReparentSmokeEntity);
+                const auto* sourceTransform = scene.transform(hierarchyReparentSmokeEntity);
+                const auto* peer = scene.find(hierarchyReparentManyPeer);
+                const auto* peerTransform = scene.transform(hierarchyReparentManyPeer);
+                const auto* descendant = scene.find(hierarchyReparentSmokeDescendant);
+                if (hierarchyReparentManySmokePhase != 15 || !hierarchyReparentManySelectionVerified
+                    || !hierarchyReparentManyDrop || !hierarchyReparentManyUndoRedo
+                    || !source || source->parent != hierarchyReparentSmokeTarget || !sourceTransform
+                    || sourceTransform->id != hierarchyReparentSmokeTransformId
+                    || sourceTransform->value != hierarchyReparentSmokeLocal
+                    || !peer || peer->parent != hierarchyReparentSmokeTarget || !peerTransform
+                    || peerTransform->id != hierarchyReparentManyPeerTransformId
+                    || peerTransform->value != hierarchyReparentManyPeerLocal
+                    || !descendant || descendant->parent != hierarchyReparentSmokeEntity)
+                    throw std::runtime_error("Hierarchy multi-reparent did not preserve its group through Undo/Redo and save/reload: phase="
+                        + std::to_string(hierarchyReparentManySmokePhase) + " selected="
+                        + std::to_string(hierarchyReparentManySelectionVerified) + " drop="
+                        + std::to_string(hierarchyReparentManyDrop) + " undoRedo="
+                        + std::to_string(hierarchyReparentManyUndoRedo) + " peer="
+                        + std::to_string(peer != nullptr) + ":"
+                        + (peer && peer->parent ? std::to_string(*peer->parent) : std::string{"<root>"}));
+            }
+            if (multiTransformInspectorSmoke)
+            {
+                const auto* first = scene.transform(multiTransformSmokePrimaryEntity);
+                const auto* second = scene.transform(multiTransformSmokeEntity);
+                if (multiTransformInspectorSmokePhase != 3 || !multiTransformSmokeApplied
+                    || !multiTransformSmokeUndoRedo || !multiTransformKeyboardDraftOnly
+                    || !multiTransformStaleDraftBlocked || !multiTransformSelectionDraftDiscarded
+                    || !multiTransformSelectionDiscardMessageShown || !first || !second
+                    || first->value.position.x != 12.5 || second->value.position.x != 12.5
+                    || first->value.position.y != multiTransformSmokeOriginals[0].position.y
+                    || second->value.position.y != multiTransformSmokeOriginals[1].position.y
+                    || first->value.rotationDegrees != multiTransformSmokeOriginals[0].rotationDegrees
+                    || second->value.rotationDegrees != multiTransformSmokeOriginals[1].rotationDegrees
+                    || first->value.scale != multiTransformSmokeOriginals[0].scale
+                    || second->value.scale != multiTransformSmokeOriginals[1].scale
+                    || first->id != multiTransformSmokeComponentIds[0]
+                    || second->id != multiTransformSmokeComponentIds[1])
+                    throw std::runtime_error(std::string("Multi-Transform Inspector did not persist the edited local field through scene save/reload: phase=")
+                        + std::to_string(multiTransformInspectorSmokePhase) + " applied="
+                        + std::to_string(multiTransformSmokeApplied) + " undoRedo="
+                        + std::to_string(multiTransformSmokeUndoRedo) + " keyboardDraftOnly="
+                        + std::to_string(multiTransformKeyboardDraftOnly) + " staleBlocked="
+                        + std::to_string(multiTransformStaleDraftBlocked) + " selectionDiscarded="
+                        + std::to_string(multiTransformSelectionDraftDiscarded) + " discardNotice="
+                        + std::to_string(multiTransformSelectionDiscardMessageShown) + " first="
+                        + (first ? std::to_string(first->value.position.x) + "," + std::to_string(first->value.position.y) : "missing")
+                        + " second=" + (second ? std::to_string(second->value.position.x) + "," + std::to_string(second->value.position.y) : "missing")
+                        + " ids=" + (first ? std::to_string(first->id) : "missing") + "/"
+                        + std::to_string(multiTransformSmokeComponentIds[0]) + ","
+                        + (second ? std::to_string(second->id) : "missing") + "/"
+                        + std::to_string(multiTransformSmokeComponentIds[1]));
+            }
+            if (codexPrimitiveCreationSmoke)
+            {
+                const auto* createdEntity = scene.find(codexChangeReviewSmokeEntity);
+                const auto* createdPrimitive = scene.primitiveRenderer(codexChangeReviewSmokeEntity);
+                if (!createdEntity || createdEntity->name != "AI primitive smoke Ω"
+                    || createdEntity->parent != codexPrimitiveReviewSmokeParent || !createdPrimitive
+                    || createdPrimitive->primitive != astro::scene::Primitive3D::Cube
+                    || createdPrimitive->visible)
+                    throw std::runtime_error("AI primitive review smoke did not persist the confirmed primitive: id="
+                        + std::to_string(codexChangeReviewSmokeEntity) + " found=" + std::to_string(createdEntity != nullptr)
+                        + " name=" + (createdEntity ? createdEntity->name : std::string{"<missing>"})
+                        + " parent=" + (createdEntity && createdEntity->parent
+                            ? std::to_string(*createdEntity->parent) : std::string{"<none>"})
+                        + " expectedParent=" + (codexPrimitiveReviewSmokeParent
+                            ? std::to_string(*codexPrimitiveReviewSmokeParent) : std::string{"<none>"})
+                        + " renderer=" + std::to_string(createdPrimitive != nullptr)
+                        + " visible=" + std::to_string(createdPrimitive ? createdPrimitive->visible : false));
+            }
+            if (codexCameraAdditionSmoke)
+            {
+                const auto* camera = scene.camera3D(codexChangeReviewSmokeEntity);
+                if (!codexCameraReviewSmokePreviewWasReadOnly || !camera || camera->active
+                    || camera->id != codexCameraReviewSmokeComponentId)
+                    throw std::runtime_error("AI Camera3D review smoke did not preserve the confirmed inactive component: entity="
+                        + std::to_string(codexChangeReviewSmokeEntity) + " found=" + std::to_string(camera != nullptr)
+                        + " previewReadOnly=" + std::to_string(codexCameraReviewSmokePreviewWasReadOnly)
+                        + " actualComponentId=" + std::to_string(camera ? camera->id : 0)
+                        + " expectedComponentId=" + std::to_string(codexCameraReviewSmokeComponentId));
+            }
+            if (codexCameraLensSmoke)
+            {
+                const auto* camera = scene.camera3D(codexChangeReviewSmokeEntity);
+                if (!camera || !aiChangeReviewPanelDrawn || !aiChangeReviewDiffShown
+                    || codexChangeReviewSmokePhase != 5
+                    || camera->id != codexCameraLensSmokeComponentId
+                    || !codexCameraLensSmokeWasActive || !camera->active
+                    || camera->verticalFovDegrees != 82.5 || camera->nearPlane != 0.25
+                    || camera->farPlane != 900.0)
+                    throw std::runtime_error("AI Camera3D lens review smoke did not persist the confirmed active-camera lens: entity="
+                        + std::to_string(codexChangeReviewSmokeEntity) + " found=" + std::to_string(camera != nullptr)
+                        + " componentId=" + std::to_string(camera ? camera->id : 0)
+                        + " expectedComponentId=" + std::to_string(codexCameraLensSmokeComponentId)
+                        + " active=" + std::to_string(camera ? camera->active : false)
+                        + " fov=" + std::to_string(camera ? camera->verticalFovDegrees : 0.0)
+                        + " near=" + std::to_string(camera ? camera->nearPlane : 0.0)
+                        + " far=" + std::to_string(camera ? camera->farPlane : 0.0));
+            }
+            if (codexCameraActivationSmoke)
+            {
+                const auto target = codexCameraSelectionSmokeTarget;
+                const auto previous = codexCameraSelectionSmokePrevious;
+                const auto* targetCamera = target ? scene.camera3D(*target) : nullptr;
+                const auto* previousCamera = previous ? scene.camera3D(*previous) : nullptr;
+                if (!aiChangeReviewPanelDrawn || !aiChangeReviewDiffShown || codexChangeReviewSmokePhase != 5
+                    || !target || !previous || scene.activeCamera3D() != target
+                    || !targetCamera || !targetCamera->active
+                    || targetCamera->id != codexCameraSelectionSmokeTargetComponentId
+                    || !previousCamera || previousCamera->active
+                    || previousCamera->id != codexCameraSelectionSmokePreviousComponentId)
+                    throw std::runtime_error("AI Camera3D activation review did not persist the confirmed selection");
+            }
+            if (codexCameraClearSmoke)
+            {
+                const auto previous = codexCameraSelectionSmokePrevious;
+                const auto* previousCamera = previous ? scene.camera3D(*previous) : nullptr;
+                if (!aiChangeReviewPanelDrawn || !aiChangeReviewDiffShown || codexChangeReviewSmokePhase != 5
+                    || !previous || codexCameraSelectionSmokeTarget || scene.activeCamera3D()
+                    || !previousCamera || previousCamera->active
+                    || previousCamera->id != codexCameraSelectionSmokePreviousComponentId)
+                    throw std::runtime_error("AI Camera3D clear review did not persist the explicit no-active-camera state");
+            }
+            if (codexTransformReviewSmoke)
+            {
+                const auto* transform = scene.transform(codexChangeReviewSmokeEntity);
+                if (!aiChangeReviewPanelDrawn || !aiChangeReviewDiffShown || codexChangeReviewSmokePhase != 5
+                    || !transform || transform->id != codexTransformReviewSmokeComponentId
+                    || transform->value != codexTransformReviewSmokeExpected
+                    || !scene.camera3D(codexChangeReviewSmokeEntity)
+                    || !codexTransformReviewSmokePreviewWasReadOnly)
+                    throw std::runtime_error("AI local Transform review did not persist the reviewed camera transform: panel="
+                        + std::to_string(aiChangeReviewPanelDrawn) + " diff=" + std::to_string(aiChangeReviewDiffShown)
+                        + " phase=" + std::to_string(codexChangeReviewSmokePhase) + " entity="
+                        + std::to_string(codexChangeReviewSmokeEntity) + " component="
+                        + std::to_string(transform ? transform->id : 0) + " expectedComponent="
+                        + std::to_string(codexTransformReviewSmokeComponentId) + " camera="
+                        + std::to_string(scene.camera3D(codexChangeReviewSmokeEntity) != nullptr)
+                        + " previewReadOnly=" + std::to_string(codexTransformReviewSmokePreviewWasReadOnly)
+                        + " position=" + (transform ? std::to_string(transform->value.position.x) + ","
+                            + std::to_string(transform->value.position.y) + "," + std::to_string(transform->value.position.z)
+                            : std::string{"<missing>"}) + " expected="
+                        + std::to_string(codexTransformReviewSmokeExpected.position.x) + ","
+                        + std::to_string(codexTransformReviewSmokeExpected.position.y) + ","
+                        + std::to_string(codexTransformReviewSmokeExpected.position.z));
+            }
+            if (codexReparentReviewSmoke)
+            {
+                const auto* moved = scene.find(codexReparentReviewSmokeEntity);
+                const auto* transform = scene.transform(codexReparentReviewSmokeEntity);
+                const auto* descendant = scene.find(codexReparentReviewSmokeDescendant);
+                if (!aiChangeReviewPanelDrawn || !aiChangeReviewDiffShown || codexChangeReviewSmokePhase != 5
+                    || codexReparentReviewSmokeEntity == 0 || codexReparentReviewSmokeParent == 0
+                    || !moved || moved->parent != codexReparentReviewSmokeParent
+                    || !transform || transform->id != codexReparentReviewSmokeComponentId
+                    || transform->value != codexReparentReviewSmokeLocal
+                    || !descendant || descendant->parent != codexReparentReviewSmokeEntity
+                    || !scene.camera3D(codexReparentReviewSmokeEntity)
+                    || !codexReparentReviewSmokePreviewWasReadOnly
+                    || !codexReparentReviewSmokeWorldPoseChanged)
+                    throw std::runtime_error("AI hierarchy parent review did not persist the confirmed subtree move: phase="
+                        + std::to_string(codexChangeReviewSmokePhase) + " entity="
+                        + std::to_string(codexReparentReviewSmokeEntity) + " parent="
+                        + (moved && moved->parent ? std::to_string(*moved->parent) : std::string{"<root>"})
+                        + " expectedParent=" + std::to_string(codexReparentReviewSmokeParent)
+                        + " previewReadOnly=" + std::to_string(codexReparentReviewSmokePreviewWasReadOnly)
+                        + " worldPoseChanged=" + std::to_string(codexReparentReviewSmokeWorldPoseChanged));
+            }
+            if (codexChangeReviewSmoke)
+            {
+                const auto* entity = scene.find(codexChangeReviewSmokeEntity);
+                if (!aiChangeReviewPanelDrawn || !aiChangeReviewDiffShown || codexChangeReviewSmokePhase != 5
+                    || !entity || entity->name != "AI preview smoke Ω")
+                    throw std::runtime_error("AI property review smoke did not persist its confirmed change: phase="
+                        + std::to_string(codexChangeReviewSmokePhase) + " diff=" + std::to_string(aiChangeReviewDiffShown)
+                        + " entity=" + std::to_string(codexChangeReviewSmokeEntity) + " found="
+                        + std::to_string(entity != nullptr) + " name="
+                        + (entity ? entity->name : std::string{"<missing>"}));
+            }
             if (!scene.prefabInstances().empty()) throw std::runtime_error("Empty prefab metadata smoke failed");
             const auto loadedPath = currentScenePath;
             const auto invalidScenePath = smokeDirectory / "invalid.astro-scene";
@@ -7286,6 +15846,41 @@ public:
         std::cout << "[editor] frames=" << frames << " docked=" << docked << " rendered=" << rendered
                   << " sceneViewFrames=" << sceneViewFrames << " gameViewFrames=" << gameViewFrames
                   << " undo=" << undoShortcuts << " redo=" << redoShortcuts << " save=" << saveShortcuts << '\n';
+        if (smoke)
+        {
+            if (windowGeometrySmoke && !windowGeometrySmokePassed_)
+                throw std::runtime_error("SDL window geometry integration smoke did not complete");
+            if (monitorDpiSmoke && !monitorTransitionSmokePassed_)
+                throw std::runtime_error("Mixed-DPI SDL window transition smoke did not complete");
+            int logicalWidth = 0, logicalHeight = 0, pixelWidth = 0, pixelHeight = 0;
+            SDL_GetWindowSize(window, &logicalWidth, &logicalHeight);
+            SDL_GetWindowSizeInPixels(window, &pixelWidth, &pixelHeight);
+            const auto displayScale = SDL_GetWindowDisplayScale(window);
+            const auto expectedScale = astro::editor::EditorUiScalePolicy::normalizeScale(displayScale);
+            SDL_Rect workArea{};
+            if (!currentDisplayWorkArea(workArea) || logicalWidth > workArea.w || logicalHeight > workArea.h)
+                throw std::runtime_error("Editor smoke found the window exceeds its display usable work area");
+            workspaceLayout_ = astro::editor::EditorWorkspaceLayoutPolicy::calculate(
+                workArea.w, workArea.h, logicalWidth, logicalHeight);
+            const auto& style = ImGui::GetStyle();
+            const auto expectedPaddingX = std::trunc(uiScalePolicy_->baseStyle().WindowPadding.x * expectedScale);
+            if (std::abs(uiScalePolicy_->appliedScale() - expectedScale) >= 0.001f
+                || std::abs(style.FontScaleMain - expectedScale) >= 0.001f
+                || std::abs(style.WindowPadding.x - expectedPaddingX) >= 0.001f)
+                throw std::runtime_error("Editor smoke found a mismatch between SDL display scale and applied ImGui scaling");
+            std::cout << "[editor] windowLogical=" << logicalWidth << 'x' << logicalHeight
+                      << " windowPixels=" << pixelWidth << 'x' << pixelHeight
+                      << " pixelDensity=" << SDL_GetWindowPixelDensity(window)
+                      << " displayScale=" << displayScale
+                      << " uiScale=" << uiScalePolicy_->appliedScale()
+                      << " fontScale=" << style.FontScaleMain
+                      << " windowPaddingX=" << style.WindowPadding.x
+                      << " workArea=" << workArea.w << 'x' << workArea.h
+                      << " workspaceMode=" << (workspaceLayout_.compact ? "compact" : "wide")
+                      << " windowGeometryEvent=" << (windowGeometrySmokePassed_ ? "passed" : "not-requested")
+                      << " mixedDpiTransition=" << (monitorTransitionSmokePassed_ ? "passed" : "not-requested")
+                      << " highPixelDensityRequested=" << requestedHighPixelDensity_ << '\n';
+        }
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
         if (smoke)
             std::cout << "[editor] scene3dSubmissions=" << sceneTarget.meshSubmissions()
@@ -7296,15 +15891,114 @@ public:
                       << " cameraFocusX=" << sceneTarget.cameraFocus().x
                       << " lastFrameMeshSubmissions=" << sceneTarget.frameMeshSubmissions()
                       << " lastFrameMeshDiagnostics=" << sceneTarget.frameMeshDiagnostics()
+                      << " lastFrameTexturedMeshes=" << sceneTarget.frameTexturedMeshSubmissions()
+                      << " lastFramePrimitiveMaterialSubmissions=" << sceneTarget.framePrimitiveMaterialSubmissions()
+                      << " gameViewPrimitiveMaterialSubmissions=" << gameTarget.framePrimitiveMaterialSubmissions()
+#if defined(ASTRO_EDITOR_HAS_RUNTIME_BGFX_3D)
+                       << " runtimeBgfxGameViewAdapter=" << gameTarget.runtimeBgfxAdapterUsed()
+                       << " runtimeBgfxGameViewSubmissions=" << gameTarget.frameRuntimeBgfxSubmissions()
+                       << " runtimeBgfxGameViewCache=" << gameTarget.runtimeBgfxCachedMeshCount()
+                       << " runtimeBgfxGameViewTextureSubmissions=" << gameTarget.frameRuntimeBgfxTextureSubmissions()
+                       << " runtimeBgfxGameViewTextureCache=" << gameTarget.runtimeBgfxCachedTextureCount()
+                       << " runtimeBgfxGameViewMipTextureCache=" << gameTarget.runtimeBgfxCachedMipTextureCount()
+                       << " runtimeBgfxGameViewMipFilter=" << (runtimeBgfxGameViewTextureSmoke
+                            ? runtimeBgfxSmokeMipFilter() : 0)
+                       << " runtimeBgfxGameViewTexturePixels=" << runtimeBgfxGameViewTexturePixels
+                       << " runtimeBgfxGameViewSourceTexturePixels=" << runtimeBgfxGameViewSourceTexturePixels
+                       << " runtimeBgfxDirectionalLightPixels=" << runtimeBgfxDirectionalLightPixels
+                       << " runtimeBgfxPointLightPixels=" << runtimeBgfxPointLightPixels
+                       << " sceneViewDirectionalLightPixels=" << sceneViewDirectionalLightPixels
+                       << " sceneViewPointLightPixels=" << sceneViewPointLightPixels
+                       << " pointLightInspectorControls=" << (pointLightInspectorState.panelDrawn
+                            && pointLightInspectorState.colorControlShown
+                            && pointLightInspectorState.intensityControlShown
+                            && pointLightInspectorState.rangeControlShown
+                            && pointLightInspectorState.enabledControlShown
+                            && pointLightInspectorState.applyButtonShown
+                            && pointLightInspectorState.removeButtonShown)
+                       << " pointLightInspectorCommands=" << pointLightInspectorState.smokeCommandsPassed
+                       << " directionalLightInspectorControls=" << (directionalLightInspectorState.panelDrawn
+                            && directionalLightInspectorState.colorControlShown
+                            && directionalLightInspectorState.intensityControlShown
+                            && directionalLightInspectorState.enabledControlShown
+                            && directionalLightInspectorState.applyButtonShown
+                            && directionalLightInspectorState.removeButtonShown)
+                       << " directionalLightInspectorCommands=" << directionalLightInspectorState.smokeCommandsPassed
+                       << " sceneViewFrontLitPixels=" << sceneViewFrontLitPixels
+                       << " sceneViewBackLitPixels=" << sceneViewBackLitPixels
+                       << " runtimeBgfxGameViewFallbackTexturedMeshes=" << gameTarget.frameTexturedMeshSubmissions()
+#endif
+                      << " mipmappedTextureSubmissions=" << sceneTarget.frameMipmappedTextureSubmissions()
+                      << " maskMipmappedTextureSubmissions=" << sceneTarget.frameMaskMipmappedTextureSubmissions()
+                      << " maskMipPattern=" << static_cast<int>(maskMipPattern)
+                      << " maskMipCutoff=" << (maskMipSmoke ? maskMipAlphaCutoff : 0.0f)
+                      << " maskMipAlphaByte=" << (maskMipPattern == SmokeMaskMipPattern::CutoffBelow ? 127
+                          : maskMipPattern == SmokeMaskMipPattern::CutoffFirstPassing ? 128
+                          : maskMipPattern == SmokeMaskMipPattern::CutoffAbove ? 129 : 0)
+                      << " sharedTextureCacheHits=" << sceneTarget.sharedTextureCacheHits()
+                      << " lastFrameMaterialFallbacks=" << sceneTarget.frameMaterialFallbacks()
                       << " missingAssetDiagnostic="
                       << (sceneTarget.meshError().find("AssetId is not registered") != std::string::npos)
-                      << " sceneViewWhitePixels=" << sceneViewWhitePixels << '\n';
+                      << " baseColorFallbackDiagnostic="
+                      << (sceneTarget.meshError().find("using vertex-color fallback") != std::string::npos)
+                      << " sceneViewWhitePixels=" << sceneViewWhitePixels
+                      << " sceneViewBaseColorPixels=" << sceneViewBaseColorPixels
+                      << " sceneViewPrimitiveMaterialPixels=" << sceneViewPrimitiveMaterialPixels
+                      << " projectModelPreviewVisiblePixels=" << projectModelPreviewVisiblePixels
+                      << " sceneViewBlendPixels=" << sceneViewBlendPixels
+                      << " sceneViewMaskBoundaryPixels=" << sceneViewMaskPixels
+                      << " alphaOpaque=" << sceneTarget.frameAlphaModeSubmissions(astro::assets::MaterialAlphaMode::Opaque)
+                      << " alphaMask=" << sceneTarget.frameAlphaModeSubmissions(astro::assets::MaterialAlphaMode::Mask)
+                      << " alphaBlend=" << sceneTarget.frameAlphaModeSubmissions(astro::assets::MaterialAlphaMode::Blend)
+                      << " alphaSpatialBands="
+                      << (maskMipPattern == SmokeMaskMipPattern::CutoffTransitionRamp
+                          ? sceneViewAlphaSpatialCounts.describe() : "not-applicable") << '\n';
 #endif
 #if defined(ASTRO_EDITOR_METADATA_VALIDATOR_DLL) && defined(ASTRO_EDITOR_DOTNET_ROOT)
         if (smoke)
             std::cout << "[editor] syntheticMetadataReportBytes=" << csharpMetadataValidationOutput.size()
                       << " scrollable=" << csharpMetadataReportScrollableInSmoke
                       << " maxTextDrawMs=" << csharpMetadataReportMaxDrawMs << '\n';
+#endif
+        bool primitiveRenderSmokePassed = true;
+#if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+        if (smoke)
+        {
+            Scene primitiveScene(799, "Built-in primitive render smoke");
+            constexpr std::array kinds{astro::scene::Primitive3D::Cube, astro::scene::Primitive3D::Plane,
+                astro::scene::Primitive3D::Sphere, astro::scene::Primitive3D::Cylinder};
+            for (std::size_t index = 0; index < kinds.size(); ++index)
+            {
+                const auto entity = primitiveScene.createEntity("Primitive " + std::to_string(index));
+                if (!entity || !primitiveScene.setPrimitiveRenderer(entity.value(), kinds[index]))
+                    throw std::runtime_error("Primitive render smoke could not construct its test scene");
+                astro::scene::Transform transform;
+                transform.position.x = static_cast<double>(index) * 1.25;
+                if (!primitiveScene.setTransform(entity.value(), transform))
+                    throw std::runtime_error("Primitive render smoke could not position its test scene");
+            }
+            bgfx::TextureHandle primitiveTexture = BGFX_INVALID_HANDLE;
+            std::string primitiveError;
+            SceneViewTarget::Timings primitiveTimings;
+            primitiveRenderSmokePassed = sceneTarget.render(primitiveScene, &*assetRegistry, spriteTextures,
+                320, 240, program, sampler, outputMode, layout, primitiveTexture, primitiveError,
+                &primitiveTimings)
+                && sceneTarget.frameMeshSubmissions() == kinds.size()
+                && sceneTarget.frameMeshDiagnostics() == 0;
+            if (!primitiveRenderSmokePassed)
+                std::cerr << "[editor] primitiveRenderSmoke=0 submissions="
+                    << sceneTarget.frameMeshSubmissions() << " diagnostics="
+                    << sceneTarget.frameMeshDiagnostics() << " error=" << primitiveError << '\n';
+            else std::cout << "[editor] primitiveRenderSmoke=1 submissions="
+                << sceneTarget.frameMeshSubmissions() << " diagnostics=0\n";
+            // Restore the main Scene View cache and its existing smoke assertions.
+            bgfx::TextureHandle restoredTexture = BGFX_INVALID_HANDLE;
+            std::string restoreError;
+            if (!sceneTarget.render(runtimeBgfxDirectionalLightSmoke && directionalLightSmokeScene
+                    ? *directionalLightSmokeScene : scene, &*assetRegistry, spriteTextures, 320, 240,
+                    program, sampler, outputMode, layout, restoredTexture, restoreError))
+                throw std::runtime_error("Could not restore the main Scene View after primitive smoke: " + restoreError);
+        }
 #endif
         // Smoke/benchmark own this temporary project and remove only its paths.
         if (smoke || benchmark)
@@ -7330,19 +16024,126 @@ public:
             std::filesystem::remove(smokeScreenshot, ignored);
             std::filesystem::remove(smokeDirectory);
         }
-        return smoke && !((inspectCopyDialog ? frames >= 140 : frames == 140)
+        if (rendererBackendSmoke)
+        {
+            const auto actualRenderer = bgfx::getRendererType();
+            const bool expectedRenderer = expectVulkanRenderer
+                ? actualRenderer == bgfx::RendererType::Vulkan
+                : actualRenderer == bgfx::RendererType::Direct3D11;
+            std::cout << "[editor-renderer-smoke] requested=" << (expectVulkanRenderer ? "vulkan" : "default")
+                << " actual=" << bgfx::getRendererName(actualRenderer)
+                << " drawCalls=" << bgfx::getStats()->numDraw << '\n';
+            return expectedRenderer && bgfx::getStats()->numDraw > 0 && frames == 4 ? 0 : 1;
+        }
+        const int smokeCompletionFrame = lightInspectorPointerSmoke ? 260 : inspectCopyDialog ? 140 : 140;
+        return smoke && !(frames == smokeCompletionFrame
             && docked && rendered && sceneViewFrames > 0 && gameViewFrames > 0
             && activeProject == "Smoke project Ω"
-            && scene.entities().size() == 3 && scene.find(1)->name == "Edited Root Ω"
+            && scene.entities().size() == static_cast<std::size_t>(gameViewCameraDiagnosticCase == 0 ? 8
+                : gameViewCameraDiagnosticCase == 3 ? 10 : 9) + (codexPrimitiveCreationSmoke ? 1u : 0u)
+                    + (codexReparentReviewSmoke ? 1u : 0u)
+                    + (hierarchyReparentSmoke ? 1u : 0u)
+                    + (hierarchyReparentManySmoke ? 3u : 0u)
+                    + (multiTransformInspectorSmoke ? 1u : 0u)
+            && scene.find(1)->name == "Edited Root Ω"
+            && (!codexChangeReviewSmoke || (aiChangeReviewPanelDrawn && aiChangeReviewDiffShown
+                && codexChangeReviewSmokePhase == 5 && codexChangeReviewSmokeEntity != 0
+                && scene.find(codexChangeReviewSmokeEntity)
+                && scene.find(codexChangeReviewSmokeEntity)->name == "AI preview smoke Ω"))
+            && (!codexSpriteVisibilitySmoke || (aiChangeReviewPanelDrawn && aiChangeReviewDiffShown
+                && codexChangeReviewSmokePhase == 5 && codexChangeReviewSmokeEntity != 0
+                && scene.spriteRenderer(codexChangeReviewSmokeEntity)
+                && !scene.spriteRenderer(codexChangeReviewSmokeEntity)->visible
+                && scene.spriteRenderer(codexChangeReviewSmokeEntity)->texture == codexSpriteReviewSmokeTexture))
+            && (!codexPrimitiveCreationSmoke || (aiChangeReviewPanelDrawn && aiChangeReviewDiffShown
+                && codexChangeReviewSmokePhase == 5 && codexChangeReviewSmokeEntity != 0
+                && scene.find(codexChangeReviewSmokeEntity)
+                && scene.find(codexChangeReviewSmokeEntity)->parent == codexPrimitiveReviewSmokeParent
+                && scene.primitiveRenderer(codexChangeReviewSmokeEntity)
+                && scene.primitiveRenderer(codexChangeReviewSmokeEntity)->primitive == astro::scene::Primitive3D::Cube
+                && !scene.primitiveRenderer(codexChangeReviewSmokeEntity)->visible))
+            && (!codexCameraAdditionSmoke || (aiChangeReviewPanelDrawn && aiChangeReviewDiffShown
+                && codexChangeReviewSmokePhase == 5 && codexCameraReviewSmokePreviewWasReadOnly
+                && codexChangeReviewSmokeEntity == primitiveInspectorSmokeEntity
+                && codexCameraReviewSmokeComponentId != 0
+                && scene.camera3D(codexChangeReviewSmokeEntity)
+                && scene.camera3D(codexChangeReviewSmokeEntity)->id == codexCameraReviewSmokeComponentId
+                && !scene.camera3D(codexChangeReviewSmokeEntity)->active))
+            && (!codexCameraLensSmoke || (aiChangeReviewPanelDrawn && aiChangeReviewDiffShown
+                && codexChangeReviewSmokePhase == 5 && codexCameraLensSmokeComponentId != 0
+                && codexCameraLensSmokeWasActive && scene.camera3D(codexChangeReviewSmokeEntity)
+                && scene.camera3D(codexChangeReviewSmokeEntity)->id == codexCameraLensSmokeComponentId
+                && scene.camera3D(codexChangeReviewSmokeEntity)->active
+                && scene.camera3D(codexChangeReviewSmokeEntity)->verticalFovDegrees == 82.5
+                && scene.camera3D(codexChangeReviewSmokeEntity)->nearPlane == 0.25
+                && scene.camera3D(codexChangeReviewSmokeEntity)->farPlane == 900.0))
+            && (!codexCameraActivationSmoke || (aiChangeReviewPanelDrawn && aiChangeReviewDiffShown
+                && codexChangeReviewSmokePhase == 5 && codexCameraSelectionSmokePrevious
+                && codexCameraSelectionSmokeTarget
+                && scene.activeCamera3D() == codexCameraSelectionSmokeTarget
+                && scene.camera3D(*codexCameraSelectionSmokeTarget)
+                && scene.camera3D(*codexCameraSelectionSmokeTarget)->active
+                && scene.camera3D(*codexCameraSelectionSmokeTarget)->id == codexCameraSelectionSmokeTargetComponentId
+                && scene.camera3D(*codexCameraSelectionSmokePrevious)
+                && !scene.camera3D(*codexCameraSelectionSmokePrevious)->active
+                && scene.camera3D(*codexCameraSelectionSmokePrevious)->id
+                    == codexCameraSelectionSmokePreviousComponentId))
+            && (!codexCameraClearSmoke || (aiChangeReviewPanelDrawn && aiChangeReviewDiffShown
+                && codexChangeReviewSmokePhase == 5 && codexCameraSelectionSmokePrevious
+                && !codexCameraSelectionSmokeTarget && !scene.activeCamera3D()
+                && scene.camera3D(*codexCameraSelectionSmokePrevious)
+                && !scene.camera3D(*codexCameraSelectionSmokePrevious)->active
+                && scene.camera3D(*codexCameraSelectionSmokePrevious)->id
+                    == codexCameraSelectionSmokePreviousComponentId))
+            && (!codexTransformReviewSmoke || (aiChangeReviewPanelDrawn && aiChangeReviewDiffShown
+                && codexChangeReviewSmokePhase == 5 && codexTransformReviewSmokeComponentId != 0
+                && scene.transform(codexChangeReviewSmokeEntity)
+                && scene.transform(codexChangeReviewSmokeEntity)->id == codexTransformReviewSmokeComponentId
+                && scene.transform(codexChangeReviewSmokeEntity)->value == codexTransformReviewSmokeExpected))
 #if defined(ASTRO_EDITOR_HAS_RENDER3D_SCENE_VIEW)
+            && primitiveRenderSmokePassed
             && sceneTarget.meshSubmissions() > 0
-            && sceneTarget.frameMeshSubmissions() == 2
-            && sceneTarget.frameMeshDiagnostics() == 1
-            && sceneTarget.meshError().find("AssetId is not registered") != std::string::npos
-            && std::abs(sceneTarget.lastMeshOrigin().x - 5.25f) < 0.001f
+            && sceneTarget.frameMeshSubmissions() == (runtimeBgfxDirectionalLightSmoke ? 2u
+                : primitiveMaterialSmoke ? 7u : 6u)
+            && sceneTarget.frameTexturedMeshSubmissions() == (runtimeBgfxDirectionalLightSmoke ? 0u
+                : primitiveMaterialSmoke ? 5u : 4u)
+            && (!primitiveMaterialSmoke || (sceneTarget.framePrimitiveMaterialSubmissions() > 0
+                && (vulkanSceneViewOnlySmoke || (gameTarget.frameCameraDriven()
+                    && gameTarget.framePrimitiveMaterialSubmissions() > 0))))
+            && sceneTarget.frameMaterialFallbacks() == (runtimeBgfxDirectionalLightSmoke ? 0u : 2u)
+            && sceneTarget.frameMeshDiagnostics() == static_cast<std::uint32_t>(
+                runtimeBgfxDirectionalLightSmoke ? 0 : gameViewCameraDiagnosticCase == 3 ? 4 : 3)
+            && (runtimeBgfxDirectionalLightSmoke || sceneTarget.meshError().find("AssetId is not registered") != std::string::npos)
+            && (runtimeBgfxDirectionalLightSmoke || sceneTarget.meshError().find("using vertex-color fallback") != std::string::npos)
+            && (runtimeBgfxDirectionalLightSmoke || sceneTarget.meshError().find("Material override cannot be resolved") != std::string::npos)
+            && (runtimeBgfxDirectionalLightSmoke || std::abs(sceneTarget.lastMeshOrigin().x - 0.25f) < 0.001f)
+            && (runtimeBgfxDirectionalLightSmoke || std::abs(sceneTarget.lastMeshOrigin().z - 0.5f) < 0.001f)
             && sceneTarget.frameAllApplied() && sceneTarget.cameraDistance() < 1000.0f
-            && std::abs(sceneTarget.cameraFocus().x - 4.0f) < 0.01f
-            && sceneViewWhitePixels >= 32
+            && (runtimeBgfxDirectionalLightSmoke ? std::abs(sceneTarget.cameraFocus().x) < 0.01f
+                : std::abs(sceneTarget.cameraFocus().x + 0.25f) < 0.01f)
+            && (runtimeBgfxGameViewTextureSmoke || runtimeBgfxDirectionalLightSmoke || sceneViewWhitePixels >= 32)
+            && (runtimeBgfxGameViewTextureSmoke || runtimeBgfxDirectionalLightSmoke || sceneViewBaseColorPixels >= 32)
+#endif
+#if defined(ASTRO_EDITOR_HAS_RUNTIME_BGFX_3D)
+            && (!runtimeBgfxGameViewSmoke || (gameTarget.runtimeBgfxAdapterUsed()
+                && gameTarget.frameRuntimeBgfxSubmissions() == 1
+                && gameTarget.runtimeBgfxCachedMeshCount() == 1))
+            && (!runtimeBgfxGameViewFallbackSmoke || (!gameTarget.runtimeBgfxAdapterUsed()
+                && gameTarget.frameRuntimeBgfxSubmissions() == 0
+                && gameTarget.frameTexturedMeshSubmissions() > 0))
+            && (!runtimeBgfxGameViewTextureSmoke || (gameTarget.runtimeBgfxAdapterUsed()
+                && gameTarget.frameRuntimeBgfxSubmissions() == 2
+                && gameTarget.frameRuntimeBgfxTextureSubmissions() == 2
+                && gameTarget.runtimeBgfxCachedTextureCount() == 2
+                && gameTarget.runtimeBgfxCachedMipTextureCount() == 1
+                && runtimeBgfxGameViewTexturePixels >= 64
+                && runtimeBgfxGameViewSourceTexturePixels >= 64))
+            && (!runtimeBgfxDirectionalLightSmoke || (gameTarget.runtimeBgfxAdapterUsed()
+                && gameTarget.frameRuntimeBgfxSubmissions() == 1
+                && (directionalLightNoLightSmoke || (runtimeBgfxPointLightSmoke
+                    ? runtimeBgfxPointLightPixels >= 16 && sceneViewPointLightPixels >= 16
+                    : runtimeBgfxDirectionalLightPixels >= 16 && sceneViewDirectionalLightPixels >= 16
+                        && sceneViewFrontLitPixels >= 16 && sceneViewBackLitPixels == 0))))
 #endif
             && undoShortcuts == 1 && redoShortcuts == 1 && saveShortcuts == 1 && openShortcuts == 1
             && visualLogicWindowDrawn && logicDebugger.state() == astro::logic::DebugState::Completed
@@ -7358,30 +16159,204 @@ public:
 #if defined(ASTRO_EDITOR_METADATA_VALIDATOR_DLL) && defined(ASTRO_EDITOR_DOTNET_ROOT)
             && csharpMetadataValidationPanelDrawn
 #endif
-            && csharpBuildReport.freshness == astro::assets::ScriptBuildFreshness::Missing) ? 1 : 0;
+            && csharpBuildReport.freshness == astro::assets::ScriptBuildFreshness::Missing
+            && bgfx::getRendererType() == (expectVulkanRenderer
+                ? bgfx::RendererType::Vulkan : bgfx::RendererType::Direct3D11)) ? 1 : 0;
     }
 };
 }
 int main(int argc, char** argv)
 {
-    if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--smoke"
+    const std::string_view arg = argc == 2 ? argv[1] : std::string_view{};
+    const bool rendererBackendSmoke = arg == "--smoke-bgfx-backend" || arg == "--smoke-bgfx-vulkan";
+    const bool vulkanSceneViewOnlySmoke = arg == "--smoke-bgfx-vulkan-scene-view-material";
+    const bool runtimeBgfxVulkanGameViewTextureSmoke = arg == "--smoke-runtime-bgfx-vulkan-game-view-texture";
+    const bool expectVulkanRenderer = arg == "--smoke-bgfx-vulkan"
+        || vulkanSceneViewOnlySmoke || runtimeBgfxVulkanGameViewTextureSmoke;
+    const bool mipBoundaryBelow = arg == "--smoke-mask-mips-boundary-below-near"
+        || arg == "--smoke-mask-mips-boundary-below-far";
+    const bool mipBoundaryFirstPassing = arg == "--smoke-mask-mips-boundary-first-pass-near"
+        || arg == "--smoke-mask-mips-boundary-first-pass-far";
+    const bool mipBoundaryAbove = arg == "--smoke-mask-mips-boundary-above-near"
+        || arg == "--smoke-mask-mips-boundary-above-far";
+    const bool mipBoundaryNear = arg == "--smoke-mask-mips-boundary-below-near"
+        || arg == "--smoke-mask-mips-boundary-first-pass-near"
+        || arg == "--smoke-mask-mips-boundary-above-near";
+    const bool mipBoundaryFar = arg == "--smoke-mask-mips-boundary-below-far"
+        || arg == "--smoke-mask-mips-boundary-first-pass-far"
+        || arg == "--smoke-mask-mips-boundary-above-far";
+    const int alphaMaskBoundaryCase = arg == "--smoke-mask-below" || mipBoundaryBelow ? 0
+        : arg == "--smoke-mask-equal" || mipBoundaryFirstPassing ? 1
+        : arg == "--smoke-mask-above" || mipBoundaryAbove ? 2 : -1;
+    const bool partialMipNear = arg == "--smoke-mask-mips-partial-near-25"
+        || arg == "--smoke-mask-mips-partial-near-75";
+    const bool partialMipFar = arg == "--smoke-mask-mips-partial-far-25"
+        || arg == "--smoke-mask-mips-partial-far-75";
+    const bool mixedBoundaryNear = arg == "--smoke-mask-mips-mixed-near";
+    const bool mixedBoundaryFar = arg == "--smoke-mask-mips-mixed-far";
+    const bool cutoffTransitionCompactNear = arg == "--smoke-mask-mips-transition-compact-near";
+    const bool cutoffTransitionCompactFar = arg == "--smoke-mask-mips-transition-compact-far";
+    const bool cutoffTransitionHighDpiNear = arg == "--smoke-mask-mips-transition-hidpi-near";
+    const bool cutoffTransitionHighDpiFar = arg == "--smoke-mask-mips-transition-hidpi-far";
+    const bool windowGeometrySmoke = arg == "--smoke-window-geometry";
+    const bool monitorDpiSmoke = arg == "--smoke-window-mixed-dpi";
+    const int gameViewCameraDiagnosticCase = arg == "--smoke-game-camera-no-active" ? 1
+        : arg == "--smoke-game-camera-invalid" ? 2
+        : arg == "--smoke-game-diagnostic-entity" ? 3
+        : arg == "--smoke-game-diagnostic-asset" ? 4 : 0;
+    const bool assetBrowserSmoke = arg == "--smoke-asset-browser";
+    const bool codexChangeReviewSmoke = arg == "--smoke-ai-change-review";
+    const bool codexSpriteVisibilitySmoke = arg == "--smoke-ai-sprite-visibility-review";
+    const bool codexPrimitiveCreationSmoke = arg == "--smoke-ai-primitive-creation-review";
+    const bool codexCameraAdditionSmoke = arg == "--smoke-ai-camera-addition-review";
+    const bool codexCameraLensSmoke = arg == "--smoke-ai-camera-lens-review";
+    const bool codexCameraActivationSmoke = arg == "--smoke-ai-camera-activation-review";
+    const bool codexCameraClearSmoke = arg == "--smoke-ai-camera-clear-review";
+    const bool codexTransformReviewSmoke = arg == "--smoke-ai-transform-review";
+    const bool codexReparentReviewSmoke = arg == "--smoke-ai-reparent-review";
+    const bool hierarchyReparentSmoke = arg == "--smoke-hierarchy-reparent";
+    const bool hierarchyReparentManySmoke = arg == "--smoke-hierarchy-reparent-many";
+    const bool multiTransformInspectorSmoke = arg == "--smoke-hierarchy-multi-transform";
+    const bool assetBrowserModelPreviewSmoke = arg == "--smoke-asset-model-preview";
+    const bool primitiveMaterialSmoke = arg == "--smoke-primitive-material"
+        || vulkanSceneViewOnlySmoke;
+    const bool runtimeBgfxGameViewSmoke = arg == "--smoke-runtime-bgfx-game-view";
+    const bool runtimeBgfxGameViewFallbackSmoke = arg == "--smoke-runtime-bgfx-game-view-fallback";
+    const bool runtimeBgfxGameViewTextureSmoke = arg == "--smoke-runtime-bgfx-game-view-texture"
+        || runtimeBgfxVulkanGameViewTextureSmoke;
+    const bool directionalLightNoLightSmoke = arg == "--smoke-runtime-bgfx-directional-light-legacy"
+        || arg == "--smoke-runtime-bgfx-directional-light-zero";
+    const bool directionalLightZeroShaderSmoke = arg == "--smoke-runtime-bgfx-directional-light-zero";
+    const bool runtimeBgfxPointLightSmoke = arg == "--smoke-runtime-bgfx-point-light";
+    const bool runtimeBgfxDirectionalLightSmoke = arg == "--smoke-runtime-bgfx-directional-light"
+        || directionalLightNoLightSmoke || runtimeBgfxPointLightSmoke;
+    const bool cutoffTransitionNear = arg == "--smoke-mask-mips-transition-near"
+        || cutoffTransitionCompactNear || cutoffTransitionHighDpiNear;
+    const bool cutoffTransitionFar = arg == "--smoke-mask-mips-transition-far"
+        || cutoffTransitionCompactFar || cutoffTransitionHighDpiFar;
+    const bool cutoffTransitionHighDpi = cutoffTransitionHighDpiNear || cutoffTransitionHighDpiFar;
+    int initialWindowWidth = cutoffTransitionCompactNear || cutoffTransitionCompactFar ? 900
+        : cutoffTransitionHighDpi ? 1440 : 1100;
+    int initialWindowHeight = codexTransformReviewSmoke || codexReparentReviewSmoke
+        || hierarchyReparentManySmoke || multiTransformInspectorSmoke ? 1080
+        : cutoffTransitionCompactNear || cutoffTransitionCompactFar ? 650
+        : cutoffTransitionHighDpi ? 900 : 720;
+    if (runtimeBgfxVulkanGameViewTextureSmoke && SDL_getenv("ASTRO_VULKAN_GAME_VIEW_TAP_SMOKE"))
+    {
+        if (const char* requested = SDL_getenv("ASTRO_VULKAN_GAME_VIEW_TAP_SIZE"))
+        {
+            const std::string_view size(requested);
+            const auto separator = size.find('x');
+            int requestedWidth = 0, requestedHeight = 0;
+            const auto widthResult = separator == std::string_view::npos
+                ? std::from_chars(size.data(), size.data(), requestedWidth)
+                : std::from_chars(size.data(), size.data() + separator, requestedWidth);
+            const auto heightResult = separator == std::string_view::npos
+                ? std::from_chars(size.data(), size.data(), requestedHeight)
+                : std::from_chars(size.data() + separator + 1, size.data() + size.size(), requestedHeight);
+            if (separator == std::string_view::npos || widthResult.ec != std::errc{}
+                || widthResult.ptr != size.data() + separator || heightResult.ec != std::errc{}
+                || heightResult.ptr != size.data() + size.size()
+                || requestedWidth < 640 || requestedWidth > 2560
+                || requestedHeight < 480 || requestedHeight > 1600)
+            {
+                std::cerr << "Invalid ASTRO_VULKAN_GAME_VIEW_TAP_SIZE; expected WIDTHxHEIGHT within 640x480..2560x1600\n";
+                return 2;
+            }
+            initialWindowWidth = requestedWidth;
+            initialWindowHeight = requestedHeight;
+        }
+    }
+    const int maskMipUvScale = arg == "--smoke-mask-mips-near" ? 2
+        : arg == "--smoke-mask-mips-checker" ? 2
+        : mipBoundaryNear ? 2
+        : partialMipNear ? 2
+        : mixedBoundaryNear ? 2
+        : cutoffTransitionNear ? 2
+        : arg == "--smoke-mask-mips-far" || arg == "--smoke-mask-mips-hole"
+            || mipBoundaryFar || partialMipFar || mixedBoundaryFar || cutoffTransitionFar ? 4 : 0;
+    const auto maskMipPattern = mipBoundaryBelow ? SmokeMaskMipPattern::CutoffBelow
+        : mipBoundaryFirstPassing ? SmokeMaskMipPattern::CutoffFirstPassing
+        : mipBoundaryAbove ? SmokeMaskMipPattern::CutoffAbove
+        : mixedBoundaryNear || mixedBoundaryFar ? SmokeMaskMipPattern::CutoffBands
+        : cutoffTransitionNear || cutoffTransitionFar ? SmokeMaskMipPattern::CutoffTransitionRamp
+        : arg == "--smoke-mask-mips-checker" ? SmokeMaskMipPattern::Checker
+        : arg == "--smoke-mask-mips-hole" ? SmokeMaskMipPattern::CenterHole
+        : (partialMipNear || partialMipFar)
+            ? SmokeMaskMipPattern::FractionalRamp
+        : SmokeMaskMipPattern::Split;
+    const float maskMipAlphaCutoff = arg.ends_with("-25") ? 0.25f
+        : arg.ends_with("-75") ? 0.75f : 0.5f;
+    if (argc > 2 || (argc == 2 && arg != "--smoke"
         && std::string_view(argv[1]) != "--benchmark"
         && std::string_view(argv[1]) != "--benchmark-3d"
-        && std::string_view(argv[1]) != "--smoke-inspect-copy-dialog")) return 2;
+        && std::string_view(argv[1]) != "--smoke-inspect-copy-dialog"
+        && !windowGeometrySmoke && !monitorDpiSmoke && alphaMaskBoundaryCase < 0 && maskMipUvScale == 0
+        && gameViewCameraDiagnosticCase == 0 && !assetBrowserSmoke && !assetBrowserModelPreviewSmoke
+        && !codexChangeReviewSmoke && !codexSpriteVisibilitySmoke
+        && !codexPrimitiveCreationSmoke
+        && !codexCameraAdditionSmoke
+        && !codexCameraLensSmoke
+        && !codexCameraActivationSmoke
+        && !codexCameraClearSmoke
+        && !codexTransformReviewSmoke
+        && !codexReparentReviewSmoke
+        && !hierarchyReparentSmoke
+        && !hierarchyReparentManySmoke
+        && !multiTransformInspectorSmoke
+        && !primitiveMaterialSmoke && !runtimeBgfxGameViewSmoke && !runtimeBgfxGameViewFallbackSmoke
+        && !runtimeBgfxGameViewTextureSmoke && !runtimeBgfxDirectionalLightSmoke
+        && !runtimeBgfxPointLightSmoke && !rendererBackendSmoke)) return 2;
     const auto comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(comResult)) { std::cerr << "COM initialization failed\n"; return 1; }
     struct ComLifetime { ~ComLifetime() { CoUninitialize(); } } comLifetime;
     try
     {
+        if (expectVulkanRenderer)
+        {
+            const auto rendererCount = bgfx::getSupportedRenderers(0, nullptr);
+            std::vector<bgfx::RendererType::Enum> renderers(rendererCount);
+            if (rendererCount > 0) bgfx::getSupportedRenderers(rendererCount, renderers.data());
+            if (std::find(renderers.begin(), renderers.end(), bgfx::RendererType::Vulkan) == renderers.end())
+            {
+                std::cerr << "[editor-renderer-smoke] Vulkan renderer is not present in the linked BGFX library\n";
+                return 77;
+            }
+        }
         Editor editor;
-        editor.init();
+        editor.init(initialWindowWidth, initialWindowHeight, cutoffTransitionHighDpi, expectVulkanRenderer);
         const bool inspectCopyDialog = argc == 2
             && std::string_view(argv[1]) == "--smoke-inspect-copy-dialog";
-        const bool smoke = argc == 2 && (std::string_view(argv[1]) == "--smoke" || inspectCopyDialog);
+        const bool smoke = argc == 2 && (arg == "--smoke" || inspectCopyDialog || windowGeometrySmoke || monitorDpiSmoke
+            || alphaMaskBoundaryCase >= 0 || maskMipUvScale > 0 || gameViewCameraDiagnosticCase != 0
+            || assetBrowserSmoke || assetBrowserModelPreviewSmoke || primitiveMaterialSmoke
+            || codexChangeReviewSmoke || codexSpriteVisibilitySmoke
+            || codexPrimitiveCreationSmoke
+            || codexCameraAdditionSmoke
+            || codexCameraLensSmoke
+            || codexCameraActivationSmoke
+            || codexCameraClearSmoke
+            || codexTransformReviewSmoke
+            || codexReparentReviewSmoke
+            || hierarchyReparentSmoke
+            || hierarchyReparentManySmoke
+            || multiTransformInspectorSmoke
+            || runtimeBgfxGameViewSmoke || runtimeBgfxGameViewFallbackSmoke || runtimeBgfxGameViewTextureSmoke
+            || runtimeBgfxDirectionalLightSmoke || runtimeBgfxPointLightSmoke);
         const bool benchmark3d = argc == 2 && std::string_view(argv[1]) == "--benchmark-3d";
         const bool benchmark = argc == 2
             && (std::string_view(argv[1]) == "--benchmark" || benchmark3d);
-        return editor.run(smoke, benchmark, benchmark3d, inspectCopyDialog);
+        return editor.run(smoke, benchmark, benchmark3d, inspectCopyDialog, windowGeometrySmoke, monitorDpiSmoke,
+            alphaMaskBoundaryCase, maskMipUvScale, maskMipPattern, maskMipAlphaCutoff, gameViewCameraDiagnosticCase,
+            assetBrowserSmoke, assetBrowserModelPreviewSmoke, primitiveMaterialSmoke,
+            runtimeBgfxGameViewSmoke, runtimeBgfxGameViewFallbackSmoke, runtimeBgfxGameViewTextureSmoke,
+            runtimeBgfxDirectionalLightSmoke, runtimeBgfxPointLightSmoke,
+            directionalLightNoLightSmoke, directionalLightZeroShaderSmoke,
+            rendererBackendSmoke, expectVulkanRenderer, vulkanSceneViewOnlySmoke, codexChangeReviewSmoke,
+            codexSpriteVisibilitySmoke, codexPrimitiveCreationSmoke, codexCameraAdditionSmoke,
+            codexCameraLensSmoke, codexCameraActivationSmoke, codexCameraClearSmoke,
+            codexTransformReviewSmoke, codexReparentReviewSmoke, hierarchyReparentSmoke,
+            hierarchyReparentManySmoke, multiTransformInspectorSmoke);
     }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

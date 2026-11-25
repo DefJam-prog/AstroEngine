@@ -3,6 +3,7 @@
 #include "astro/core/Result.hpp"
 
 #include <cstdint>
+#include <array>
 #include <compare>
 #include <filesystem>
 #include <map>
@@ -56,6 +57,82 @@ struct ModelAssetReference
     std::string sourceSha256;
     // Geometry-input digest reported by a successful bounded model import.
     std::string importContentHash;
+};
+
+enum class MaterialAlphaMode
+{
+    Opaque,
+    Mask,
+    Blend
+};
+
+enum class MaterialTextureWrapMode { Repeat, MirroredRepeat, ClampToEdge };
+enum class MaterialTextureMinFilter
+{
+    Nearest, Linear, NearestMipmapNearest, LinearMipmapNearest,
+    NearestMipmapLinear, LinearMipmapLinear
+};
+enum class MaterialTextureMagFilter { Nearest, Linear };
+
+struct MaterialUvTransform
+{
+    float offsetU = 0.0f;
+    float offsetV = 0.0f;
+    float rotationRadians = 0.0f;
+    float scaleU = 1.0f;
+    float scaleV = 1.0f;
+    friend bool operator==(const MaterialUvTransform&, const MaterialUvTransform&) = default;
+};
+
+struct MaterialTextureBinding
+{
+    AssetId imageAssetId;
+    std::uint32_t texCoord = 0;
+    friend bool operator==(const MaterialTextureBinding&, const MaterialTextureBinding&) = default;
+};
+
+// Backend-neutral authored data. Numeric color values are linear-light; texture
+// sampling/color-space interpretation is defined by each semantic texture role.
+struct MaterialAssetData
+{
+    std::uint32_t schemaVersion = 2;
+    std::array<float, 4> baseColorFactor{1.0f, 1.0f, 1.0f, 1.0f};
+    float metallicFactor = 1.0f;
+    float roughnessFactor = 1.0f;
+    std::array<float, 3> emissiveFactor{0.0f, 0.0f, 0.0f};
+    MaterialAlphaMode alphaMode = MaterialAlphaMode::Opaque;
+    float alphaCutoff = 0.5f;
+    bool doubleSided = false;
+    float normalScale = 1.0f;
+    float occlusionStrength = 1.0f;
+    std::optional<MaterialTextureBinding> baseColorTexture;
+    std::optional<MaterialTextureBinding> metallicRoughnessTexture;
+    std::optional<MaterialTextureBinding> normalTexture;
+    std::optional<MaterialTextureBinding> occlusionTexture;
+    std::optional<MaterialTextureBinding> emissiveTexture;
+    // Schema-v1 data resolves to the historical Scene View policy.
+    MaterialTextureWrapMode baseColorWrapU = MaterialTextureWrapMode::ClampToEdge;
+    MaterialTextureWrapMode baseColorWrapV = MaterialTextureWrapMode::ClampToEdge;
+    MaterialTextureMinFilter baseColorMinFilter = MaterialTextureMinFilter::Nearest;
+    MaterialTextureMagFilter baseColorMagFilter = MaterialTextureMagFilter::Nearest;
+    MaterialUvTransform baseColorUvTransform{};
+    friend bool operator==(const MaterialAssetData&, const MaterialAssetData&) = default;
+};
+
+struct MaterialAssetReference
+{
+    AssetId id;
+    std::string sourceRelativePath;
+    std::uint32_t schemaVersion = 1;
+    std::uint64_t sourceSize = 0;
+    std::string sourceSha256;
+};
+
+struct ResolvedMaterialAsset
+{
+    AssetId id;
+    std::filesystem::path sourcePath;
+    MaterialAssetData material;
 };
 
 struct ResolvedModelAsset
@@ -120,11 +197,15 @@ public:
         const std::filesystem::path& runtimeConfigRelativePath);
     core::Result<ModelAssetReference> registerModel(const std::filesystem::path& sourceRelativePath,
         std::string importContentHash);
+    core::Result<MaterialAssetReference> registerMaterial(const std::filesystem::path& sourceRelativePath);
+    core::Result<MaterialAssetReference> saveMaterial(AssetId id, const MaterialAssetData& material);
     [[nodiscard]] const AssetReference* find(AssetId id) const noexcept;
     [[nodiscard]] const ScriptAssetReference* findScript(AssetId id) const noexcept;
     [[nodiscard]] const ModelAssetReference* findModel(AssetId id) const noexcept;
+    [[nodiscard]] const MaterialAssetReference* findMaterial(AssetId id) const noexcept;
     [[nodiscard]] core::Result<ResolvedScriptAsset> resolveScript(AssetId id) const;
     [[nodiscard]] core::Result<ResolvedModelAsset> resolveModel(AssetId id) const;
+    [[nodiscard]] core::Result<ResolvedMaterialAsset> resolveMaterial(AssetId id) const;
     [[nodiscard]] ScriptBuildReport inspectScriptBuild() const;
     core::Result<std::vector<ScriptAssetReference>> registerScriptsFromBuild();
     [[nodiscard]] std::vector<AssetId> missingAssets() const;
@@ -133,13 +214,15 @@ public:
     [[nodiscard]] const std::map<AssetId, AssetReference>& entries() const noexcept { return entries_; }
     [[nodiscard]] const std::map<AssetId, ScriptAssetReference>& scriptEntries() const noexcept { return scriptEntries_; }
     [[nodiscard]] const std::map<AssetId, ModelAssetReference>& modelEntries() const noexcept { return modelEntries_; }
+    [[nodiscard]] const std::map<AssetId, MaterialAssetReference>& materialEntries() const noexcept { return materialEntries_; }
 
 private:
     AssetRegistry(std::filesystem::path projectRoot, std::filesystem::path assetsRoot,
         std::filesystem::path cacheRoot, std::filesystem::path indexPath);
     core::Result<void> saveIndex(const std::map<AssetId, AssetReference>& entries,
         const std::map<AssetId, ScriptAssetReference>& scripts,
-        const std::map<AssetId, ModelAssetReference>& models, std::uint64_t nextId) const;
+        const std::map<AssetId, ModelAssetReference>& models,
+        const std::map<AssetId, MaterialAssetReference>& materials, std::uint64_t nextId) const;
 
     std::filesystem::path projectRoot_;
     std::filesystem::path assetsRoot_;
@@ -148,6 +231,7 @@ private:
     std::map<AssetId, AssetReference> entries_;
     std::map<AssetId, ScriptAssetReference> scriptEntries_;
     std::map<AssetId, ModelAssetReference> modelEntries_;
+    std::map<AssetId, MaterialAssetReference> materialEntries_;
     std::uint64_t nextId_ = 1;
 };
 

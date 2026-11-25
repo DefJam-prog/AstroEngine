@@ -35,6 +35,8 @@ int main()
     }
 
     auto registryResult = astro::assets::AssetRegistry::open(root);
+    if (!registryResult)
+        std::cerr << "AssetRegistry open failed: " << registryResult.error().message << '\n';
     CHECK(registryResult);
     auto registry = std::move(registryResult).value();
     const auto registered = registry.registerScript(fs::path(L"Scripts") / L"Scene.cs", "Game.Пример",

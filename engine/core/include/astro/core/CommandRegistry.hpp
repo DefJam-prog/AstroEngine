@@ -26,7 +26,11 @@ enum class CommandFieldType
     UnsignedInteger,
     Boolean,
     AssetId,
-    StringOrUnsignedInteger
+    StringOrUnsignedInteger,
+    Number,
+    NumberArray,
+    UnsignedIntegerArray,
+    TransformAssignmentArray
 };
 
 struct CommandFieldSchema

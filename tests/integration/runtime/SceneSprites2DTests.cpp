@@ -132,7 +132,10 @@ int main(const int argc, char** argv)
         auto registryResult = assets::AssetRegistry::open(root);
         CHECK(registryResult);
         if (!registryResult)
+        {
+            std::cerr << "AssetRegistry open failed: " << registryResult.error().message << '\n';
             throw std::runtime_error("AssetRegistry open failed: " + registryResult.error().message);
+        }
         auto registry = std::move(registryResult).value();
         const auto source = root / "Assets" / "sprite.png";
         const auto bytes = png2x3();

@@ -1,5 +1,6 @@
 #include "astro/render3d/GltfImporter.hpp"
 #include "astro/render3d/SceneMeshResolver.hpp"
+#include "astro/assets/MaterialAsset.hpp"
 #include "astro/scene/Scene.hpp"
 #include "astro/scene/SceneFile.hpp"
 
@@ -7,6 +8,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -65,6 +67,8 @@ std::string base64(const std::vector<std::uint8_t>& bytes)
     return output;
 }
 
+void replaceOnce(std::string& value, std::string_view from, std::string_view to);
+
 std::string document(const std::string& bufferSource, const std::size_t byteLength,
     const std::string& meshName = "Triangle Ω", const bool requiredExtension = false)
 {
@@ -78,6 +82,28 @@ std::string document(const std::string& bufferSource, const std::size_t byteLeng
         "{\"bufferView\":1,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}],"
         "\"meshes\":[{\"name\":\"" + meshName + "\",\"primitives\":[{\"attributes\":{\"POSITION\":0},"
         "\"indices\":1,\"mode\":4}]}]}";
+    return json;
+}
+
+std::string materialDocument(const std::string& imageUri, const std::vector<std::uint8_t>& geometryBytes)
+{
+    auto json = document("data:application/octet-stream;base64," + base64(geometryBytes), geometryBytes.size());
+    replaceOnce(json, "\"mode\":4}", "\"mode\":4,\"material\":0}");
+    json.pop_back();
+    json += ",\"images\":[{\"name\":\"Albedo Ω\",\"uri\":\"" + imageUri + "\"}],"
+        "\"samplers\":[{\"magFilter\":9728,\"minFilter\":9729,\"wrapS\":33648,\"wrapT\":33071}],"
+        "\"textures\":[{\"name\":\"Paint texture\",\"source\":0,\"sampler\":0}],"
+        "\"extensionsUsed\":[\"KHR_texture_transform\",\"VENDOR_material_note\"],"
+        "\"materials\":[{\"name\":\"Paint\",\"pbrMetallicRoughness\":{"
+            "\"baseColorFactor\":[0.25,0.5,0.75,1],\"metallicFactor\":0.3,\"roughnessFactor\":0.7,"
+            "\"baseColorTexture\":{\"index\":0,\"texCoord\":1,\"extensions\":{"
+                "\"KHR_texture_transform\":{\"offset\":[0.25,0.5],\"rotation\":1.57079632679,"
+                "\"scale\":[2,3],\"texCoord\":0}}},"
+            "\"metallicRoughnessTexture\":{\"index\":0}},"
+        "\"normalTexture\":{\"index\":0,\"scale\":0.8,\"texCoord\":2},"
+        "\"occlusionTexture\":{\"index\":0,\"strength\":0.6},"
+        "\"emissiveTexture\":{\"index\":0},\"emissiveFactor\":[0.1,0.2,0.3],"
+        "\"alphaMode\":\"MASK\",\"alphaCutoff\":0.42,\"doubleSided\":true}]}";
     return json;
 }
 
@@ -95,6 +121,59 @@ void writeText(const std::filesystem::path& path, const std::string& value)
 }
 void appendU32(std::vector<std::uint8_t>& bytes, const std::uint32_t value)
 { for (unsigned shift = 0; shift < 32; shift += 8) bytes.push_back(static_cast<std::uint8_t>(value >> shift)); }
+
+void appendFloat(std::vector<std::uint8_t>& bytes, const float value)
+{ appendU32(bytes, std::bit_cast<std::uint32_t>(value)); }
+
+std::vector<std::uint8_t> normalUvTriangleBytes()
+{
+    std::vector<std::uint8_t> bytes;
+    for (const float value : std::array<float, 9>{0, 0, 0, 1, 0, 0, 0, 1, 0}) appendFloat(bytes, value);
+    for (const float value : std::array<float, 9>{0, 0, 1, 0, 0, 1, 0, 0, 1}) appendFloat(bytes, value);
+    for (const float value : std::array<float, 6>{0, 0, 1, 0, 0, 1}) appendFloat(bytes, value);
+    for (const auto value : std::array<std::uint16_t, 3>{0, 1, 2})
+    { bytes.push_back(static_cast<std::uint8_t>(value)); bytes.push_back(static_cast<std::uint8_t>(value >> 8)); }
+    return bytes;
+}
+
+std::string normalUvDocument(const std::vector<std::uint8_t>& bytes)
+{
+    return "{\"asset\":{\"version\":\"2.0\"},\"buffers\":[{\"uri\":\"data:application/octet-stream;base64,"
+        + base64(bytes) + "\",\"byteLength\":" + std::to_string(bytes.size()) + "}],"
+        "\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36},"
+        "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":36},"
+        "{\"buffer\":0,\"byteOffset\":72,\"byteLength\":24},"
+        "{\"buffer\":0,\"byteOffset\":96,\"byteLength\":6}],"
+        "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+        "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+        "{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"},"
+        "{\"bufferView\":3,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}],"
+        "\"meshes\":[{\"name\":\"Normal UV triangle\",\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"mode\":4}]}]}";
+}
+
+std::vector<std::uint8_t> normalizedByteUvTriangleBytes()
+{
+    std::vector<std::uint8_t> bytes;
+    for (const float value : std::array<float, 9>{0, 0, 0, 1, 0, 0, 0, 1, 0}) appendFloat(bytes, value);
+    for (const std::uint8_t value : std::array<std::uint8_t, 6>{0, 255, 128, 128, 255, 0}) bytes.push_back(value);
+    for (const auto value : std::array<std::uint16_t, 3>{0, 1, 2})
+    { bytes.push_back(static_cast<std::uint8_t>(value)); bytes.push_back(static_cast<std::uint8_t>(value >> 8)); }
+    return bytes;
+}
+
+std::string normalizedByteUvDocument(const std::vector<std::uint8_t>& bytes, const bool normalized)
+{
+    return "{\"asset\":{\"version\":\"2.0\"},\"buffers\":[{\"uri\":\"data:application/octet-stream;base64,"
+        + base64(bytes) + "\",\"byteLength\":" + std::to_string(bytes.size()) + "}],"
+        "\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36},"
+        "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":6},"
+        "{\"buffer\":0,\"byteOffset\":42,\"byteLength\":6}],"
+        "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+        "{\"bufferView\":1,\"componentType\":5121,\"normalized\":" + (normalized ? "true" : "false")
+        + ",\"count\":3,\"type\":\"VEC2\"},"
+        "{\"bufferView\":2,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}],"
+        "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"TEXCOORD_0\":1},\"indices\":2,\"mode\":4}]}]}";
+}
 
 void replaceOnce(std::string& value, const std::string_view from, const std::string_view to)
 {
@@ -123,6 +202,7 @@ bool verifyTriangle(const astro::render3d::GltfImportResult& imported)
     if (imported.meshes.size() != 1 || imported.meshes.front().primitives.size() != 1) return false;
     const auto& mesh = imported.meshes.front().primitives.front();
     return mesh.vertices().size() == 3 && mesh.triangleIndices() == std::vector<std::uint32_t>{0, 1, 2}
+        && !mesh.hasNormals() && !mesh.hasTexCoords()
         && mesh.vertices()[1].position.x == 1.0f && mesh.vertices()[2].position.y == 1.0f;
 }
 
@@ -131,6 +211,8 @@ void testAssetRegistryAndSceneReference()
     using namespace astro;
     TempProject project;
     auto registryResult = assets::AssetRegistry::open(project.root);
+    if (!registryResult)
+        std::cerr << "AssetRegistry open failed: " << registryResult.error().message << '\n';
     expect(registryResult.hasValue(), "open registry for imported model integration");
     if (!registryResult) return;
     auto registry = std::move(registryResult).value();
@@ -156,7 +238,7 @@ void testAssetRegistryAndSceneReference()
         "attach model AssetId to the versioned MeshRenderer component");
     const auto scenePath = project.root / "Scenes" / "Mesh.scene";
     std::filesystem::create_directories(scenePath.parent_path());
-    expect(entity && scene::saveSceneFile(scenePath, authored).hasValue(), "serialize Scene v6 model reference");
+    expect(entity && scene::saveSceneFile(scenePath, authored).hasValue(), "serialize Scene v7 model reference");
     auto reopenedScene = scene::loadSceneFile(scenePath);
     expect(reopenedScene && reopenedScene.value().meshRenderer(entity.value())
         && reopenedScene.value().meshRenderer(entity.value())->model == modelId,
@@ -168,8 +250,32 @@ void testAssetRegistryAndSceneReference()
     auto resolvedGeometry = render3d::resolveMeshRenderer(registry, *loadedMesh);
     expect(resolvedGeometry && resolvedGeometry.value().geometry.vertices().size() == 3
         && resolvedGeometry.value().geometry.triangleIndices() == std::vector<std::uint32_t>{0, 1, 2}
-        && resolvedGeometry.value().meshName == "Triangle Ω" && !resolvedGeometry.value().visible,
+        && resolvedGeometry.value().meshName == "Triangle Ω" && !resolvedGeometry.value().visible
+        && !resolvedGeometry.value().sourceMaterialIndex && resolvedGeometry.value().materialOverride.value == 0,
         "resolve a Scene MeshRenderer to its current primitive geometry and visibility state");
+
+    std::filesystem::create_directories(project.root / "Assets" / "Materials");
+    const auto materialText = assets::serializeMaterialAsset(assets::MaterialAssetData{});
+    expect(materialText.hasValue(), "serialize a valid project material fixture");
+    if (materialText)
+    {
+        writeText(project.root / "Assets" / "Materials" / "override.astro-material", materialText.value());
+        const auto material = registry.registerMaterial(std::filesystem::path("Materials/override.astro-material"));
+        expect(material.hasValue(), "register a project material for a Scene primitive override");
+        if (material)
+        {
+            auto overridden = *loadedMesh;
+            overridden.materialOverride = material.value().id;
+            overridden.schemaVersion = 2;
+            const auto resolvedOverride = render3d::resolveMeshRenderer(registry, overridden);
+            expect(resolvedOverride && resolvedOverride.value().materialOverride == material.value().id
+                && !resolvedOverride.value().sourceMaterialIndex,
+                "resolve a registered Scene override separately from the absent imported source material");
+            overridden.materialOverride = {999999};
+            expect(!render3d::resolveMeshRenderer(registry, overridden),
+                "diagnose an unresolved project material override");
+        }
+    }
 
     auto invalidMeshSelection = *loadedMesh;
     invalidMeshSelection.meshIndex = 1;
@@ -184,7 +290,7 @@ void testAssetRegistryAndSceneReference()
     expect(!render3d::resolveMeshRenderer(registry, unknownAssetSelection),
         "reject an unregistered MeshRenderer model AssetId");
     auto unsupportedSchema = *loadedMesh;
-    unsupportedSchema.schemaVersion = 2;
+    unsupportedSchema.schemaVersion = 99;
     expect(!render3d::resolveMeshRenderer(registry, unsupportedSchema),
         "reject an unsupported MeshRenderer schema version");
     auto zeroAssetSelection = *loadedMesh;
@@ -258,6 +364,197 @@ void testExternalBufferFreshness()
         "resolve geometry after external-buffer reimport updates the registered digest");
 }
 
+void testMaterialMetadataAndImageReferences()
+{
+    using namespace astro;
+    TempProject project;
+    const auto geometry = triangleBytes();
+    const auto modelPath = project.root / "Assets/Models/materials.gltf";
+    const auto imagePath = project.root / "Assets/Models/albedo.png";
+    writeBytes(imagePath, {137, 80, 78, 71, 1, 2, 3}); // Metadata-only fixture; no image decoder is invoked.
+    writeText(modelPath, materialDocument("albedo.png", geometry));
+
+    auto imported = render3d::GltfImporter::importFile(project.root, "Assets/Models/materials.gltf");
+    expect(imported && verifyTriangle(imported.value()), "geometry remains available with glTF material metadata");
+    if (!imported) return;
+    const auto& result = imported.value();
+    expect(result.meshes[0].primitiveMaterialIndices.size() == 1
+        && result.meshes[0].primitiveMaterialIndices[0] == std::optional<std::uint32_t>(0),
+        "primitive retains its source material index");
+    expect(result.images.size() == 1 && result.images[0].name == "Albedo Ω"
+        && result.images[0].sourceKind == render3d::GltfImageSourceKind::ExternalFile
+        && result.images[0].reference == "Models/albedo.png" && result.images[0].available
+        && result.images[0].sourceSize == 7 && !result.images[0].sourceHash.empty(),
+        "external image reference is confined and hashed without rewriting the image");
+    expect(result.textures.size() == 1 && result.textures[0].imageIndex == std::optional<std::uint32_t>(0)
+        && result.textures[0].samplerIndex == std::optional<std::uint32_t>(0)
+        && result.samplers.size() == 1
+        && result.samplers[0].wrapS == render3d::GltfSamplerWrap::MirroredRepeat
+        && result.samplers[0].wrapT == render3d::GltfSamplerWrap::ClampToEdge
+        && result.samplers[0].magFilter == render3d::GltfSamplerFilter::Nearest
+        && result.samplers[0].minFilter == render3d::GltfSamplerFilter::Linear,
+        "glTF texture preserves sampler index and validated wrap/filter settings");
+    expect(result.materials.size() == 1 && result.materials[0].name == "Paint"
+        && result.materials[0].values.baseColorFactor == std::array<float, 4>{0.25f, 0.5f, 0.75f, 1.0f}
+        && result.materials[0].values.metallicFactor == 0.3f
+        && result.materials[0].values.roughnessFactor == 0.7f
+        && result.materials[0].values.alphaMode == assets::MaterialAlphaMode::Mask
+        && result.materials[0].values.alphaCutoff == 0.42f && result.materials[0].values.doubleSided
+        && result.materials[0].values.normalScale == 0.8f
+        && result.materials[0].values.occlusionStrength == 0.6f,
+        "supported metallic-roughness material factors and flags are preserved");
+    const auto& material = result.materials[0];
+    expect(material.baseColorTexture && material.baseColorTexture->textureIndex == 0
+        && material.baseColorTexture->texCoord == 0
+        && material.baseColorTexture->transform.has_value()
+        && std::abs(material.baseColorTexture->transform->offsetU - 0.25f) < 1e-6f
+        && std::abs(material.baseColorTexture->transform->offsetV - 0.5f) < 1e-6f
+        && std::abs(material.baseColorTexture->transform->scaleU - 2.0f) < 1e-6f
+        && std::abs(material.baseColorTexture->transform->scaleV - 3.0f) < 1e-6f
+        && std::abs(material.baseColorTexture->transform->rotationRadians - 1.5707963f) < 1e-5f
+        && material.metallicRoughnessTexture && material.metallicRoughnessTexture->texCoord == 0
+        && material.normalTexture && material.normalTexture->texCoord == 2
+        && material.occlusionTexture && material.emissiveTexture,
+        "all supported texture roles retain source texture and texCoord selectors");
+    expect(std::none_of(result.diagnostics.begin(), result.diagnostics.end(), [](const std::string& item) {
+            return item.find("KHR_texture_transform") != std::string::npos;
+        }) && std::any_of(result.diagnostics.begin(), result.diagnostics.end(), [](const std::string& item) {
+            return item.find("VENDOR_material_note") != std::string::npos;
+        }), "supported texture transform metadata is retained and unsupported used extensions are diagnosed");
+
+    TempProject defaultSamplerProject;
+    writeBytes(defaultSamplerProject.root / "Assets/Models/albedo.png", {137, 80, 78, 71, 1, 2, 3});
+    auto defaultSamplerDocument = materialDocument("albedo.png", geometry);
+    replaceOnce(defaultSamplerDocument,
+        "\"samplers\":[{\"magFilter\":9728,\"minFilter\":9729,\"wrapS\":33648,\"wrapT\":33071}]",
+        "\"samplers\":[{}]");
+    writeText(defaultSamplerProject.root / "Assets/Models/default-sampler.gltf", defaultSamplerDocument);
+    const auto defaultSamplerImport = render3d::GltfImporter::importFile(defaultSamplerProject.root,
+        "Assets/Models/default-sampler.gltf");
+    expect(defaultSamplerImport && defaultSamplerImport.value().samplers.size() == 1
+        && defaultSamplerImport.value().samplers[0].wrapS == render3d::GltfSamplerWrap::Repeat
+        && defaultSamplerImport.value().samplers[0].wrapT == render3d::GltfSamplerWrap::Repeat
+        && !defaultSamplerImport.value().samplers[0].magFilter
+        && !defaultSamplerImport.value().samplers[0].minFilter,
+        "sampler default wrap modes and implementation-selected filters are retained explicitly");
+
+    const auto cacheHit = render3d::GltfImporter::importFile(project.root, "Assets/Models/materials.gltf");
+    expect(cacheHit && cacheHit.value().cacheHit && cacheHit.value().materials.size() == 1
+        && cacheHit.value().samplers.size() == 1
+        && cacheHit.value().materials[0].baseColorTexture
+        && cacheHit.value().materials[0].baseColorTexture->transform.has_value()
+        && cacheHit.value().meshes[0].primitiveMaterialIndices[0] == std::optional<std::uint32_t>(0),
+        "cache hit reconstructs sampler, transform and material metadata from source");
+
+    writeBytes(imagePath, {137, 80, 78, 71, 9, 8, 7});
+    const auto changedImage = render3d::GltfImporter::importFile(project.root, "Assets/Models/materials.gltf");
+    expect(changedImage && !changedImage.value().cacheHit
+        && changedImage.value().contentHash != result.contentHash,
+        "external image byte changes invalidate the import content digest");
+
+    TempProject missingProject;
+    writeText(missingProject.root / "Assets/Models/missing-image.gltf",
+        materialDocument("late.png", geometry));
+    const auto missingImage = render3d::GltfImporter::importFile(missingProject.root, "Assets/Models/missing-image.gltf");
+    expect(missingImage && missingImage.value().images.size() == 1 && !missingImage.value().images[0].available
+        && std::any_of(missingImage.value().diagnostics.begin(), missingImage.value().diagnostics.end(), [](const std::string& item) {
+            return item.find("missing local file") != std::string::npos;
+        }), "missing texture image is preserved and diagnosed without dropping the material slot");
+    writeBytes(missingProject.root / "Assets/Models/late.png", {1, 2, 3});
+    const auto restoredImage = render3d::GltfImporter::importFile(missingProject.root, "Assets/Models/missing-image.gltf");
+    expect(restoredImage && restoredImage.value().images[0].available
+        && restoredImage.value().contentHash != missingImage.value().contentHash,
+        "restoring a missing referenced image changes freshness state");
+
+    TempProject embeddedProject;
+    writeText(embeddedProject.root / "Assets/Models/embedded-image.gltf",
+        materialDocument("data:image/png;base64," + base64({1, 2, 3, 4}), geometry));
+    const auto embeddedImage = render3d::GltfImporter::importFile(embeddedProject.root,
+        "Assets/Models/embedded-image.gltf");
+    expect(embeddedImage && embeddedImage.value().images.size() == 1
+        && embeddedImage.value().images[0].available && !embeddedImage.value().images[0].sourceHash.empty(),
+        "embedded image bytes retain a bounded source reference and digest");
+
+    TempProject remoteProject;
+    writeText(remoteProject.root / "Assets/Models/remote-image.gltf",
+        materialDocument("https://example.invalid/texture.png", geometry));
+    const auto remoteImage = render3d::GltfImporter::importFile(remoteProject.root, "Assets/Models/remote-image.gltf");
+    expect(remoteImage && remoteImage.value().images[0].sourceKind == render3d::GltfImageSourceKind::Unsupported
+        && !remoteImage.value().images[0].available
+        && std::any_of(remoteImage.value().diagnostics.begin(), remoteImage.value().diagnostics.end(), [](const std::string& item) {
+            return item.find("not fetched") != std::string::npos;
+        }), "remote image URI is retained as a diagnostic and never fetched");
+
+    TempProject unsafeProject;
+    writeText(unsafeProject.root / "Assets/Models/traversal-image.gltf",
+        materialDocument("../../outside.png", geometry));
+    expect(!render3d::GltfImporter::importFile(unsafeProject.root, "Assets/Models/traversal-image.gltf"),
+        "image URI traversal outside Assets is rejected");
+
+    TempProject noMaterialProject;
+    writeText(noMaterialProject.root / "Assets/Models/no-material.gltf", document(
+        "data:application/octet-stream;base64," + base64(geometry), geometry.size()));
+    const auto noMaterial = render3d::GltfImporter::importFile(noMaterialProject.root, "Assets/Models/no-material.gltf");
+    expect(noMaterial && noMaterial.value().materials.empty()
+        && noMaterial.value().meshes[0].primitiveMaterialIndices.size() == 1
+        && !noMaterial.value().meshes[0].primitiveMaterialIndices[0],
+        "unassigned primitives retain an explicit empty material mapping");
+}
+
+void testSceneMeshSourceMaterialResolution()
+{
+    using namespace astro;
+    TempProject project;
+    const auto geometry = triangleBytes();
+    writeBytes(project.root / "Assets/Models/albedo.png", {137, 80, 78, 71, 1, 2, 3});
+    auto source = materialDocument("albedo.png", geometry);
+    replaceOnce(source, "\"texCoord\":1", "\"texCoord\":0");
+    writeText(project.root / "Assets/Models/source-material.gltf", source);
+    auto registryResult = assets::AssetRegistry::open(project.root);
+    expect(registryResult.hasValue(), "open registry for source material resolution");
+    if (!registryResult) return;
+    auto registry = std::move(registryResult).value();
+    const auto imported = render3d::GltfImporter::importAndRegister(registry,
+        std::filesystem::path("Assets/Models/source-material.gltf"));
+    expect(imported.hasValue(), "import/register model with a source base-color material");
+    if (!imported) return;
+
+    scene::MeshRendererComponent component;
+    component.id = 1;
+    component.model = imported.value().modelAssetId;
+    const auto resolvedSource = render3d::resolveMeshRenderer(registry, component);
+    expect(resolvedSource && resolvedSource.value().sourceMaterialIndex == std::optional<std::uint32_t>(0)
+        && resolvedSource.value().sourceMaterial.has_value()
+        && resolvedSource.value().sourceMaterial->values.baseColorFactor
+            == std::array<float, 4>{0.25f, 0.5f, 0.75f, 1.0f}
+        && resolvedSource.value().sourceMaterial->hasBaseColorTexture
+        && resolvedSource.value().sourceMaterial->baseColorTexCoord == 0
+        && resolvedSource.value().sourceMaterial->baseColorSampler
+        && resolvedSource.value().sourceMaterial->baseColorSampler->wrapS == render3d::GltfSamplerWrap::MirroredRepeat
+        && resolvedSource.value().sourceMaterial->baseColorTransform
+        && std::abs(resolvedSource.value().sourceMaterial->baseColorTransform->scaleV - 3.0f) < 1e-6f
+        && resolvedSource.value().sourceMaterial->baseColorImageAvailable
+        && resolvedSource.value().sourceMaterial->baseColorImagePath
+            == project.root / "Assets/Models/albedo.png",
+        "without a project override resolve the primitive source factor, UV0 binding and confined external image path");
+
+    std::filesystem::create_directories(project.root / "Assets/Materials");
+    const auto materialText = assets::serializeMaterialAsset(assets::MaterialAssetData{});
+    expect(materialText.hasValue(), "serialize a project override for source material precedence");
+    if (!materialText) return;
+    writeText(project.root / "Assets/Materials/override.astro-material", materialText.value());
+    const auto registered = registry.registerMaterial(std::filesystem::path("Materials/override.astro-material"));
+    expect(registered.hasValue(), "register project material for source precedence resolution");
+    if (!registered) return;
+    component.materialOverride = registered.value().id;
+    component.schemaVersion = 2;
+    const auto resolvedOverride = render3d::resolveMeshRenderer(registry, component);
+    expect(resolvedOverride && resolvedOverride.value().materialOverride == registered.value().id
+        && resolvedOverride.value().sourceMaterialIndex == std::optional<std::uint32_t>(0)
+        && resolvedOverride.value().sourceMaterial.has_value(),
+        "retain source material metadata while representing the explicit project override separately");
+}
+
 void testDataUriAndCache()
 {
     using astro::render3d::GltfImporter;
@@ -298,6 +595,46 @@ void testDataUriAndCache()
         const std::string sentinelAfter((std::istreambuf_iterator<char>(sentinelFile)), std::istreambuf_iterator<char>());
         expect(sentinelAfter == "preserve target bytes", "cache symlink target is not modified");
     }
+}
+
+void testNormalUvAttributesAndCache()
+{
+    using astro::render3d::GltfImporter;
+    TempProject project;
+    const auto bytes = normalUvTriangleBytes();
+    const auto path = project.root / "Assets" / "Models" / "normal-uv.gltf";
+    writeText(path, normalUvDocument(bytes));
+    const auto imported = GltfImporter::importFile(project.root, "Assets/Models/normal-uv.gltf");
+    expect(imported && !imported.value().cacheHit, "first import accepts matching FLOAT NORMAL and TEXCOORD_0 accessors");
+    if (!imported) return;
+    const auto& mesh = imported.value().meshes[0].primitives[0];
+    expect(mesh.hasNormals() && mesh.hasTexCoords(), "imported mesh advertises both imported vertex channels");
+    expect(mesh.vertices()[0].normal == (astro::render3d::Vec3{0, 0, 1})
+        && mesh.vertices()[2].normal == (astro::render3d::Vec3{0, 0, 1}),
+        "NORMAL values remain aligned to their positions");
+    expect(mesh.vertices()[0].texCoord0 == (astro::render3d::Vec2{0, 0})
+        && mesh.vertices()[1].texCoord0 == (astro::render3d::Vec2{1, 0})
+        && mesh.vertices()[2].texCoord0 == (astro::render3d::Vec2{0, 1}),
+        "TEXCOORD_0 values remain aligned to their positions");
+    expect(imported.value().cachePath.filename().string().ends_with(".v2.astro-mesh-cache"),
+        "new vertex channel data uses the version 2 derived geometry cache");
+
+    const auto cached = GltfImporter::importFile(project.root, "Assets/Models/normal-uv.gltf");
+    expect(cached && cached.value().cacheHit && cached.value().meshes[0].primitives[0].hasNormals()
+        && cached.value().meshes[0].primitives[0].hasTexCoords()
+        && cached.value().meshes[0].primitives[0].vertices()[1].normal == (astro::render3d::Vec3{0, 0, 1})
+        && cached.value().meshes[0].primitives[0].vertices()[1].texCoord0 == (astro::render3d::Vec2{1, 0}),
+        "verified cache round-trip retains channel presence and vertex data");
+
+    TempProject normalizedProject;
+    const auto byteUv = normalizedByteUvTriangleBytes();
+    writeText(normalizedProject.root / "Assets/Models/byte-uv.gltf", normalizedByteUvDocument(byteUv, true));
+    const auto normalizedImport = GltfImporter::importFile(normalizedProject.root, "Assets/Models/byte-uv.gltf");
+    expect(normalizedImport && normalizedImport.value().meshes[0].primitives[0].hasTexCoords()
+        && normalizedImport.value().meshes[0].primitives[0].vertices()[0].texCoord0 == (astro::render3d::Vec2{0, 1})
+        && std::abs(normalizedImport.value().meshes[0].primitives[0].vertices()[1].texCoord0.x
+            - (128.0f / 255.0f)) < 1.0e-6f,
+        "normalized UNSIGNED_BYTE TEXCOORD_0 is converted to float coordinates");
 }
 
 void testGlbAndExternalBuffers()
@@ -371,6 +708,39 @@ void testRejectUnsafeAndUnsupported()
     }
     {
         TempProject project;
+        auto mismatched = normalUvDocument(normalUvTriangleBytes());
+        replaceOnce(mismatched, "\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"",
+            "\"bufferView\":1,\"componentType\":5126,\"count\":2,\"type\":\"VEC3\"");
+        writeText(project.root / "Assets/Models/mismatched-normal.gltf", mismatched);
+        expect(!GltfImporter::importFile(project.root, "Assets/Models/mismatched-normal.gltf"),
+            "NORMAL vertex count must match POSITION");
+    }
+    {
+        TempProject project;
+        auto bytes = normalUvTriangleBytes();
+        std::fill(bytes.begin() + 36, bytes.begin() + 48, 0);
+        writeText(project.root / "Assets/Models/zero-normal.gltf", normalUvDocument(bytes));
+        expect(!GltfImporter::importFile(project.root, "Assets/Models/zero-normal.gltf"),
+            "zero-length NORMAL values are rejected");
+    }
+    {
+        TempProject project;
+        auto mismatched = normalUvDocument(normalUvTriangleBytes());
+        replaceOnce(mismatched, "\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"",
+            "\"bufferView\":2,\"componentType\":5126,\"count\":2,\"type\":\"VEC2\"");
+        writeText(project.root / "Assets/Models/mismatched-uv.gltf", mismatched);
+        expect(!GltfImporter::importFile(project.root, "Assets/Models/mismatched-uv.gltf"),
+            "TEXCOORD_0 vertex count must match POSITION");
+    }
+    {
+        TempProject project;
+        const auto byteUv = normalizedByteUvTriangleBytes();
+        writeText(project.root / "Assets/Models/unnormalized-byte-uv.gltf", normalizedByteUvDocument(byteUv, false));
+        expect(!GltfImporter::importFile(project.root, "Assets/Models/unnormalized-byte-uv.gltf"),
+            "integer TEXCOORD_0 values must be normalized");
+    }
+    {
+        TempProject project;
         writeText(project.root / "Assets/Models/malformed.gltf", "{not-json");
         auto imported = GltfImporter::importFile(project.root, std::filesystem::path("Assets/Models/malformed.gltf"));
         expect(!imported, "malformed JSON is rejected");
@@ -398,7 +768,10 @@ int main()
 {
     testAssetRegistryAndSceneReference();
     testExternalBufferFreshness();
+    testMaterialMetadataAndImageReferences();
+    testSceneMeshSourceMaterialResolution();
     testDataUriAndCache();
+    testNormalUvAttributesAndCache();
     testGlbAndExternalBuffers();
     testRejectUnsafeAndUnsupported();
     if (failures != 0) { std::cerr << failures << " glTF integration assertion(s) failed\n"; return 1; }

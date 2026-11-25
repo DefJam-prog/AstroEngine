@@ -212,7 +212,8 @@ if(ASTRO_BUILD_2D_RUNTIME_ADAPTERS)
     endif()
 endif()
 
-if(WIN32 AND ASTRO_BUILD_2D_RUNTIME_ADAPTERS)
+if(WIN32 AND (ASTRO_BUILD_2D_RUNTIME_ADAPTERS OR ASTRO_BUILD_RENDER3D_BGFX_SMOKE
+    OR (ASTRO_BUILD_EDITOR AND ASTRO_BUILD_GLTF_IMPORTER)))
     add_library(astro_runtime_sdl_wic_image adapters/sdl3/SDLImageTextureCache.cpp)
     target_include_directories(astro_runtime_sdl_wic_image PUBLIC include)
     target_link_libraries(astro_runtime_sdl_wic_image PUBLIC astro_assets SDL3::SDL3-static windowscodecs ole32)

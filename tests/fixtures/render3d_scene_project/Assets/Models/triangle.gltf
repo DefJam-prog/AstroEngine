@@ -1,19 +1,21 @@
 {
-  "asset": { "version": "2.0", "generator": "AstroEngine 07.1e Scene smoke" },
+  "asset": { "version": "2.0", "generator": "AstroEngine 07.2h texture smoke" },
   "buffers": [{
-    "uri": "data:application/octet-stream;base64,AACAvwAAgL8AAAAAAACAPwAAgL8AAAAAAAAAAAAAgD8AAAAAAAABAAIA",
-    "byteLength": 42
+    "uri": "data:application/octet-stream;base64,AACAvwAAgL8AAAAAAACAPwAAgL8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAD8AAIA/AAABAAIA",
+    "byteLength": 66
   }],
   "bufferViews": [
     { "buffer": 0, "byteOffset": 0, "byteLength": 36 },
-    { "buffer": 0, "byteOffset": 36, "byteLength": 6 }
+    { "buffer": 0, "byteOffset": 36, "byteLength": 24 },
+    { "buffer": 0, "byteOffset": 60, "byteLength": 6 }
   ],
   "accessors": [
     { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [-1, -1, 0], "max": [1, 1, 0] },
-    { "bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR" }
+    { "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2" },
+    { "bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR" }
   ],
   "meshes": [{
     "name": "SceneSmokeTriangle",
-    "primitives": [{ "attributes": { "POSITION": 0 }, "indices": 1, "mode": 4 }]
+    "primitives": [{ "attributes": { "POSITION": 0, "TEXCOORD_0": 1 }, "indices": 2, "mode": 4 }]
   }]
 }

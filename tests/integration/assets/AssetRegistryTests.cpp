@@ -479,9 +479,9 @@ int main()
                 "Library/Scripts/Legacy.dll", "Library/Scripts/Legacy.runtimeconfig.json");
             const auto migratedBytes = readBytes(legacyIndex);
             check(migrated && migrated.value().id.value == 1
-                && std::string(migratedBytes.begin(), migratedBytes.end()).starts_with("ASTRO_ASSETS 3\n")
+                && std::string(migratedBytes.begin(), migratedBytes.end()).starts_with("ASTRO_ASSETS 4\n")
                 && AssetRegistry::open(legacyRoot).value().resolveScript({1}),
-                "upgrade the shared index to v2 only on explicit script registration and resolve legacy project files");
+                "upgrade the shared index to v4 only on explicit script registration and resolve legacy project files");
         }
         const auto indexPath = root / ".astro" / "assets.index";
         writeBytes(indexPath, {'B','A','D','\n'});

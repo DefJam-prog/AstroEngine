@@ -1,4 +1,5 @@
 #include "astro/assets/AssetRegistry.hpp"
+#include "astro/assets/MaterialAsset.hpp"
 
 #include <algorithm>
 #include <array>
@@ -35,6 +36,7 @@ constexpr std::size_t MaxAssetEntries = 100000;
 constexpr std::size_t MaxAssetPathBytes = 4096;
 constexpr std::size_t MaxScriptSourceBytes = 16ull * 1024ull * 1024ull;
 constexpr std::size_t MaxModelSourceBytes = 8ull * 1024ull * 1024ull;
+constexpr std::size_t MaxMaterialSourceBytes = 64ull * 1024ull;
 constexpr std::size_t MaxManagedTypeNameBytes = 512;
 constexpr std::size_t MaxScriptBuildStateBytes = 4ull * 1024ull * 1024ull;
 constexpr std::size_t MaxScriptBuildSources = 4096;
@@ -62,6 +64,11 @@ core::Result<ModelAssetReference> modelReferenceError(const core::ErrorCode code
     return core::Result<ModelAssetReference>::failure({code, std::move(message)});
 }
 
+core::Result<MaterialAssetReference> materialReferenceError(const core::ErrorCode code, std::string message)
+{
+    return core::Result<MaterialAssetReference>::failure({code, std::move(message)});
+}
+
 core::Result<ResolvedScriptAsset> resolvedScriptError(const core::ErrorCode code, std::string message)
 {
     return core::Result<ResolvedScriptAsset>::failure({code, std::move(message)});
@@ -70,6 +77,28 @@ core::Result<ResolvedScriptAsset> resolvedScriptError(const core::ErrorCode code
 core::Result<ResolvedModelAsset> resolvedModelError(const core::ErrorCode code, std::string message)
 {
     return core::Result<ResolvedModelAsset>::failure({code, std::move(message)});
+}
+
+core::Result<ResolvedMaterialAsset> resolvedMaterialError(const core::ErrorCode code, std::string message)
+{
+    return core::Result<ResolvedMaterialAsset>::failure({code, std::move(message)});
+}
+
+template<typename MaterialType>
+core::Result<void> validateMaterialImageReferences(const MaterialType& material,
+    const std::map<AssetId, AssetReference>& images)
+{
+    const std::array<const std::optional<MaterialTextureBinding>*, 5> bindings{
+        &material.baseColorTexture, &material.metallicRoughnessTexture, &material.normalTexture,
+        &material.occlusionTexture, &material.emissiveTexture};
+    for (const auto* binding : bindings)
+    {
+        if (!*binding) continue;
+        if (!(*binding)->imageAssetId.value || !images.contains((*binding)->imageAssetId))
+            return core::Result<void>::failure({core::ErrorCode::NotFound,
+                "Material texture reference is not a registered image AssetId"});
+    }
+    return core::Result<void>::success();
 }
 
 bool hasExtra(std::istringstream& input)
@@ -1031,7 +1060,7 @@ core::Result<AssetRegistry> AssetRegistry::open(const std::filesystem::path& pro
     AssetRegistry registry(root, canonicalAssets, canonicalCache, canonicalMetadata / "assets.index");
     if (!std::filesystem::exists(registry.indexPath_, error))
     {
-        const auto saved = registry.saveIndex({}, {}, {}, 1);
+        const auto saved = registry.saveIndex({}, {}, {}, {}, 1);
         if (!saved) return assetError(saved.error().code, saved.error().message);
         return core::Result<AssetRegistry>::success(std::move(registry));
     }
@@ -1059,7 +1088,7 @@ core::Result<AssetRegistry> AssetRegistry::open(const std::filesystem::path& pro
     header.imbue(std::locale::classic());
     std::string magic;
     if (!(header >> magic >> indexVersion) || hasExtra(header) || magic != "ASTRO_ASSETS"
-        || indexVersion < 1 || indexVersion > 3)
+        || indexVersion < 1 || indexVersion > 4)
         return assetError(core::ErrorCode::VersionMismatch, "Unsupported asset index format version");
     if (!nextLine()) return assetError(core::ErrorCode::ParseError, "Asset index counter is missing");
     std::istringstream counterLine(line); counterLine.imbue(std::locale::classic());
@@ -1167,9 +1196,35 @@ core::Result<AssetRegistry> AssetRegistry::open(const std::filesystem::path& pro
             maximumId = std::max(maximumId, reference.id.value);
             registry.modelEntries_.emplace(reference.id, std::move(reference));
         }
+        else if (marker == "MATERIAL" && indexVersion >= 4)
+        {
+            MaterialAssetReference reference;
+            if (!(record >> reference.id.value >> std::quoted(reference.sourceRelativePath)
+                >> reference.schemaVersion >> reference.sourceSize >> reference.sourceSha256) || hasExtra(record))
+                return assetError(core::ErrorCode::ParseError, "Invalid material asset index entry");
+            const auto sourcePath = fromUtf8(reference.sourceRelativePath);
+            const auto extension = utf8(sourcePath.extension());
+            if (reference.id.value == 0 || reference.id.value == std::numeric_limits<std::uint64_t>::max()
+                || (reference.schemaVersion != 1 && reference.schemaVersion != 2) || !validUtf8(reference.sourceRelativePath)
+                || reference.sourceRelativePath.find('\0') != std::string::npos
+                || reference.sourceRelativePath.size() > MaxAssetPathBytes
+                || reference.sourceSize == 0 || reference.sourceSize > MaxMaterialSourceBytes
+                || !validHash(reference.sourceSha256) || !validRelative(sourcePath)
+                || sourcePath != sourcePath.lexically_normal()
+                || !hasPathPrefix(sourcePath, std::filesystem::path("Materials"))
+                || extension != ".astro-material")
+                return assetError(core::ErrorCode::ValidationError, "Asset index contains invalid material metadata");
+            if (!registeredPaths.emplace(reference.sourceRelativePath).second)
+                return assetError(core::ErrorCode::AlreadyExists, "Asset index contains a duplicate material source path");
+            if (!registeredIds.emplace(reference.id.value).second)
+                return assetError(core::ErrorCode::AlreadyExists, "Asset index contains a duplicate asset ID");
+            maximumId = std::max(maximumId, reference.id.value);
+            registry.materialEntries_.emplace(reference.id, std::move(reference));
+        }
         else
             return assetError(core::ErrorCode::ValidationError, "Unknown or unsupported asset index record: " + marker);
-        if (registry.entries_.size() + registry.scriptEntries_.size() + registry.modelEntries_.size() > MaxAssetEntries)
+        if (registry.entries_.size() + registry.scriptEntries_.size() + registry.modelEntries_.size()
+            + registry.materialEntries_.size() > MaxAssetEntries)
             return assetError(core::ErrorCode::ValidationError, "Asset index exceeds 100000 total entries");
     }
     if (!ended || input.bad()) return assetError(core::ErrorCode::ParseError, "Asset index terminator is missing or unreadable");
@@ -1183,12 +1238,13 @@ core::Result<AssetRegistry> AssetRegistry::open(const std::filesystem::path& pro
 
 core::Result<void> AssetRegistry::saveIndex(const std::map<AssetId, AssetReference>& entries,
     const std::map<AssetId, ScriptAssetReference>& scripts,
-    const std::map<AssetId, ModelAssetReference>& models, const std::uint64_t nextId) const
+    const std::map<AssetId, ModelAssetReference>& models,
+    const std::map<AssetId, MaterialAssetReference>& materials, const std::uint64_t nextId) const
 {
-    if (entries.size() + scripts.size() + models.size() > MaxAssetEntries)
+    if (entries.size() + scripts.size() + models.size() + materials.size() > MaxAssetEntries)
         return core::Result<void>::failure({core::ErrorCode::ValidationError, "Asset index exceeds 100000 total entries"});
     std::ostringstream output; output.imbue(std::locale::classic());
-    output << "ASTRO_ASSETS 3\nNEXT " << nextId << '\n';
+    output << "ASTRO_ASSETS 4\nNEXT " << nextId << '\n';
     for (const auto& [id, reference] : entries)
     {
         if (reference.sourceRelativePath.size() > MaxAssetPathBytes)
@@ -1229,6 +1285,24 @@ core::Result<void> AssetRegistry::saveIndex(const std::map<AssetId, AssetReferen
         if (output.tellp() > static_cast<std::streamoff>(MaxIndexBytes))
             return core::Result<void>::failure({core::ErrorCode::ValidationError, "Asset index exceeds 16 MiB"});
     }
+    for (const auto& [id, material] : materials)
+    {
+        const auto materialPath = fromUtf8(material.sourceRelativePath);
+        if (id.value == 0 || id.value == std::numeric_limits<std::uint64_t>::max()
+            || (material.schemaVersion != 1 && material.schemaVersion != 2) || !validUtf8(material.sourceRelativePath)
+            || material.sourceRelativePath.find('\0') != std::string::npos
+            || !validRelative(materialPath) || materialPath != materialPath.lexically_normal()
+            || !hasPathPrefix(materialPath, std::filesystem::path("Materials"))
+            || utf8(materialPath.extension()) != ".astro-material"
+            || material.sourceRelativePath.size() > MaxAssetPathBytes || material.sourceSize == 0
+            || material.sourceSize > MaxMaterialSourceBytes || !validHash(material.sourceSha256))
+            return core::Result<void>::failure({core::ErrorCode::ValidationError,
+                "Material asset metadata is invalid or exceeds its bounds"});
+        output << "MATERIAL " << id.value << ' ' << std::quoted(material.sourceRelativePath) << ' '
+               << material.schemaVersion << ' ' << material.sourceSize << ' ' << material.sourceSha256 << '\n';
+        if (output.tellp() > static_cast<std::streamoff>(MaxIndexBytes))
+            return core::Result<void>::failure({core::ErrorCode::ValidationError, "Asset index exceeds 16 MiB"});
+    }
     output << "END\n";
     const auto text = output.str();
     if (text.size() > MaxIndexBytes)
@@ -1254,6 +1328,12 @@ const ModelAssetReference* AssetRegistry::findModel(const AssetId id) const noex
     return found == modelEntries_.end() ? nullptr : &found->second;
 }
 
+const MaterialAssetReference* AssetRegistry::findMaterial(const AssetId id) const noexcept
+{
+    const auto found = materialEntries_.find(id);
+    return found == materialEntries_.end() ? nullptr : &found->second;
+}
+
 core::Result<ResolvedModelAsset> AssetRegistry::resolveModel(const AssetId id) const
 {
     const auto* reference = findModel(id);
@@ -1272,6 +1352,41 @@ core::Result<ResolvedModelAsset> AssetRegistry::resolveModel(const AssetId id) c
         return resolvedModelError(core::ErrorCode::InvalidState,
             "Model source changed after registration; import and register it again");
     return core::Result<ResolvedModelAsset>::success({id, source.value(), reference->importContentHash});
+}
+
+core::Result<ResolvedMaterialAsset> AssetRegistry::resolveMaterial(const AssetId id) const
+{
+    const auto* reference = findMaterial(id);
+    if (!reference)
+        return resolvedMaterialError(core::ErrorCode::NotFound, "Material AssetId is not registered");
+    const auto relative = fromUtf8(reference->sourceRelativePath);
+    if ((reference->schemaVersion != 1 && reference->schemaVersion != 2) || !validRelative(relative)
+        || relative != relative.lexically_normal()
+        || !hasPathPrefix(relative, std::filesystem::path("Materials"))
+        || utf8(relative.extension()) != ".astro-material")
+        return resolvedMaterialError(core::ErrorCode::ValidationError, "Registered material path is invalid");
+    const auto projectRelative = std::filesystem::path("Assets") / relative;
+    auto source = resolveProjectFile(projectRoot_, projectRelative,
+        std::filesystem::path("Assets") / "Materials", ".astro-material", "Material source");
+    if (!source) return resolvedMaterialError(source.error().code, source.error().message);
+    std::error_code error;
+    const auto sourceSize = std::filesystem::file_size(source.value(), error);
+    if (error)
+        return resolvedMaterialError(core::ErrorCode::IoError, "Cannot inspect material source: " + error.message());
+    if (sourceSize == 0 || sourceSize > MaxMaterialSourceBytes)
+        return resolvedMaterialError(core::ErrorCode::ValidationError, "Material source must contain 1 byte through 64 KiB");
+    auto bytes = readBytes(source.value());
+    if (!bytes) return resolvedMaterialError(bytes.error().code, bytes.error().message);
+    if (bytes.value().size() != sourceSize || sourceSize != reference->sourceSize
+        || sha256Hex(bytes.value()) != reference->sourceSha256)
+        return resolvedMaterialError(core::ErrorCode::InvalidState,
+            "Material source changed after registration; register it again");
+    const auto parsed = parseMaterialAsset(std::string_view(
+        reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size()));
+    if (!parsed) return resolvedMaterialError(parsed.error().code, parsed.error().message);
+    const auto referencesValid = validateMaterialImageReferences(parsed.value(), entries_);
+    if (!referencesValid) return resolvedMaterialError(referencesValid.error().code, referencesValid.error().message);
+    return core::Result<ResolvedMaterialAsset>::success({id, source.value(), parsed.value()});
 }
 
 core::Result<ResolvedScriptAsset> AssetRegistry::resolveScript(const AssetId id) const
@@ -1356,7 +1471,7 @@ core::Result<ScriptAssetReference> AssetRegistry::registerScript(
     }
     else
     {
-        if (entries_.size() + scriptEntries_.size() + modelEntries_.size() >= MaxAssetEntries)
+        if (entries_.size() + scriptEntries_.size() + modelEntries_.size() + materialEntries_.size() >= MaxAssetEntries)
             return scriptReferenceError(core::ErrorCode::ValidationError, "Asset index exceeds 100000 total entries");
         if (nextId_ == 0 || nextId_ == std::numeric_limits<std::uint64_t>::max())
             return scriptReferenceError(core::ErrorCode::InvalidState, "Asset ID space is exhausted");
@@ -1365,7 +1480,7 @@ core::Result<ScriptAssetReference> AssetRegistry::registerScript(
     }
 
     const auto newNextId = existing == updatedScripts.end() ? nextId_ + 1 : nextId_;
-    const auto saved = saveIndex(entries_, updatedScripts, modelEntries_, newNextId);
+    const auto saved = saveIndex(entries_, updatedScripts, modelEntries_, materialEntries_, newNextId);
     if (!saved) return scriptReferenceError(saved.error().code, saved.error().message);
     scriptEntries_ = std::move(updatedScripts);
     nextId_ = newNextId;
@@ -1512,7 +1627,7 @@ core::Result<std::vector<ScriptAssetReference>> AssetRegistry::registerScriptsFr
         }
         else
         {
-            if (entries_.size() + updatedScripts.size() + modelEntries_.size() >= MaxAssetEntries)
+            if (entries_.size() + updatedScripts.size() + modelEntries_.size() + materialEntries_.size() >= MaxAssetEntries)
                 return core::Result<std::vector<ScriptAssetReference>>::failure({core::ErrorCode::ValidationError,
                     "Asset index exceeds 100000 total entries"});
             if (nextId == 0 || nextId == std::numeric_limits<std::uint64_t>::max())
@@ -1532,7 +1647,7 @@ core::Result<std::vector<ScriptAssetReference>> AssetRegistry::registerScriptsFr
             return core::Result<std::vector<ScriptAssetReference>>::failure({core::ErrorCode::AlreadyExists,
                 "Multiple script sources select the same managed type in one assembly"});
     }
-    const auto saved = saveIndex(entries_, updatedScripts, modelEntries_, nextId);
+    const auto saved = saveIndex(entries_, updatedScripts, modelEntries_, materialEntries_, nextId);
     if (!saved) return core::Result<std::vector<ScriptAssetReference>>::failure(saved.error());
     scriptEntries_ = std::move(updatedScripts);
     nextId_ = nextId;
@@ -1550,6 +1665,13 @@ std::vector<AssetId> AssetRegistry::missingAssets() const
     for (const auto& [id, reference] : modelEntries_)
     {
         auto source = resolveSource(assetsRoot_, fromUtf8(reference.sourceRelativePath));
+        if (!source) missing.push_back(id);
+    }
+    for (const auto& [id, reference] : materialEntries_)
+    {
+        const auto projectRelative = std::filesystem::path("Assets") / fromUtf8(reference.sourceRelativePath);
+        auto source = resolveProjectFile(projectRoot_, projectRelative,
+            std::filesystem::path("Assets") / "Materials", ".astro-material", "Material source");
         if (!source) missing.push_back(id);
     }
     return missing;
@@ -1611,7 +1733,7 @@ core::Result<ModelAssetReference> AssetRegistry::registerModel(
     }
     else
     {
-        if (entries_.size() + scriptEntries_.size() + modelEntries_.size() >= MaxAssetEntries)
+        if (entries_.size() + scriptEntries_.size() + modelEntries_.size() + materialEntries_.size() >= MaxAssetEntries)
             return modelReferenceError(core::ErrorCode::ValidationError,
                 "Asset index exceeds 100000 total entries");
         if (nextId_ == 0 || nextId_ == std::numeric_limits<std::uint64_t>::max())
@@ -1621,11 +1743,122 @@ core::Result<ModelAssetReference> AssetRegistry::registerModel(
         updated.emplace(reference.id, reference);
     }
     const auto newNextId = existing == updated.end() ? nextId_ + 1 : nextId_;
-    const auto saved = saveIndex(entries_, scriptEntries_, updated, newNextId);
+    const auto saved = saveIndex(entries_, scriptEntries_, updated, materialEntries_, newNextId);
     if (!saved) return modelReferenceError(saved.error().code, saved.error().message);
     modelEntries_ = std::move(updated);
     nextId_ = newNextId;
     return core::Result<ModelAssetReference>::success(std::move(reference));
+}
+
+core::Result<MaterialAssetReference> AssetRegistry::registerMaterial(
+    const std::filesystem::path& sourceRelativePath)
+{
+    const auto extension = utf8(sourceRelativePath.extension());
+    if (extension != ".astro-material")
+        return materialReferenceError(core::ErrorCode::ValidationError,
+            "Material source extension must be .astro-material");
+    const auto projectRelative = std::filesystem::path("Assets") / sourceRelativePath;
+    auto resolved = resolveProjectFile(projectRoot_, projectRelative,
+        std::filesystem::path("Assets") / "Materials", ".astro-material", "Material source");
+    if (!resolved) return materialReferenceError(resolved.error().code, resolved.error().message);
+    const auto relative = resolved.value().lexically_relative(assetsRoot_).lexically_normal();
+    const auto relativeText = utf8(relative);
+    if (!validUtf8(relativeText) || relativeText.find('\0') != std::string::npos
+        || relativeText.size() > MaxAssetPathBytes || !validRelative(relative)
+        || !hasPathPrefix(relative, std::filesystem::path("Materials")))
+        return materialReferenceError(core::ErrorCode::ValidationError,
+            "Material source path must be a normalized UTF-8 path under Assets/Materials");
+    std::error_code error;
+    const auto sourceSize = std::filesystem::file_size(resolved.value(), error);
+    if (error)
+        return materialReferenceError(core::ErrorCode::IoError, "Cannot inspect material source: " + error.message());
+    if (sourceSize == 0 || sourceSize > MaxMaterialSourceBytes)
+        return materialReferenceError(core::ErrorCode::ValidationError,
+            "Material source must contain 1 byte through 64 KiB");
+    auto bytes = readBytes(resolved.value());
+    if (!bytes) return materialReferenceError(bytes.error().code, bytes.error().message);
+    if (bytes.value().size() != sourceSize)
+        return materialReferenceError(core::ErrorCode::IoError, "Material source changed while it was being read");
+    const auto parsed = parseMaterialAsset(std::string_view(
+        reinterpret_cast<const char*>(bytes.value().data()), bytes.value().size()));
+    if (!parsed) return materialReferenceError(parsed.error().code, parsed.error().message);
+    const auto referencesValid = validateMaterialImageReferences(parsed.value(), entries_);
+    if (!referencesValid)
+        return materialReferenceError(referencesValid.error().code, referencesValid.error().message);
+    if (std::any_of(entries_.begin(), entries_.end(), [&](const auto& item) {
+            return item.second.sourceRelativePath == relativeText;
+        }) || std::any_of(modelEntries_.begin(), modelEntries_.end(), [&](const auto& item) {
+            return item.second.sourceRelativePath == relativeText;
+        }))
+        return materialReferenceError(core::ErrorCode::AlreadyExists,
+            "This source path is already registered as another asset type");
+
+    auto updated = materialEntries_;
+    auto existing = std::find_if(updated.begin(), updated.end(), [&](const auto& item) {
+        return item.second.sourceRelativePath == relativeText;
+    });
+    MaterialAssetReference reference;
+    const auto sourceHash = sha256Hex(bytes.value());
+    if (existing != updated.end())
+    {
+        reference = existing->second;
+        reference.schemaVersion = parsed.value().schemaVersion;
+        reference.sourceSize = sourceSize;
+        reference.sourceSha256 = sourceHash;
+        existing->second = reference;
+    }
+    else
+    {
+        if (entries_.size() + scriptEntries_.size() + modelEntries_.size() + materialEntries_.size() >= MaxAssetEntries)
+            return materialReferenceError(core::ErrorCode::ValidationError, "Asset index exceeds 100000 total entries");
+        if (nextId_ == 0 || nextId_ == std::numeric_limits<std::uint64_t>::max())
+            return materialReferenceError(core::ErrorCode::InvalidState, "Asset ID space is exhausted");
+        reference = {{nextId_}, relativeText, parsed.value().schemaVersion, sourceSize, sourceHash};
+        updated.emplace(reference.id, reference);
+    }
+    const auto newNextId = existing == updated.end() ? nextId_ + 1 : nextId_;
+    const auto saved = saveIndex(entries_, scriptEntries_, modelEntries_, updated, newNextId);
+    if (!saved) return materialReferenceError(saved.error().code, saved.error().message);
+    materialEntries_ = std::move(updated);
+    nextId_ = newNextId;
+    return core::Result<MaterialAssetReference>::success(std::move(reference));
+}
+
+core::Result<MaterialAssetReference> AssetRegistry::saveMaterial(const AssetId id,
+    const MaterialAssetData& material)
+{
+    const auto* reference = findMaterial(id);
+    if (!reference)
+        return materialReferenceError(core::ErrorCode::NotFound, "Material AssetId is not registered");
+    if (material.schemaVersion != 2)
+        return materialReferenceError(core::ErrorCode::VersionMismatch,
+            "Explicit material saves must use schema version 2");
+    auto current = resolveMaterial(id);
+    if (!current) return materialReferenceError(current.error().code, current.error().message);
+    const auto encoded = serializeMaterialAsset(material);
+    if (!encoded) return materialReferenceError(encoded.error().code, encoded.error().message);
+    const auto referencesValid = validateMaterialImageReferences(material, entries_);
+    if (!referencesValid)
+        return materialReferenceError(referencesValid.error().code, referencesValid.error().message);
+
+    const auto previousBytes = readBytes(current.value().sourcePath);
+    if (!previousBytes) return materialReferenceError(previousBytes.error().code, previousBytes.error().message);
+    const auto relative = fromUtf8(reference->sourceRelativePath);
+    std::vector<unsigned char> newBytes(encoded.value().begin(), encoded.value().end());
+    const auto published = writeAtomically(current.value().sourcePath, newBytes);
+    if (!published) return materialReferenceError(published.error().code, published.error().message);
+
+    auto updated = registerMaterial(relative);
+    if (!updated)
+    {
+        const auto restored = writeAtomically(current.value().sourcePath, previousBytes.value());
+        if (!restored)
+            return materialReferenceError(core::ErrorCode::IoError,
+                "Material save failed and the previous source bytes could not be restored: "
+                    + updated.error().message + "; " + restored.error().message);
+        return materialReferenceError(updated.error().code, updated.error().message);
+    }
+    return updated;
 }
 
 core::Result<AssetReference> AssetRegistry::importImage(const std::filesystem::path& sourceRelativePath)
@@ -1661,7 +1894,7 @@ core::Result<AssetReference> AssetRegistry::importImage(const std::filesystem::p
     if (!cached) return referenceError(cached.error().code, cached.error().message);
     auto updated = entries_;
     updated.emplace(reference.id, reference);
-    const auto indexSaved = saveIndex(updated, scriptEntries_, modelEntries_, nextId_ + 1);
+    const auto indexSaved = saveIndex(updated, scriptEntries_, modelEntries_, materialEntries_, nextId_ + 1);
     if (!indexSaved) return referenceError(indexSaved.error().code, indexSaved.error().message);
     entries_ = std::move(updated);
     ++nextId_;
@@ -1689,7 +1922,7 @@ core::Result<AssetReference> AssetRegistry::reimport(const AssetId id)
     if (!cached) return referenceError(cached.error().code, cached.error().message);
     auto updated = entries_;
     updated[id] = updatedReference;
-    const auto indexSaved = saveIndex(updated, scriptEntries_, modelEntries_, nextId_);
+    const auto indexSaved = saveIndex(updated, scriptEntries_, modelEntries_, materialEntries_, nextId_);
     if (!indexSaved) return referenceError(indexSaved.error().code, indexSaved.error().message);
     entries_ = std::move(updated);
     return core::Result<AssetReference>::success(std::move(updatedReference));

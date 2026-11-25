@@ -55,3 +55,6 @@ Desktop.ini
 *.p12
 *.pfx
 secrets/
+
+# Compiler output accidentally emitted at the repository root by the asset smoke build
+/07.2ax-register-review-model.obj

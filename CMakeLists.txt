@@ -2,6 +2,15 @@ cmake_minimum_required(VERSION 3.20)
 
 project(AstroEngine LANGUAGES CXX)
 
+# MSVC /showIncludes is localized on some Windows installations. CMake may
+# mis-decode the emitted prefix, which disables Ninja header dependency scans.
+# Allow the active console prefix to be supplied for localized toolchains.
+set(ASTRO_MSVC_SHOWINCLUDES_PREFIX "" CACHE STRING
+    "Override CMake's MSVC /showIncludes prefix when compiler output is localized")
+if(MSVC AND ASTRO_MSVC_SHOWINCLUDES_PREFIX)
+    set(CMAKE_CL_SHOWINCLUDES_PREFIX "${ASTRO_MSVC_SHOWINCLUDES_PREFIX}")
+endif()
+
 if(MSVC)
     # Match the locally prepared static SDL3/bgfx libraries used by the optional editor.
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -22,6 +31,8 @@ option(ASTRO_BUILD_GLTF_IMPORTER "Build the optional bounded glTF/GLB mesh impor
 set(ASTRO_GLTF_DEPS_ROOT "${CMAKE_SOURCE_DIR}/build/07.1b-deps" CACHE PATH
     "Ignored local source cache for the pinned glTF importer dependencies")
 option(ASTRO_BUILD_RENDER3D_BGFX_SMOKE "Build optional Windows bgfx 3D visual smoke previews" OFF)
+option(ASTRO_BUILD_RUNTIME_BGFX_3D "Build optional Windows BGFX consumer for Scene render packets" OFF)
+option(ASTRO_BUILD_AI_EDITOR_API "Build the optional in-process AI/Codex Editor API adapter" OFF)
 option(ASTRO_BUILD_2D_PLAYGROUND "Build the optional SDL3 2D Play/render playground" OFF)
 option(ASTRO_BUILD_VISUAL_LOGIC "Build the optional typed Visual Logic graph runtime" OFF)
 option(ASTRO_BUILD_STACK_SPIKE "Build the isolated Windows SDL3/bgfx/ImGui experiment" OFF)
@@ -38,13 +49,17 @@ add_subdirectory(engine/runtime)
 add_subdirectory(engine/core)
 add_subdirectory(engine/assets)
 add_subdirectory(engine/scene)
+if(ASTRO_BUILD_AI_EDITOR_API OR BUILD_TESTING OR ASTRO_BUILD_EDITOR)
+    add_subdirectory(engine/ai)
+endif()
 add_subdirectory(engine/prefabs)
 
 if(ASTRO_BUILD_EDITOR OR BUILD_TESTING)
     add_subdirectory(engine/save_editor)
 endif()
 
-if(ASTRO_BUILD_RENDER3D OR ASTRO_BUILD_GLTF_IMPORTER OR ASTRO_BUILD_EDITOR OR BUILD_TESTING)
+if(ASTRO_BUILD_RENDER3D OR ASTRO_BUILD_GLTF_IMPORTER OR ASTRO_BUILD_RENDER3D_BGFX_SMOKE OR ASTRO_BUILD_RUNTIME_BGFX_3D
+        OR ASTRO_BUILD_EDITOR OR BUILD_TESTING)
     add_subdirectory(engine/render3d)
 endif()
 
@@ -65,7 +80,14 @@ if(ASTRO_BUILD_STACK_SPIKE OR ASTRO_BUILD_EDITOR OR ASTRO_BUILD_GAME_UI_DEMO OR 
     add_subdirectory(samples/stack_spike)
 endif()
 
-if(ASTRO_BUILD_RENDER3D_BGFX_SMOKE)
+if(ASTRO_BUILD_RUNTIME_BGFX_3D)
+    if(NOT ASTRO_BUILD_STACK_SPIKE)
+        message(FATAL_ERROR "ASTRO_BUILD_RUNTIME_BGFX_3D requires ASTRO_BUILD_STACK_SPIKE and the local BGFX dependency cache")
+    endif()
+    add_subdirectory(engine/runtime/adapters/bgfx)
+endif()
+
+if(ASTRO_BUILD_RENDER3D_BGFX_SMOKE OR ASTRO_BUILD_RUNTIME_BGFX_3D)
     if(NOT ASTRO_BUILD_STACK_SPIKE AND NOT ASTRO_BUILD_EDITOR)
         message(FATAL_ERROR "ASTRO_BUILD_RENDER3D_BGFX_SMOKE requires the prepared SDL3/bgfx stack dependency targets")
     endif()
